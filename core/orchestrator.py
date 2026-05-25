@@ -22,7 +22,7 @@ from typing import Callable, Optional
 
 @dataclass
 class AnalysisConfig:
-    sample_path:   Path
+    sample_path:   Optional[Path]        # None → 전체 시스템 모니터링 모드
     output_dir:    Path
     timeout:       int   = 60       # 모니터링 초
     procmon_path:  Optional[str] = None
@@ -81,7 +81,7 @@ def run_analysis(
     from core.registry_snapshot import take_snapshot, diff_snapshots, AVAILABLE as REG_AVAILABLE
     from core.process_tracker  import (
         take_process_snapshot, diff_process_snapshots,
-        get_child_pids, find_process_hacker, launch_process_hacker,
+        find_process_hacker, launch_process_hacker,
     )
     from parsers.procmon_csv   import parse_csv, get_child_pids as pm_child_pids
     from parsers.pcap_parser   import parse_pcap, PcapResult
@@ -138,34 +138,41 @@ def run_analysis(
         if ph_proc is None:
             result.tools_used["process_hacker"] = False
 
-    # ── 3. 샘플 실행 ──────────────────────────────────────────────────
-    status(f"[3/6] 샘플 실행: {config.sample_path.name}")
+    # ── 3. 샘플 실행 (파일 지정 시에만) ─────────────────────────────
     sample_proc = None
-    try:
-        sample_proc = subprocess.Popen(
-            [str(config.sample_path)],
-            cwd=str(config.sample_path.parent),
-        )
-        result.sample_pid = sample_proc.pid
-        result.all_pids.add(sample_proc.pid)
-        status(f"      PID: {sample_proc.pid}")
-    except Exception as e:
-        result.errors.append(f"샘플 실행 실패: {e}")
-        status(f"[오류] 샘플 실행 실패: {e}")
+    if config.sample_path:
+        status(f"[3/6] 샘플 실행: {config.sample_path.name}")
+        try:
+            sample_proc = subprocess.Popen(
+                [str(config.sample_path)],
+                cwd=str(config.sample_path.parent),
+            )
+            result.sample_pid = sample_proc.pid
+            result.all_pids.add(sample_proc.pid)
+            status(f"      PID: {sample_proc.pid}")
+        except Exception as e:
+            result.errors.append(f"샘플 실행 실패: {e}")
+            status(f"[오류] 샘플 실행 실패: {e}")
+    else:
+        status(f"[3/6] 전체 시스템 모니터링 모드 — 직접 프로그램을 실행하세요")
 
     # ── 4. 모니터링 대기 ──────────────────────────────────────────────
-    status(f"[4/6] 모니터링 중... ({config.timeout}초)")
+    status(f"[4/6] 모니터링 중... ({config.timeout}초)  Ctrl+C로 조기 종료 가능")
     elapsed = 0
     interval = 5
-    while elapsed < config.timeout:
-        time.sleep(interval)
-        elapsed += interval
-        # 프로세스가 이미 종료됐으면 중간 스냅샷
-        if sample_proc and sample_proc.poll() is not None:
-            status(f"      샘플 종료 감지 ({elapsed}s)")
-            break
-        remaining = config.timeout - elapsed
-        status(f"      {elapsed}s 경과 / 잔여 {remaining}s...")
+    sample_exited = False
+    try:
+        while elapsed < config.timeout:
+            time.sleep(interval)
+            elapsed += interval
+            # 샘플 종료 감지 — 자식 프로세스 활동을 위해 타임아웃까지 계속 모니터링
+            if sample_proc and not sample_exited and sample_proc.poll() is not None:
+                sample_exited = True
+                status(f"      샘플 종료 감지 ({elapsed}s) — 자식 프로세스 모니터링 계속...")
+            remaining = config.timeout - elapsed
+            status(f"      {elapsed}s 경과 / 잔여 {remaining}s...")
+    except KeyboardInterrupt:
+        status(f"\n[!] Ctrl+C 감지 — {elapsed}s 시점 데이터로 분석을 마무리합니다...")
 
     # ── 5. 종료 ───────────────────────────────────────────────────────
     status("[5/6] 모니터링 종료...")

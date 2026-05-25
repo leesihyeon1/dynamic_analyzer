@@ -102,8 +102,8 @@ _SYSTEM_PATH_PREFIXES: tuple[str, ...] = (
     r"c:\windows\syswow64",
     r"c:\windows\sysnative",
     r"c:\windows\winsxs",
-    r"c:\program files\",
-    r"c:\program files (x86)\",
+    "c:\\program files\\",
+    "c:\\program files (x86)\\",
 )
 
 # Registry path fragments that indicate persistence / injection

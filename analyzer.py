@@ -141,14 +141,12 @@ def main() -> None:
         sys.exit(0)
 
     # ── 입력 검증 ────────────────────────────────────────────────
-    if not args.input:
-        console.print("[red][!] 분석할 파일을 지정하세요. 예: python analyzer.py malware.exe[/red]")
-        sys.exit(1)
-
-    sample_path = Path(args.input)
-    if not sample_path.exists():
-        console.print(f"[red][!] 파일 없음: {sample_path}[/red]")
-        sys.exit(1)
+    sample_path = None
+    if args.input:
+        sample_path = Path(args.input)
+        if not sample_path.exists():
+            console.print(f"[red][!] 파일 없음: {sample_path}[/red]")
+            sys.exit(1)
 
     # ── 관리자 권한 경고 ────────────────────────────────────────
     if not _check_admin():
@@ -160,12 +158,17 @@ def main() -> None:
     if args.output:
         out_dir = Path(args.output)
     else:
-        out_dir = Path("results") / f"{sample_path.stem}_{ts_str}"
+        stem = sample_path.stem if sample_path else "monitor"
+        out_dir = Path("results") / f"{stem}_{ts_str}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 분석 시작 ───────────────────────────────────────────────
-    console.rule(f"[bold white]🧪 dynamic_analyzer — {sample_path.name}")
-    console.print(f"  대상   : {sample_path.resolve()}")
+    label = sample_path.name if sample_path else "전체 시스템 모니터링"
+    console.rule(f"[bold white]🧪 dynamic_analyzer — {label}")
+    if sample_path:
+        console.print(f"  대상   : {sample_path.resolve()}")
+    else:
+        console.print(f"  대상   : [yellow]지정 없음 — 모니터링 시작 후 직접 실행하세요[/yellow]")
     console.print(f"  출력   : {out_dir.resolve()}")
     console.print(f"  timeout: {args.timeout}초")
     console.print()
@@ -219,7 +222,7 @@ def main() -> None:
         from exporters.json_report import save_json_report
         from exporters.html_report import generate_html_report
 
-        stem      = sample_path.stem
+        stem      = sample_path.stem if sample_path else "monitor"
         json_path = out_dir / f"{stem}_dynamic_report.json"
         html_path = out_dir / f"{stem}_dynamic_report.html"
 
