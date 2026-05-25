@@ -169,6 +169,14 @@ def _registry_events_html(result) -> str:
     return "\n".join(parts) if parts else "<p class='alert alert-success'>레지스트리 변경 없음</p>"
 
 
+def _fmt_bytes(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f} MB"
+    if n >= 1_000:
+        return f"{n/1_000:.1f} KB"
+    return f"{n} B"
+
+
 def _network_html(result) -> str:
     pcap = result.pcap_result
     if not pcap:
@@ -176,50 +184,154 @@ def _network_html(result) -> str:
 
     parts = []
 
+    # ── 캡처 요약 ──────────────────────────────────────────────
+    s = getattr(pcap, "summary", None)
+    if s:
+        parts.append(
+            f"<div class='card' style='margin-bottom:1rem'>"
+            f"<table class='kv'>"
+            f"<tr><td>총 패킷</td><td>{s.total_packets:,}</td></tr>"
+            f"<tr><td>외부 송신</td><td>{_fmt_bytes(s.total_bytes_out)}</td></tr>"
+            f"<tr><td>수신</td><td>{_fmt_bytes(s.total_bytes_in)}</td></tr>"
+            f"<tr><td>외부 고유 IP</td><td>{s.unique_dst_ips}</td></tr>"
+            f"<tr><td>고유 도메인</td><td>{s.unique_domains}</td></tr>"
+            f"</table></div>"
+        )
+
+    # ── 비콘 탐지 ──────────────────────────────────────────────
+    beacons = getattr(pcap, "beacon_candidates", [])
+    if beacons:
+        rows = "".join(
+            f"<tr>"
+            f"<td class='mono ev-network'>{_e(b.dst_ip)}</td>"
+            f"<td class='mono'>{b.dst_port}</td>"
+            f"<td>{b.count}회</td>"
+            f"<td class='mono'>{b.interval_avg}s</td>"
+            f"<td>{_b(f'지터 {b.jitter_ratio:.1%}', 'red' if b.jitter_ratio < 0.1 else 'orange')}</td>"
+            f"</tr>"
+            for b in beacons[:20]
+        )
+        parts.append(
+            "<h3>🚨 비콘(Beaconing) 탐지</h3>"
+            "<table><tr><th>목적지 IP</th><th>포트</th><th>횟수</th>"
+            "<th>평균 간격</th><th>규칙성</th></tr>"
+            f"{rows}</table>"
+        )
+
+    # ── TLS SNI ────────────────────────────────────────────────
+    tls_list = getattr(pcap, "tls_info", [])
+    if tls_list:
+        seen = {}
+        for t in tls_list:
+            if t.sni not in seen:
+                seen[t.sni] = t
+        rows = "".join(
+            f"<tr>"
+            f"<td class='mono ev-network'>{_e(t.sni)}</td>"
+            f"<td class='mono'>{_e(t.dst_ip)}</td>"
+            f"<td class='mono'>{t.dst_port}</td>"
+            f"</tr>"
+            for t in list(seen.values())[:100]
+        )
+        parts.append(
+            "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
+            "<table><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th></tr>"
+            f"{rows}</table>"
+        )
+
+    # ── DGA / 의심 도메인 ──────────────────────────────────────
+    susp_domains = getattr(pcap, "suspicious_domains", [])
+    if susp_domains:
+        rows = "".join(
+            f"<tr><td class='mono' style='color:#ff7b72'>{_e(d)}</td></tr>"
+            for d in susp_domains[:50]
+        )
+        parts.append(
+            "<h3>⚠ DGA / 고엔트로피 도메인</h3>"
+            f"<table><tr><th>도메인</th></tr>{rows}</table>"
+        )
+
+    # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
         rows = ""
-        for c in sorted(pcap.connections, key=lambda x: -x.count)[:100]:
+        for c in sorted(pcap.connections, key=lambda x: -x.bytes_out)[:100]:
+            ext = not _is_private_ip_str(c.dst_ip)
+            ip_color = "ev-network" if ext else ""
+            susp_badge = _b("!", "red") if c.suspicious_port else ""
+            # IP → 도메인 역매핑
+            domains = pcap.ip_to_domain.get(c.dst_ip, [])
+            domain_str = f"<br><span style='color:#8b949e;font-size:0.72rem'>{_e(', '.join(domains[:2]))}</span>" if domains else ""
             rows += (
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
                 f"<td class='mono'>{_e(c.src_ip)}</td>"
-                f"<td class='mono ev-network'>{_e(c.dst_ip)}</td>"
-                f"<td class='mono'>{c.dst_port}</td>"
+                f"<td class='mono {ip_color}'>{_e(c.dst_ip)}{domain_str}</td>"
+                f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
+                f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
                 f"</tr>"
             )
         parts.append(
-            "<h3>네트워크 연결</h3>"
-            "<table><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th><th>포트</th><th>횟수</th></tr>"
+            "<h3>네트워크 연결 (송신량 순)</h3>"
+            "<table><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
+            "<th>포트</th><th>횟수</th><th>송신량</th></tr>"
             f"{rows}</table>"
         )
 
+    # ── DNS 쿼리 ───────────────────────────────────────────────
     if pcap.dns_queries:
         rows = "".join(
-            f"<tr><td class='mono ev-network'>{_e(q.name)}</td>"
-            f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td></tr>"
-            for q in pcap.dns_queries[:100]
+            f"<tr>"
+            f"<td class='mono {'ev-network' if not q.suspicious else ''}"
+            f"' style='{'color:#ff7b72' if q.suspicious else ''}'>{_e(q.name)}</td>"
+            f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
+            f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
+            f"<td class='mono' style='color:#56d364;font-size:0.72rem'>"
+            f"{_e(', '.join(q.response_ips[:3]))}</td>"
+            f"{'<td>' + _b('DGA?','red') + '</td>' if q.suspicious else '<td></td>'}"
+            f"</tr>"
+            for q in sorted(pcap.dns_queries, key=lambda x: -x.entropy)[:100]
         )
         parts.append(
-            "<h3>DNS 쿼리</h3>"
-            f"<table><tr><th>도메인</th><th>타입</th></tr>{rows}</table>"
+            "<h3>DNS 쿼리 (엔트로피 순)</h3>"
+            "<table><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
+            "<th>응답 IP</th><th>의심</th></tr>"
+            f"{rows}</table>"
         )
 
+    # ── HTTP 요청 ──────────────────────────────────────────────
     if pcap.http_requests:
         rows = "".join(
-            f"<tr><td>{_b(r.method,'orange')}</td>"
+            f"<tr>"
+            f"<td>{_b(r.method,'orange')}</td>"
             f"<td class='mono'>{_e(r.host)}</td>"
             f"<td class='mono ev-network'>{_e(r.path[:80])}</td>"
-            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:60])}</td></tr>"
+            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:60])}</td>"
+            f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
+            f"<td>{'🍪' if r.has_cookie else ''}</td>"
+            f"</tr>"
             for r in pcap.http_requests[:50]
         )
         parts.append(
             "<h3>HTTP 요청</h3>"
-            "<table><tr><th>메서드</th><th>호스트</th><th>경로</th><th>User-Agent</th></tr>"
+            "<table><tr><th>메서드</th><th>호스트</th><th>경로</th>"
+            "<th>User-Agent</th><th>Body</th><th>Cookie</th></tr>"
             f"{rows}</table>"
         )
 
     return "\n".join(parts) if parts else "<p class='alert alert-success'>외부 네트워크 활동 없음</p>"
+
+
+def _is_private_ip_str(ip: str) -> bool:
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return False
+        a, b = int(parts[0]), int(parts[1])
+        return (a == 10 or (a == 172 and 16 <= b <= 31)
+                or (a == 192 and b == 168) or a == 127)
+    except Exception:
+        return False
 
 
 def _process_html(result) -> str:
@@ -267,7 +379,7 @@ def _ioc_html(result) -> str:
 def generate_html_report(result, output_path: str) -> None:
     """AnalysisResult → HTML 파일 저장"""
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    sample_name = result.config.sample_path.name
+    sample_name = result.config.sample_path.name if result.config.sample_path else "전체 시스템 모니터링"
     techs = result.behavior_report.techniques if result.behavior_report else []
     ioc   = result.ioc_report
 
@@ -297,7 +409,7 @@ def generate_html_report(result, output_path: str) -> None:
 
 <h1>🧪 Dynamic Malware Analysis Report</h1>
 <p class="subtitle">
-  샘플: <code>{_e(str(result.config.sample_path))}</code> &nbsp;|&nbsp;
+  샘플: <code>{_e(str(result.config.sample_path) if result.config.sample_path else "전체 시스템 모니터링")}</code> &nbsp;|&nbsp;
   생성: {generated} &nbsp;|&nbsp;
   모니터링: {result.config.timeout}초 &nbsp;|&nbsp;
   총 소요: {result.end_time - result.start_time:.1f}초

@@ -376,55 +376,100 @@ def _classify_network(
 ) -> None:
     """Map network observations to MITRE C2 / exfiltration techniques."""
 
-    # TCP connections
+    # TCP/UDP 연결
     for conn in pcap.connections:
-        if conn.proto == "TCP" and not _is_private_ip(conn.dst_ip):
-            evidence = f"{conn.dst_ip}:{conn.dst_port}"
-            if conn.dst_port in (80, 443):
-                _add_evidence(
-                    technique_map,
-                    "T1071.001",
-                    "Web Protocols",
-                    "Command and Control",
-                    evidence=evidence,
-                    reference="https://attack.mitre.org/techniques/T1071/001/",
-                )
-            else:
-                _add_evidence(
-                    technique_map,
-                    "T1095",
-                    "Non-Application Layer Protocol",
-                    "Command and Control",
-                    evidence=evidence,
-                    reference="https://attack.mitre.org/techniques/T1095/",
-                )
-            report.suspicious_network.append(evidence)
+        if _is_private_ip(conn.dst_ip):
+            continue
+        evidence = f"{conn.dst_ip}:{conn.dst_port}"
 
-    # DNS queries
-    if pcap.dns_queries:
-        for q in pcap.dns_queries:
-            _add_evidence(
-                technique_map,
-                "T1071.004",
-                "DNS",
-                "Command and Control",
-                evidence=q.name,
-                reference="https://attack.mitre.org/techniques/T1071/004/",
-            )
-            report.suspicious_network.append(q.name)
+        if conn.dst_port in (80, 8080):
+            _add_evidence(technique_map, "T1071.001", "Web Protocols",
+                          "Command and Control", evidence=evidence,
+                          reference="https://attack.mitre.org/techniques/T1071/001/")
+        elif conn.dst_port in (443, 8443):
+            _add_evidence(technique_map, "T1071.001", "Web Protocols (HTTPS)",
+                          "Command and Control", evidence=evidence,
+                          reference="https://attack.mitre.org/techniques/T1071/001/")
+        else:
+            _add_evidence(technique_map, "T1095",
+                          "Non-Application Layer Protocol",
+                          "Command and Control", evidence=evidence,
+                          reference="https://attack.mitre.org/techniques/T1095/")
 
-    # External IPs → potential exfiltration
-    external_ips = {ip for ip in pcap.raw_ips if not _is_private_ip(ip)}
+        # 의심 포트
+        if conn.suspicious_port:
+            _add_evidence(technique_map, "T1095",
+                          "Non-Application Layer Protocol (의심 포트)",
+                          "Command and Control",
+                          evidence=f"{conn.dst_ip}:{conn.dst_port} [{conn.proto}]",
+                          reference="https://attack.mitre.org/techniques/T1095/")
+
+        report.suspicious_network.append(evidence)
+
+    # TLS SNI → HTTPS C2 도메인 탐지
+    seen_sni: set[str] = set()
+    for tls in pcap.tls_info:
+        if tls.sni and tls.sni not in seen_sni:
+            seen_sni.add(tls.sni)
+            _add_evidence(technique_map, "T1071.001",
+                          "Web Protocols (TLS SNI)",
+                          "Command and Control",
+                          evidence=f"SNI={tls.sni} → {tls.dst_ip}:{tls.dst_port}",
+                          reference="https://attack.mitre.org/techniques/T1071/001/")
+            report.suspicious_network.append(f"TLS SNI: {tls.sni}")
+
+    # DNS 쿼리
+    for q in pcap.dns_queries:
+        _add_evidence(technique_map, "T1071.004", "DNS",
+                      "Command and Control", evidence=q.name,
+                      reference="https://attack.mitre.org/techniques/T1071/004/")
+
+    # DGA 의심 도메인
+    if pcap.suspicious_domains:
+        for domain in pcap.suspicious_domains:
+            _add_evidence(technique_map, "T1568.002",
+                          "Domain Generation Algorithms",
+                          "Command and Control",
+                          evidence=f"고엔트로피 도메인: {domain}",
+                          reference="https://attack.mitre.org/techniques/T1568/002/")
+            report.suspicious_network.append(f"DGA 의심: {domain}")
+
+    # DNS 터널링 의심
+    if pcap.dns_tunnel_suspects:
+        for base in pcap.dns_tunnel_suspects:
+            _add_evidence(technique_map, "T1071.004",
+                          "DNS (터널링 의심)",
+                          "Command and Control",
+                          evidence=f"다수 서브도메인 쿼리: {base}",
+                          reference="https://attack.mitre.org/techniques/T1071/004/")
+            report.suspicious_network.append(f"DNS 터널링 의심: {base}")
+
+    # 비콘 탐지 → C2 주기적 통신
+    if pcap.beacon_candidates:
+        for bc in pcap.beacon_candidates:
+            _add_evidence(technique_map, "T1071.001",
+                          "Web Protocols (Beaconing)",
+                          "Command and Control",
+                          evidence=(f"비콘 {bc.dst_ip}:{bc.dst_port} "
+                                    f"— {bc.count}회, 평균 {bc.interval_avg}s, "
+                                    f"지터 {bc.jitter_ratio:.1%}"),
+                          reference="https://attack.mitre.org/techniques/T1071/001/")
+            report.suspicious_network.append(
+                f"비콘: {bc.dst_ip}:{bc.dst_port} ({bc.count}회, ~{bc.interval_avg}s 간격)")
+
+    # 데이터 유출 (외부 IP + 대용량 전송)
+    external_ips = {c.dst_ip for c in pcap.connections if not _is_private_ip(c.dst_ip)}
+    large_transfers = [c for c in pcap.connections
+                       if not _is_private_ip(c.dst_ip) and c.bytes_out > 100_000]
     if external_ips:
-        _add_evidence(
-            technique_map,
-            "T1041",
-            "Exfiltration Over C2 Channel",
-            "Exfiltration",
-            evidence=", ".join(sorted(external_ips)),
-            reference="https://attack.mitre.org/techniques/T1041/",
-        )
-        report.suspicious_network.extend(sorted(external_ips))
+        _add_evidence(technique_map, "T1041",
+                      "Exfiltration Over C2 Channel",
+                      "Exfiltration",
+                      evidence=", ".join(sorted(external_ips)),
+                      reference="https://attack.mitre.org/techniques/T1041/")
+    for c in large_transfers:
+        report.suspicious_network.append(
+            f"대용량 전송: {c.dst_ip}:{c.dst_port} {c.bytes_out:,} bytes")
 
 
 # ---------------------------------------------------------------------------
