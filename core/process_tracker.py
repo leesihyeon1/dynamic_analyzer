@@ -6,6 +6,12 @@ Uses psutil to capture lightweight process snapshots before and after malware
 execution, then diffs them to surface newly-spawned and terminated processes.
 Optionally launches Process Hacker / System Informer as a live visual aid for
 the analyst.
+
+분석 도구 노이즈 필터링
+-----------------------
+``diff_process_snapshots`` 는 ProcMon·SystemInformer 등 분석 환경 자체 프로세스를
+``new_processes`` 목록에서 자동으로 제외합니다.
+제외 기준: :data:`_ANALYSIS_TOOL_PROC_NAMES` 참고.
 """
 
 from __future__ import annotations
@@ -17,6 +23,23 @@ from pathlib import Path
 
 import psutil
 
+
+# ---------------------------------------------------------------------------
+# Analysis tool process names — excluded from new_processes diff output
+# (lowercased for case-insensitive comparison)
+# ---------------------------------------------------------------------------
+_ANALYSIS_TOOL_PROC_NAMES: frozenset[str] = frozenset({
+    "systeminformer.exe",
+    "processhacker.exe",
+    "procmon.exe",
+    "procmon64.exe",
+    "procexp.exe",
+    "procexp64.exe",
+    "zoomit.exe",
+    "zoomit64.exe",
+    "tshark.exe",
+    "dumpcap.exe",
+})
 
 # ---------------------------------------------------------------------------
 # Process Hacker / System Informer search paths
@@ -148,7 +171,12 @@ def diff_process_snapshots(
     before_pids = set(before.keys())
     after_pids = set(after.keys())
 
-    new_processes = [after[pid] for pid in (after_pids - before_pids)]
+    # 분석 도구 프로세스는 new_processes 목록에서 제외
+    new_processes = [
+        after[pid]
+        for pid in (after_pids - before_pids)
+        if after[pid].name.lower() not in _ANALYSIS_TOOL_PROC_NAMES
+    ]
     terminated_processes = [before[pid] for pid in (before_pids - after_pids)]
 
     return {

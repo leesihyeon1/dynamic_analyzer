@@ -11,10 +11,18 @@ dynamic_analyzer — Windows 악성코드 동적 분석 도구
   python analyzer.py --list-interfaces                 # tshark 인터페이스 목록 확인
   python analyzer.py --check-tools                     # 사용 가능한 도구 확인
 
+  # Wireshark에서 미리 캡처한 PCAP 파일 분석
+  python analyzer.py malware.exe --pcap capture.pcap
+  python analyzer.py malware.exe --pcap capture.pcapng --no-tshark
+
+  # PCAP만 단독 분석 (샘플 실행 없이)
+  python analyzer.py --pcap capture.pcapng --no-procmon --no-tshark
+
 요구사항:
   - 관리자 권한으로 실행 (ProcMon, tshark 모두 필요)
   - FLARE VM 또는 동적 분석 전용 VM 환경 권장
   - pip install -r requirements.txt
+  - PCAP 분석: pip install scapy  (.pcap / .pcapng 모두 지원)
 """
 from __future__ import annotations
 
@@ -120,6 +128,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-ph",       action="store_true", help="Process Hacker GUI 실행 안 함")
     g.add_argument("--no-export",   action="store_true", help="파일 저장 없이 콘솔 출력만")
 
+    # PCAP 입력
+    pg = p.add_argument_group("PCAP 분석")
+    pg.add_argument("--pcap", metavar="FILE",
+                    help="Wireshark 등에서 미리 캡처한 PCAP/PCAPng 파일 경로. "
+                         "지정 시 tshark 캡처 대신 해당 파일로 네트워크 분석 수행")
+
     # 유틸리티
     p.add_argument("--check-tools",      action="store_true", help="도구 설치 상태 확인 후 종료")
     p.add_argument("--list-interfaces",  action="store_true", help="tshark 인터페이스 목록 후 종료")
@@ -140,6 +154,15 @@ def main() -> None:
         _list_interfaces()
         sys.exit(0)
 
+    # ── scapy 가용성 확인 (PCAP 분석 필수) ──────────────────────
+    try:
+        import scapy  # noqa: F401
+    except ImportError:
+        console.print(
+            "[yellow]⚠ scapy 미설치 — PCAP 분석이 비활성화됩니다.[/yellow]\n"
+            "  설치: [bold]pip install scapy[/bold]"
+        )
+
     # ── 입력 검증 ────────────────────────────────────────────────
     sample_path = None
     if args.input:
@@ -147,6 +170,20 @@ def main() -> None:
         if not sample_path.exists():
             console.print(f"[red][!] 파일 없음: {sample_path}[/red]")
             sys.exit(1)
+
+    # ── 외부 PCAP 검증 ──────────────────────────────────────────
+    external_pcap = None
+    if args.pcap:
+        external_pcap = Path(args.pcap)
+        if not external_pcap.exists():
+            console.print(f"[red][!] PCAP 파일 없음: {external_pcap}[/red]")
+            sys.exit(1)
+        suffix = external_pcap.suffix.lower()
+        if suffix not in (".pcap", ".pcapng", ".cap"):
+            console.print(
+                f"[yellow]⚠ 알 수 없는 확장자: {suffix} "
+                f"— .pcap / .pcapng / .cap 파일을 권장합니다.[/yellow]"
+            )
 
     # ── 관리자 권한 경고 ────────────────────────────────────────
     if not _check_admin():
@@ -169,6 +206,8 @@ def main() -> None:
         console.print(f"  대상   : {sample_path.resolve()}")
     else:
         console.print(f"  대상   : [yellow]지정 없음 — 모니터링 시작 후 직접 실행하세요[/yellow]")
+    if external_pcap:
+        console.print(f"  PCAP   : {external_pcap.resolve()}")
     console.print(f"  출력   : {out_dir.resolve()}")
     console.print(f"  timeout: {args.timeout}초")
     console.print()
@@ -176,13 +215,14 @@ def main() -> None:
     from core.orchestrator import AnalysisConfig, run_analysis
 
     config = AnalysisConfig(
-        sample_path = sample_path,
-        output_dir  = out_dir,
-        timeout     = args.timeout,
-        interface   = args.interface,
-        no_procmon  = args.no_procmon,
-        no_tshark   = args.no_tshark,
-        no_ph       = args.no_ph,
+        sample_path   = sample_path,
+        output_dir    = out_dir,
+        timeout       = args.timeout,
+        interface     = args.interface,
+        no_procmon    = args.no_procmon,
+        no_tshark     = args.no_tshark,
+        no_ph         = args.no_ph,
+        external_pcap = external_pcap,
     )
 
     def on_status(msg: str) -> None:

@@ -47,7 +47,91 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .ev-registry { color: #d2a8ff; }
 .ev-process  { color: #ffa657; }
 .ev-network  { color: #56d364; }
+.pg-wrap{display:flex;align-items:center;gap:.75rem;padding:.6rem 0;flex-wrap:wrap;border-top:1px solid #21262d;margin-top:.25rem}
+.pg-info{color:#8b949e;font-size:.78rem;flex:1}
+.pg-btns{display:flex;gap:.2rem;flex-wrap:wrap}
+.pg-btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:.18rem .52rem;font-size:.78rem;cursor:pointer;min-width:28px}
+.pg-btn:hover{background:#30363d}
+.pg-active{background:#1f6feb!important;color:#fff!important;border-color:#1f6feb!important}
+.pg-ellipsis{color:#8b949e;padding:0 .2rem;line-height:2;font-size:.78rem}
 """
+
+_JS = """
+function setupPagination(tableId, rowsPerPage) {
+    var table = document.getElementById(tableId);
+    if (!table) return;
+    var allRows = Array.prototype.slice.call(table.rows, 1); // skip header
+    var total = allRows.length;
+    if (total <= rowsPerPage) return;
+    var totalPages = Math.ceil(total / rowsPerPage);
+    var cur = 1;
+    var wrapper = document.createElement('div');
+    wrapper.className = 'pg-wrap';
+    table.parentNode.insertBefore(wrapper, table.nextSibling);
+    function render(page) {
+        cur = page;
+        allRows.forEach(function(row, i) {
+            row.style.display = (i >= (page-1)*rowsPerPage && i < page*rowsPerPage) ? '' : 'none';
+        });
+        var start = (page-1)*rowsPerPage + 1;
+        var end = Math.min(page*rowsPerPage, total);
+        wrapper.innerHTML = '';
+        var info = document.createElement('span');
+        info.className = 'pg-info';
+        info.textContent = start + '–' + end + ' / 중 ' + total + '행';
+        wrapper.appendChild(info);
+        var btns = document.createElement('span');
+        btns.className = 'pg-btns';
+        function mkBtn(p, label, active) {
+            var b = document.createElement('button');
+            b.textContent = label !== undefined ? label : p;
+            b.className = 'pg-btn' + (active ? ' pg-active' : '');
+            b.onclick = function(){ render(p); };
+            btns.appendChild(b);
+        }
+        function mkEll() {
+            var s = document.createElement('span');
+            s.className = 'pg-ellipsis';
+            s.textContent = '…';
+            btns.appendChild(s);
+        }
+        if (page > 1) mkBtn(page-1, '‹');
+        var pages = [1];
+        for (var p = Math.max(2, page-2); p <= Math.min(totalPages-1, page+2); p++) pages.push(p);
+        if (totalPages > 1) pages.push(totalPages);
+        // deduplicate
+        pages = pages.filter(function(v,i,a){ return a.indexOf(v) === i; });
+        var last = 0;
+        pages.forEach(function(p) {
+            if (p - last > 1) mkEll();
+            mkBtn(p, p, p === cur);
+            last = p;
+        });
+        if (page < totalPages) mkBtn(page+1, '›');
+        wrapper.appendChild(btns);
+    }
+    render(1);
+}
+"""
+
+_PG_INIT = """<script>
+window.addEventListener('load', function() {
+  setupPagination('tbl-file', 100);
+  setupPagination('tbl-reg-diff', 100);
+  setupPagination('tbl-reg-procmon', 100);
+  setupPagination('tbl-net-beacon', 100);
+  setupPagination('tbl-net-tls', 100);
+  setupPagination('tbl-net-conn', 100);
+  setupPagination('tbl-net-dns', 100);
+  setupPagination('tbl-net-http', 100);
+  setupPagination('tbl-ioc-ip', 100);
+  setupPagination('tbl-ioc-domain', 100);
+  setupPagination('tbl-ioc-file', 100);
+  setupPagination('tbl-ioc-reg', 100);
+  setupPagination('tbl-ioc-url', 100);
+  setupPagination('tbl-proc-net', 100);
+});
+</script>"""
 
 _TACTIC_COLOR = {
     "Execution":        "red",
@@ -95,13 +179,15 @@ def _section_html(result) -> str:
 
 def _file_events_html(result) -> str:
     from parsers.procmon_csv import EventCategory
+    # CreateFile 제외 — Windows에서 CreateFile은 파일 열기(읽기)도 포함하므로
+    # 실제 쓰기/변경 작업(WriteFile, DeleteFile, RenameFile, SetEndOfFile)만 표시
     events = [e for e in result.filtered_events if e.category == EventCategory.FILE
-              and e.operation in ("WriteFile","CreateFile","DeleteFile","RenameFile","SetEndOfFile")]
+              and e.operation in ("WriteFile","DeleteFile","RenameFile","SetEndOfFile")]
     if not events:
         return "<p class='alert alert-success'>파일 시스템 이벤트 없음</p>"
     rows = ""
-    op_color = {"WriteFile":"blue","CreateFile":"green","DeleteFile":"red","RenameFile":"yellow","SetEndOfFile":"gray"}
-    for e in events[:200]:
+    op_color = {"WriteFile":"blue","DeleteFile":"red","RenameFile":"yellow","SetEndOfFile":"gray"}
+    for e in events[:2000]:
         rows += (
             f"<tr>"
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
@@ -111,10 +197,9 @@ def _file_events_html(result) -> str:
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
             f"</tr>"
         )
-    extra = f"<p style='color:#8b949e;font-size:0.8rem'>... 외 {len(events)-200}개</p>" if len(events) > 200 else ""
     return (
-        "<table><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
-        f"{rows}</table>{extra}"
+        "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
+        f"{rows}</table>"
     )
 
 
@@ -131,26 +216,26 @@ def _registry_events_html(result) -> str:
     # RegShot diff
     if added or modified:
         rows = ""
-        for k, n, v in added[:50]:
+        for k, n, v in added[:500]:
             rows += (f"<tr><td>{_b('추가','green')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td></tr>")
-        for k, n, o, nw in modified[:50]:
+        for k, n, o, nw in modified[:500]:
             rows += (f"<tr><td>{_b('변경','orange')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td></tr>")
         parts.append(
             "<h3>레지스트리 스냅샷 비교 (Regshot)</h3>"
-            "<table><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th></tr>"
+            "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th></tr>"
             f"{rows}</table>"
         )
 
     # ProcMon 이벤트
     if events:
         rows = ""
-        for e in events[:100]:
+        for e in events[:1000]:
             rows += (
                 f"<tr>"
                 f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
@@ -162,7 +247,7 @@ def _registry_events_html(result) -> str:
             )
         parts.append(
             "<h3>ProcMon 레지스트리 이벤트</h3>"
-            "<table><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th></tr>"
+            "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th></tr>"
             f"{rows}</table>"
         )
 
@@ -209,11 +294,11 @@ def _network_html(result) -> str:
             f"<td class='mono'>{b.interval_avg}s</td>"
             f"<td>{_b(f'지터 {b.jitter_ratio:.1%}', 'red' if b.jitter_ratio < 0.1 else 'orange')}</td>"
             f"</tr>"
-            for b in beacons[:20]
+            for b in beacons[:100]
         )
         parts.append(
             "<h3>🚨 비콘(Beaconing) 탐지</h3>"
-            "<table><tr><th>목적지 IP</th><th>포트</th><th>횟수</th>"
+            "<table id='tbl-net-beacon'><tr><th>목적지 IP</th><th>포트</th><th>횟수</th>"
             "<th>평균 간격</th><th>규칙성</th></tr>"
             f"{rows}</table>"
         )
@@ -231,11 +316,11 @@ def _network_html(result) -> str:
             f"<td class='mono'>{_e(t.dst_ip)}</td>"
             f"<td class='mono'>{t.dst_port}</td>"
             f"</tr>"
-            for t in list(seen.values())[:100]
+            for t in list(seen.values())[:500]
         )
         parts.append(
             "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
-            "<table><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th></tr>"
+            "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th></tr>"
             f"{rows}</table>"
         )
 
@@ -254,7 +339,7 @@ def _network_html(result) -> str:
     # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
         rows = ""
-        for c in sorted(pcap.connections, key=lambda x: -x.bytes_out)[:100]:
+        for c in sorted(pcap.connections, key=lambda x: -x.bytes_out)[:1000]:
             ext = not _is_private_ip_str(c.dst_ip)
             ip_color = "ev-network" if ext else ""
             susp_badge = _b("!", "red") if c.suspicious_port else ""
@@ -273,7 +358,7 @@ def _network_html(result) -> str:
             )
         parts.append(
             "<h3>네트워크 연결 (송신량 순)</h3>"
-            "<table><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
+            "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
             "<th>포트</th><th>횟수</th><th>송신량</th></tr>"
             f"{rows}</table>"
         )
@@ -290,11 +375,11 @@ def _network_html(result) -> str:
             f"{_e(', '.join(q.response_ips[:3]))}</td>"
             f"{'<td>' + _b('DGA?','red') + '</td>' if q.suspicious else '<td></td>'}"
             f"</tr>"
-            for q in sorted(pcap.dns_queries, key=lambda x: -x.entropy)[:100]
+            for q in sorted(pcap.dns_queries, key=lambda x: -x.entropy)[:1000]
         )
         parts.append(
             "<h3>DNS 쿼리 (엔트로피 순)</h3>"
-            "<table><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
+            "<table id='tbl-net-dns'><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
             "<th>응답 IP</th><th>의심</th></tr>"
             f"{rows}</table>"
         )
@@ -310,11 +395,11 @@ def _network_html(result) -> str:
             f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
             f"<td>{'🍪' if r.has_cookie else ''}</td>"
             f"</tr>"
-            for r in pcap.http_requests[:50]
+            for r in pcap.http_requests[:500]
         )
         parts.append(
             "<h3>HTTP 요청</h3>"
-            "<table><tr><th>메서드</th><th>호스트</th><th>경로</th>"
+            "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
             "<th>User-Agent</th><th>Body</th><th>Cookie</th></tr>"
             f"{rows}</table>"
         )
@@ -332,6 +417,35 @@ def _is_private_ip_str(ip: str) -> bool:
                 or (a == 192 and b == 168) or a == 127)
     except Exception:
         return False
+
+
+def _process_network_html(result) -> str:
+    """프로세스↔네트워크 연결 매핑 테이블"""
+    pnmap = getattr(result, "process_network_map", [])
+    if not pnmap:
+        return "<p class='alert alert-info'>ProcMon 네트워크 이벤트 없음 (procmon 필요)</p>"
+
+    rows = ""
+    for c in pnmap[:1000]:
+        dir_color = "blue" if c.direction == "outbound" else "orange"
+        dir_label = "→ 송신" if c.direction == "outbound" else "← 수신"
+        rows += (
+            f"<tr>"
+            f"<td class='mono ev-process'>{_e(c.process)}"
+            f" <span style='color:#8b949e'>({c.pid})</span></td>"
+            f"<td>{_b(c.proto, 'blue')}</td>"
+            f"<td>{_b(dir_label, dir_color)}</td>"
+            f"<td class='mono ev-network'>{_e(c.remote_ip)}</td>"
+            f"<td class='mono'>{c.remote_port}</td>"
+            f"<td style='color:#8b949e;text-align:right'>{c.event_count:,}</td>"
+            f"</tr>"
+        )
+    return (
+        "<table id='tbl-proc-net'>"
+        "<tr><th>프로세스</th><th>프로토콜</th><th>방향</th>"
+        "<th>외부 IP</th><th>포트</th><th>이벤트</th></tr>"
+        f"{rows}</table>"
+    )
 
 
 def _process_html(result) -> str:
@@ -361,17 +475,18 @@ def _ioc_html(result) -> str:
         return ""
     parts = []
 
-    def _list_table(title: str, items: list, label: str) -> str:
+    def _list_table(title: str, items: list, label: str, table_id: str = "") -> str:
         if not items:
             return ""
-        rows = "".join(f"<tr><td class='mono'>{_e(str(i))}</td></tr>" for i in items[:100])
-        return f"<h3>{title}</h3><table><tr><th>{label}</th></tr>{rows}</table>"
+        id_attr = f" id='{table_id}'" if table_id else ""
+        rows = "".join(f"<tr><td class='mono'>{_e(str(i))}</td></tr>" for i in items[:1000])
+        return f"<h3>{title}</h3><table{id_attr}><tr><th>{label}</th></tr>{rows}</table>"
 
-    parts.append(_list_table("외부 IP", ioc.ip_addresses, "IP 주소"))
-    parts.append(_list_table("도메인", ioc.domains, "도메인"))
-    parts.append(_list_table("드롭된 파일", ioc.dropped_files, "파일 경로"))
-    parts.append(_list_table("레지스트리 키", ioc.registry_keys, "키 경로"))
-    parts.append(_list_table("URL", ioc.urls, "URL"))
+    parts.append(_list_table("외부 IP", ioc.ip_addresses, "IP 주소", "tbl-ioc-ip"))
+    parts.append(_list_table("도메인", ioc.domains, "도메인", "tbl-ioc-domain"))
+    parts.append(_list_table("드롭된 파일", ioc.dropped_files, "파일 경로", "tbl-ioc-file"))
+    parts.append(_list_table("레지스트리 키", ioc.registry_keys, "키 경로", "tbl-ioc-reg"))
+    parts.append(_list_table("URL", ioc.urls, "URL", "tbl-ioc-url"))
 
     return "\n".join(p for p in parts if p)
 
@@ -403,6 +518,7 @@ def generate_html_report(result, output_path: str) -> None:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dynamic Analysis — {_e(sample_name)}</title>
 <style>{_CSS}</style>
+<script>{_JS}</script>
 </head>
 <body>
 <div class="container">
@@ -451,6 +567,10 @@ def generate_html_report(result, output_path: str) -> None:
 <h2>🎯 MITRE ATT&CK 매핑</h2>
 {_section_html(result)}
 
+<!-- ── 프로세스↔네트워크 매핑 ── -->
+<h2>🔗 프로세스↔네트워크 연결 매핑 (ProcMon)</h2>
+{_process_network_html(result)}
+
 <!-- ── 프로세스 트리 ── -->
 <h2>🌲 신규 프로세스 (Process Hacker / psutil)</h2>
 {_process_html(result)}
@@ -472,6 +592,7 @@ def generate_html_report(result, output_path: str) -> None:
 {_ioc_html(result)}
 
 </div>
+{_PG_INIT}
 </body>
 </html>"""
 

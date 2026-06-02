@@ -32,6 +32,7 @@ class AnalysisConfig:
     no_procmon:    bool = False
     no_tshark:     bool = False
     no_ph:         bool = False
+    external_pcap: Optional[Path] = None  # 외부 PCAP 파일 경로 (Wireshark 등)
 
 
 @dataclass
@@ -56,6 +57,7 @@ class AnalysisResult:
     sample_pid:         Optional[int] = None
     all_pids:           set   = field(default_factory=set)    # 샘플 + 자식 PID
     errors:             list  = field(default_factory=list)
+    process_network_map: list = field(default_factory=list)  # list[ProcNetConnection]
 
 
 def run_analysis(
@@ -87,7 +89,8 @@ def run_analysis(
     from parsers.pcap_parser   import parse_pcap, PcapResult
     from analysis.noise_filter import filter_events
     from analysis.behavior_classifier import classify_behaviors
-    from analysis.ioc_extractor import extract_iocs
+    from analysis.ioc_extractor       import extract_iocs
+    from analysis.process_network_map import build_process_network_map
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     pm = ProcMonController(
@@ -133,6 +136,7 @@ def run_analysis(
             result.errors.append("tshark 시작 실패")
             result.tools_used["tshark"] = False
 
+    ph_proc = None
     if result.tools_used["process_hacker"]:
         ph_proc = launch_process_hacker(ph_path)
         if ph_proc is None:
@@ -198,6 +202,18 @@ def run_analysis(
     if result.tools_used["tshark"]:
         ts.stop()
 
+    # Process Hacker / System Informer 종료
+    if ph_proc is not None and ph_proc.poll() is None:
+        try:
+            ph_proc.terminate()
+            ph_proc.wait(timeout=5)
+            status("      Process Hacker 종료됨")
+        except Exception:
+            try:
+                ph_proc.kill()
+            except Exception:
+                pass
+
     # ── 6. 사후 스냅샷 ────────────────────────────────────────────────
     status("[6/6] 사후 스냅샷 수집 중...")
     reg_after  = take_snapshot() if REG_AVAILABLE else {}
@@ -222,13 +238,48 @@ def run_analysis(
         status(f"      이벤트 {len(result.procmon_events):,}개 → 필터 후 {len(result.filtered_events):,}개")
 
     status("[분석] PCAP 파싱...")
-    if ts.pcap_path.exists():
-        result.pcap_result = parse_pcap(ts.pcap_path)
-        status(f"      연결 {len(result.pcap_result.connections)}개  "
-               f"DNS {len(result.pcap_result.dns_queries)}건")
+    from parsers.pcap_parser import SCAPY_AVAILABLE
+    if not SCAPY_AVAILABLE:
+        if ts.tshark_path:
+            status("      scapy 없음 → tshark 파서로 대체 분석")
+        else:
+            status("      [경고] scapy·tshark 모두 없음 — 네트워크 분석 불가 (pip install scapy)")
+
+    # 우선순위: 외부 PCAP(--pcap) > tshark 캡처 파일
+    pcap_target = None
+    if config.external_pcap and config.external_pcap.exists():
+        pcap_target = config.external_pcap
+        status(f"      외부 PCAP 사용: {config.external_pcap.name}  "
+               f"({config.external_pcap.stat().st_size:,} bytes)")
+    elif ts.pcap_path.exists():
+        pcap_target = ts.pcap_path
+        status(f"      캡처 파일: {ts.pcap_path.name}  "
+               f"({ts.pcap_path.stat().st_size:,} bytes)")
+
+    tshark_bin = str(ts.tshark_path) if ts.tshark_path else None
+    if pcap_target:
+        result.pcap_result = parse_pcap(pcap_target, tshark_path=tshark_bin)
+        pr = result.pcap_result
+        if pr.parse_error:
+            status(f"      [오류] {pr.parse_error}")
+            result.errors.append(f"PCAP 파싱 오류: {pr.parse_error}")
+        else:
+            ip_only = pr.packets_loaded - pr.packets_skipped
+            status(f"      패킷 {pr.packets_loaded:,}개 로드  "
+                   f"(IP/TCP/UDP {ip_only:,}개, 건너뜀 {pr.packets_skipped:,}개)")
+            status(f"      연결 {len(pr.connections)}개  "
+                   f"DNS {len(pr.dns_queries)}건  "
+                   f"TLS SNI {len(pr.tls_info)}건  "
+                   f"HTTP {len(pr.http_requests)}건")
+            if pr.beacon_candidates:
+                status(f"      [!] 비콘 의심 {len(pr.beacon_candidates)}개 탐지")
+            if pr.suspicious_domains:
+                status(f"      [!] 의심 도메인 {len(pr.suspicious_domains)}개 (DGA/터널링)")
     else:
         from parsers.pcap_parser import PcapResult as _PR
         result.pcap_result = _PR()
+        if not config.no_tshark:
+            status("      PCAP 파일 없음 (tshark 미실행 또는 캡처 실패)")
 
     # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
     status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
@@ -244,6 +295,11 @@ def run_analysis(
         result.registry_diff,
         result.process_diff,
     )
+
+    status("[분석] 프로세스↔네트워크 연결 매핑...")
+    result.process_network_map = build_process_network_map(result.filtered_events)
+    if result.process_network_map:
+        status(f"      {len(result.process_network_map)}개 연결 집계")
 
     result.end_time = time.time()
     elapsed_total = result.end_time - result.start_time

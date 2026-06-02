@@ -160,6 +160,10 @@ class PcapResult:
     raw_domains: set[str] = field(default_factory=set)
     # DNS A/AAAA 응답: IP → [domain]
     ip_to_domain: dict[str, list[str]] = field(default_factory=dict)
+    # 진단 정보
+    packets_loaded: int = 0       # rdpcap으로 읽은 총 패킷 수
+    packets_skipped: int = 0      # IP/TCP/UDP 레이어 없어 건너뛴 패킷 수
+    parse_error: str = ""         # 파싱 실패 원인 (정상이면 빈 문자열)
 
 
 # ---------------------------------------------------------------------------
@@ -360,25 +364,252 @@ def _detect_beacons(
 
 
 # ---------------------------------------------------------------------------
+# tshark 기반 파서 (scapy 없이 동작하는 fallback)
+# ---------------------------------------------------------------------------
+
+def _run_tshark_fields(
+    tshark_path: str,
+    pcap_path: Path,
+    fields: list[str],
+    display_filter: str = "",
+    occurrence: str = "f",
+) -> list[list[str]]:
+    """tshark -T fields 실행 → 행×열 리스트 반환"""
+    import subprocess
+
+    cmd = [tshark_path, "-r", str(pcap_path), "-T", "fields"]
+    for f in fields:
+        cmd += ["-e", f]
+    cmd += ["-E", "separator=\t", f"-E", f"occurrence={occurrence}", "-E", "quote=n"]
+    if display_filter:
+        cmd += ["-Y", display_filter]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, timeout=300,
+            encoding="utf-8", errors="replace",
+        )
+        return [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
+    except Exception:
+        return []
+
+
+def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
+    """
+    tshark를 이용해 PCAP을 파싱한다 (scapy 대체).
+
+    Pass 1 — 전체 패킷: 연결 추적 + DNS 쿼리 + TLS SNI
+    Pass 2 — DNS 응답:  IP↔도메인 매핑
+    Pass 3 — HTTP 요청: 메서드·호스트·User-Agent
+    """
+    conn_map:     dict[tuple, NetworkConnection]  = {}
+    dns_seen:     dict[str, DNSQuery]             = {}
+    ip_to_domain: dict[str, list[str]]            = defaultdict(list)
+    http_list:    list[HTTPRequest]               = []
+    tls_list:     list[TLSInfo]                   = []
+    beacon_ts:    dict[tuple, list[float]]        = defaultdict(list)
+    dns_base_cnt: dict[str, int]                  = defaultdict(int)
+    raw_ips:      set[str]                        = set()
+    raw_domains:  set[str]                        = set()
+    total_bytes_out = 0
+    total_bytes_in  = 0
+    packets_loaded  = 0
+    packets_skipped = 0
+
+    # ── Pass 1 ────────────────────────────────────────────────────────
+    P1 = [
+        "frame.time_epoch",                        # 0
+        "ip.src",                                  # 1  (IPv4)
+        "ip.dst",                                  # 2
+        "ipv6.src",                                # 3  (IPv6 fallback)
+        "ipv6.dst",                                # 4
+        "tcp.dstport",                             # 5
+        "udp.dstport",                             # 6
+        "frame.len",                               # 7
+        "dns.qry.name",                            # 8
+        "dns.qry.type",                            # 9
+        "tls.handshake.extensions_server_name",    # 10
+    ]
+    for row in _run_tshark_fields(tshark_path, pcap_path, P1):
+        packets_loaded += 1
+        try:
+            def _f(i: int) -> str:
+                return row[i].strip() if i < len(row) else ""
+
+            src_ip  = _f(1) or _f(3)
+            dst_ip  = _f(2) or _f(4)
+            tcp_dp  = _f(5)
+            udp_dp  = _f(6)
+            flen    = int(_f(7)) if _f(7).isdigit() else 0
+            ts_str  = _f(0)
+            ts      = float(ts_str) if ts_str else 0.0
+
+            if not src_ip or not dst_ip:
+                packets_skipped += 1
+                continue
+
+            if tcp_dp and tcp_dp.isdigit():
+                proto, dst_port = "TCP", int(tcp_dp)
+            elif udp_dp and udp_dp.isdigit():
+                proto, dst_port = "UDP", int(udp_dp)
+            else:
+                packets_skipped += 1
+                continue
+
+            # 연결 추적
+            key = (proto, src_ip, dst_ip, dst_port)
+            if key in conn_map:
+                c = conn_map[key]
+                c.count     += 1
+                c.bytes_out += flen
+                c.last_seen  = ts
+            else:
+                conn_map[key] = NetworkConnection(
+                    proto=proto, src_ip=src_ip, dst_ip=dst_ip,
+                    dst_port=dst_port, count=1,
+                    bytes_out=flen, bytes_in=0,
+                    first_seen=ts, last_seen=ts,
+                    suspicious_port=(dst_port in SUSPICIOUS_PORTS),
+                )
+
+            if not _is_private_ip(dst_ip):
+                raw_ips.add(dst_ip)
+                total_bytes_out += flen
+                beacon_ts[(dst_ip, dst_port)].append(ts)
+            else:
+                total_bytes_in += flen
+
+            # DNS 쿼리
+            dns_name = _f(8).rstrip(".")
+            if dns_name:
+                raw_domains.add(dns_name)
+                dns_base_cnt[_base_domain(dns_name)] += 1
+                if dns_name not in dns_seen:
+                    qt_raw = _f(9)
+                    qtype  = _QTYPE_MAP.get(int(qt_raw) if qt_raw.isdigit() else 0, qt_raw or "A")
+                    ent    = _subdomain_entropy(dns_name)
+                    dns_seen[dns_name] = DNSQuery(
+                        name=dns_name, qtype=qtype, entropy=round(ent, 3),
+                    )
+
+            # TLS SNI
+            sni = _f(10)
+            if sni:
+                raw_domains.add(sni)
+                tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
+
+        except Exception:
+            packets_skipped += 1
+            continue
+
+    # ── Pass 2: DNS 응답 → IP 매핑 ───────────────────────────────────
+    P2 = ["dns.qry.name", "dns.a", "dns.aaaa"]
+    for row in _run_tshark_fields(
+        tshark_path, pcap_path, P2,
+        display_filter="dns.flags.response == 1",
+    ):
+        try:
+            qname = row[0].rstrip(".") if len(row) > 0 else ""
+            for ip in [row[1] if len(row) > 1 else "",
+                       row[2] if len(row) > 2 else ""]:
+                ip = ip.strip()
+                if ip and not _is_private_ip(ip):
+                    if qname in dns_seen:
+                        if ip not in dns_seen[qname].response_ips:
+                            dns_seen[qname].response_ips.append(ip)
+                    ip_to_domain[ip].append(qname)
+        except Exception:
+            continue
+
+    # ── Pass 3: HTTP 요청 ─────────────────────────────────────────────
+    P3 = [
+        "ip.dst", "http.host", "http.request.method",
+        "http.request.uri", "http.user_agent",
+        "http.content_length", "http.referer",
+    ]
+    for row in _run_tshark_fields(
+        tshark_path, pcap_path, P3, display_filter="http.request",
+    ):
+        try:
+            def _h(i: int) -> str:
+                return row[i].strip() if i < len(row) else ""
+            method = _h(2)
+            if not method:
+                continue
+            cl_str = _h(5)
+            http_list.append(HTTPRequest(
+                method=method,
+                host=_h(1),
+                path=_h(3),
+                user_agent=_h(4),
+                content_length=int(cl_str) if cl_str.isdigit() else 0,
+                referer=_h(6),
+            ))
+        except Exception:
+            continue
+
+    # ── 공통 후처리 ──────────────────────────────────────────────────
+    suspicious_domains: list[str] = []
+    for name, q in dns_seen.items():
+        if (q.entropy >= DGA_ENTROPY_THRESHOLD
+                or len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN
+                or dns_base_cnt.get(_base_domain(name), 0) >= DNS_TUNNEL_QUERY_THRESHOLD):
+            q.suspicious = True
+            suspicious_domains.append(name)
+
+    dns_tunnel_suspects = [
+        d for d, cnt in dns_base_cnt.items()
+        if cnt >= DNS_TUNNEL_QUERY_THRESHOLD
+    ]
+
+    summary = PcapSummary(
+        total_packets=packets_loaded,
+        total_bytes_out=total_bytes_out,
+        total_bytes_in=total_bytes_in,
+        unique_dst_ips=len(raw_ips),
+        unique_domains=len(raw_domains),
+    )
+
+    return PcapResult(
+        connections=list(conn_map.values()),
+        dns_queries=list(dns_seen.values()),
+        http_requests=http_list,
+        tls_info=tls_list,
+        beacon_candidates=_detect_beacons(beacon_ts),
+        suspicious_domains=sorted(set(suspicious_domains)),
+        dns_tunnel_suspects=sorted(set(dns_tunnel_suspects)),
+        summary=summary,
+        raw_ips=raw_ips,
+        raw_domains=raw_domains,
+        ip_to_domain=dict(ip_to_domain),
+        packets_loaded=packets_loaded,
+        packets_skipped=packets_skipped,
+        parse_error="",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def parse_pcap(pcap_path: Path) -> PcapResult:
+def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult:
     """PCAP 파일을 파싱해 구조화된 네트워크 정보를 반환.
 
-    scapy 미설치 시 빈 PcapResult 반환 (예외 없음).
+    scapy가 없으면 tshark_path를 이용한 fallback 파서를 사용한다.
+    둘 다 없을 경우 parse_error 필드에 원인을 담아 반환한다.
     """
     if not SCAPY_AVAILABLE:
-        return PcapResult()
+        if tshark_path:
+            return _parse_pcap_with_tshark(Path(pcap_path), tshark_path)
+        return PcapResult(parse_error="scapy 미설치 (pip install scapy)")
 
     pcap_path = Path(pcap_path)
     if not pcap_path.exists():
-        return PcapResult()
+        return PcapResult(parse_error=f"파일 없음: {pcap_path}")
 
     try:
         packets = rdpcap(str(pcap_path))
-    except Exception:
-        return PcapResult()
+    except Exception as e:
+        return PcapResult(parse_error=f"PCAP 읽기 실패: {e}")
 
     # --- 수집 자료구조 ---
     conn_map:     dict[tuple, NetworkConnection]  = {}
@@ -391,9 +622,12 @@ def parse_pcap(pcap_path: Path) -> PcapResult:
     dns_base_cnt: dict[str, int]                  = defaultdict(int)   # base_domain→query count
     raw_ips:      set[str]                        = set()
     raw_domains:  set[str]                        = set()
-    total_bytes_out = 0
-    total_bytes_in  = 0
-    total_packets   = 0
+    total_bytes_out  = 0
+    total_bytes_in   = 0
+    total_packets    = 0
+    packets_loaded   = len(packets)   # rdpcap 성공 후 총 패킷 수
+    packets_skipped  = 0
+    pkt_errors: list[str] = []
 
     for pkt in packets:
         try:
@@ -407,6 +641,7 @@ def parse_pcap(pcap_path: Path) -> PcapResult:
                 src_ip = pkt[IPv6].src
                 dst_ip = pkt[IPv6].dst
             else:
+                packets_skipped += 1
                 continue
 
             pkt_len = len(pkt)
@@ -429,6 +664,7 @@ def parse_pcap(pcap_path: Path) -> PcapResult:
                 dst_port = pkt[UDP].dport
                 src_port = pkt[UDP].sport
             else:
+                packets_skipped += 1
                 continue
 
             # --- 연결 추적 ---
@@ -528,7 +764,11 @@ def parse_pcap(pcap_path: Path) -> PcapResult:
                     if req:
                         http_list.append(req)
 
-        except Exception:
+        except Exception as e:
+            # 처음 10개 패킷 오류만 기록 (과도한 로그 방지)
+            if len(pkt_errors) < 10:
+                pkt_errors.append(str(e))
+            packets_skipped += 1
             continue
 
     # --- DNS 응답 IP 병합 ---
@@ -563,6 +803,10 @@ def parse_pcap(pcap_path: Path) -> PcapResult:
         unique_domains=len(raw_domains),
     )
 
+    parse_error = ""
+    if pkt_errors:
+        parse_error = f"패킷 파싱 오류 {len(pkt_errors)}건 (처음 오류: {pkt_errors[0]})"
+
     return PcapResult(
         connections=list(conn_map.values()),
         dns_queries=list(dns_seen.values()),
@@ -575,4 +819,7 @@ def parse_pcap(pcap_path: Path) -> PcapResult:
         raw_ips=raw_ips,
         raw_domains=raw_domains,
         ip_to_domain=dict(ip_to_domain),
+        packets_loaded=packets_loaded,
+        packets_skipped=packets_skipped,
+        parse_error=parse_error,
     )

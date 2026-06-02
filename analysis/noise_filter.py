@@ -21,6 +21,7 @@ from parsers.procmon_csv import ProcMonEvent, EventCategory
 # Processes to ignore completely (compared in lowercase)
 NOISY_PROCESSES: frozenset[str] = frozenset(
     {
+        # ── Windows OS 노이즈 프로세스 ───────────────────────────────────
         "system",
         "registry",
         "smss.exe",
@@ -46,6 +47,18 @@ NOISY_PROCESSES: frozenset[str] = frozenset(
         "dashost.exe",
         "fontdrvhost.exe",
         "dwm.exe",
+        # ── 분석 도구 프로세스 — 이벤트 전체 제거 ───────────────────────
+        "procmon.exe",
+        "procmon64.exe",
+        "procexp.exe",
+        "procexp64.exe",
+        "systeminformer.exe",
+        "processhacker.exe",
+        "tshark.exe",
+        "dumpcap.exe",
+        "wireshark.exe",
+        "zoomit.exe",
+        "zoomit64.exe",
     }
 )
 

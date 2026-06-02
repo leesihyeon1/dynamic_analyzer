@@ -11,13 +11,16 @@ ProcMon · tshark · winreg · psutil 을 조합해 **Noriben.py** 스타일로 
 | 기능 | 설명 |
 |------|------|
 | **ProcMon 자동화** | 백그라운드 실행 → CSV 변환 → 파싱 |
-| **패킷 캡처** | tshark로 pcap 수집, scapy로 연결/DNS/HTTP 분석 |
+| **패킷 캡처** | tshark로 pcap 수집, scapy/tshark로 연결/DNS/TLS SNI/HTTP 분석 |
+| **외부 PCAP 분석** | `--pcap` 옵션으로 Wireshark 캡처 파일 직접 분석 |
+| **scapy 없이 PCAP 분석** | scapy 미설치 시 tshark fallback 파서로 자동 대체 |
 | **레지스트리 diff** | 실행 전·후 winreg 스냅샷 비교 (Regshot 대체) |
 | **프로세스 추적** | psutil로 자식 PID 추적, 신규/종료 프로세스 감지 |
-| **노이즈 필터** | 시스템 프로세스·경로 제거, 샘플 관련 이벤트만 집중 |
+| **프로세스↔네트워크 매핑** | ProcMon TCP/UDP 이벤트 기반, 프로세스별 외부 연결 집계 |
+| **노이즈 필터** | 시스템 프로세스 + 분석 도구(ProcMon·tshark·SystemInformer 등) 이벤트 자동 제거 |
 | **MITRE ATT&CK** | 행동 패턴 → 기법 자동 매핑 (T1059, T1547, T1486 등) |
 | **IOC 추출** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL |
-| **리포트 생성** | 다크 테마 HTML + 구조화된 JSON |
+| **리포트 생성** | 다크 테마 HTML(페이지네이션 지원) + 구조화된 JSON |
 
 ---
 
@@ -35,7 +38,7 @@ pip install -r requirements.txt
 
 ```
 psutil>=5.9.0
-scapy>=2.5.0
+scapy>=2.5.0   # 없으면 tshark fallback 파서로 자동 대체
 rich>=13.7.0
 ```
 
@@ -80,6 +83,19 @@ python analyzer.py malware.exe --no-ph
 python analyzer.py malware.exe --no-export
 ```
 
+### PCAP 분석
+
+```powershell
+# Wireshark에서 미리 캡처한 파일을 분석에 사용
+python analyzer.py malware.exe --pcap capture.pcapng
+
+# PCAP만 단독 분석 (샘플 실행 없이)
+python analyzer.py --pcap capture.pcapng --no-procmon --no-tshark
+
+# 전체 시스템 모니터링 모드 (샘플 미지정)
+python analyzer.py --timeout 120
+```
+
 ### 유틸리티
 
 ```powershell
@@ -114,11 +130,13 @@ python analyzer.py malware.exe
         ▼
 [5/6] 종료              ProcMon /Terminate → PML → CSV 변환
                         tshark 종료 → pcap 저장
+                        Process Hacker / SystemInformer 종료
         │
         ▼
 [6/6] 분석              사후 스냅샷 → 레지스트리·프로세스 diff
                         ProcMon CSV 파싱 + 노이즈 필터
-                        PCAP 파싱 (연결, DNS, HTTP)
+                        PCAP 파싱 (연결, DNS, TLS SNI, HTTP)
+                        프로세스↔네트워크 연결 매핑
                         MITRE ATT&CK 매핑
                         IOC 추출
         │
@@ -153,11 +171,14 @@ python analyzer.py malware.exe
         샘플 종료 감지 (15s)
   [5/6] 모니터링 종료...
         ProcMon 로그 변환 중...
+        Process Hacker 종료됨
   [6/6] 사후 스냅샷 수집 중...
   [분석] ProcMon CSV 파싱...
         이벤트 18,432개 → 필터 후 247개
   [분석] PCAP 파싱...
         연결 3개  DNS 5건
+  [분석] 프로세스↔네트워크 연결 매핑...
+        12개 연결 집계
 
   MITRE 기법       3건
   외부 IP          2개
@@ -192,19 +213,20 @@ dynamic_analyzer/
 │   ├── procmon.py            # ProcMon 제어 (시작/종료/CSV 변환)
 │   ├── tshark_capture.py     # tshark 패킷 캡처
 │   ├── registry_snapshot.py  # winreg 스냅샷 + diff
-│   └── process_tracker.py    # psutil 프로세스 추적
+│   └── process_tracker.py    # psutil 프로세스 추적 + 분석 도구 필터
 │
 ├── parsers/
 │   ├── procmon_csv.py        # ProcMon CSV → ProcMonEvent 파싱
-│   └── pcap_parser.py        # PCAP → 연결/DNS/HTTP (scapy)
+│   └── pcap_parser.py        # PCAP → 연결/DNS/TLS SNI/HTTP (scapy 또는 tshark fallback)
 │
 ├── analysis/
-│   ├── noise_filter.py       # 시스템 노이즈 제거
+│   ├── noise_filter.py       # 시스템·분석 도구 노이즈 제거
 │   ├── behavior_classifier.py # MITRE ATT&CK 매핑
-│   └── ioc_extractor.py      # IOC 추출
+│   ├── ioc_extractor.py      # IOC 추출
+│   └── process_network_map.py # 프로세스↔네트워크 연결 매핑 (신규)
 │
 └── exporters/
-    ├── html_report.py        # 다크 테마 HTML 리포트
+    ├── html_report.py        # 다크 테마 HTML 리포트 (페이지네이션)
     └── json_report.py        # 구조화 JSON 저장
 ```
 
@@ -232,6 +254,34 @@ dynamic_analyzer/
 | T1071.004 | DNS | Command and Control |
 | T1095 | Non-Application Layer Protocol | Command and Control |
 | T1041 | Exfiltration Over C2 Channel | Exfiltration |
+
+---
+
+## 변경 이력
+
+### v1.3 — 프로세스↔네트워크 매핑 · 노이즈 필터 강화
+
+- **프로세스↔네트워크 연결 매핑** (`analysis/process_network_map.py` 신규)
+  - ProcMon TCP/UDP 이벤트 기반으로 프로세스별 외부 연결 자동 집계
+  - HTML 리포트에 전용 섹션 추가, JSON 리포트에도 포함
+- **분석 도구 노이즈 필터 강화**
+  - `noise_filter.py`: ProcMon, tshark, SystemInformer, Process Hacker, ZoomIt 등 분석 도구 프로세스 이벤트 전체 제거
+  - `process_tracker.py`: 신규 프로세스 목록에서 분석 도구 자동 제외
+  - `ioc_extractor.py`: dropped_files IOC에서 분석 도구 경로 패턴 제외, `WriteFile`만 실제 드롭으로 판정 (`CreateFile` 제외)
+- **분석 종료 후 자동 정리**: Process Hacker / System Informer 프로세스 자동 종료
+
+### v1.2 — PCAP 분석 강화 · HTML 페이지네이션
+
+- **scapy 없이 PCAP 분석**: scapy 미설치 시 tshark fallback 파서 자동 전환
+- **외부 PCAP 파일 지원**: `--pcap <FILE>` 옵션으로 Wireshark 캡처 파일 직접 분석
+- **HTML 페이지네이션**: 모든 결과 테이블에 1·2·3… 페이지 네비게이션 추가 (100행/페이지)
+- **TLS SNI 분석**: HTTPS 트래픽의 도메인 식별 지원
+
+### v1.1 — 초기 기능 개선
+
+- PCAP 분석 (연결, DNS, HTTP)
+- 비콘 탐지 (규칙적 C2 통신 감지)
+- DGA / 고엔트로피 도메인 탐지
 
 ---
 

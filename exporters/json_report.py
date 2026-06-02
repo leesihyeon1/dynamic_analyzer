@@ -68,6 +68,19 @@ def save_json_report(result, output_path: str) -> None:
 
         "network": _to_serializable(result.pcap_result) if result.pcap_result else {},
 
+        "process_network_map": [
+            {
+                "pid":         c.pid,
+                "process":     c.process,
+                "proto":       c.proto,
+                "remote_ip":   c.remote_ip,
+                "remote_port": c.remote_port,
+                "direction":   c.direction,
+                "event_count": c.event_count,
+            }
+            for c in getattr(result, "process_network_map", [])
+        ],
+
         "events_summary": {
             "total":    len(result.procmon_events),
             "filtered": len(result.filtered_events),
