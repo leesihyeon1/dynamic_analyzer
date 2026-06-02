@@ -58,6 +58,7 @@ class AnalysisResult:
     all_pids:           set   = field(default_factory=set)    # 샘플 + 자식 PID
     errors:             list  = field(default_factory=list)
     process_network_map: list = field(default_factory=list)  # list[ProcNetConnection]
+    yara_result:        object = None                          # YaraScanResult
 
 
 def run_analysis(
@@ -91,6 +92,7 @@ def run_analysis(
     from analysis.behavior_classifier import classify_behaviors
     from analysis.ioc_extractor       import extract_iocs
     from analysis.process_network_map import build_process_network_map
+    from analysis.yara_scanner        import run_yara_scan
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     pm = ProcMonController(
@@ -300,6 +302,18 @@ def run_analysis(
     result.process_network_map = build_process_network_map(result.filtered_events)
     if result.process_network_map:
         status(f"      {len(result.process_network_map)}개 연결 집계")
+
+    status("[분석] YARA 룰 스캔...")
+    dropped = result.ioc_report.dropped_files if result.ioc_report else []
+    result.yara_result = run_yara_scan(config.sample_path, dropped)
+    yr = result.yara_result
+    if yr.available:
+        status(f"      룰 {yr.rules_loaded:,}개 로드"
+               + (f" / {yr.rules_failed}개 실패" if yr.rules_failed else ""))
+        status(f"      파일 {len(yr.files_scanned)}개 스캔 → 탐지 {len(yr.matches)}건"
+               + (" 🚨" if yr.matches else " ✅"))
+    else:
+        status(f"      [경고] {yr.error}")
 
     result.end_time = time.time()
     elapsed_total = result.end_time - result.start_time

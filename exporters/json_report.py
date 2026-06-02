@@ -23,6 +23,33 @@ def _to_serializable(obj: Any) -> Any:
     return obj
 
 
+def _build_yara_json(yr) -> dict:
+    """YaraScanResult → JSON-serialisable dict."""
+    if yr is None:
+        return {"available": False, "error": "실행되지 않음"}
+    base = {
+        "available":     yr.available,
+        "rules_loaded":  yr.rules_loaded,
+        "rules_failed":  yr.rules_failed,
+        "files_scanned": yr.files_scanned,
+        "match_count":   len(yr.matches),
+        "error":         yr.error,
+    }
+    base["matches"] = [
+        {
+            "rule":            m.rule_name,
+            "file":            m.file_scanned,
+            "description":     m.meta.get("description", m.meta.get("desc", "")),
+            "author":          m.meta.get("author", ""),
+            "tags":            m.tags,
+            "matched_strings": m.matched_strings,
+            "meta":            m.meta,
+        }
+        for m in yr.matches
+    ]
+    return base
+
+
 def save_json_report(result, output_path: str) -> None:
     """AnalysisResult → JSON 파일 저장"""
     from core.orchestrator import AnalysisResult
@@ -85,6 +112,8 @@ def save_json_report(result, output_path: str) -> None:
             "total":    len(result.procmon_events),
             "filtered": len(result.filtered_events),
         },
+
+        "yara_scan": _build_yara_json(getattr(result, "yara_result", None)),
     }
 
     Path(output_path).write_text(
