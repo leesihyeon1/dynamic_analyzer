@@ -129,7 +129,6 @@ window.addEventListener('load', function() {
   setupPagination('tbl-ioc-file', 100);
   setupPagination('tbl-ioc-reg', 100);
   setupPagination('tbl-ioc-url', 100);
-  setupPagination('tbl-proc-net', 100);
 });
 </script>"""
 
@@ -338,6 +337,17 @@ def _network_html(result) -> str:
 
     # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
+        # 프로세스-네트워크 매핑 룩업 테이블: (proto, dst_ip, dst_port) → 프로세스 목록
+        pnmap = getattr(result, "process_network_map", [])
+        proc_lookup: dict[tuple, list[str]] = {}
+        for pn in pnmap:
+            key = (pn.proto.upper(), pn.remote_ip, pn.remote_port)
+            label = f"{pn.process} ({pn.pid})"
+            if key not in proc_lookup:
+                proc_lookup[key] = []
+            if label not in proc_lookup[key]:
+                proc_lookup[key].append(label)
+
         rows = ""
         for c in sorted(pcap.connections, key=lambda x: -x.bytes_out)[:1000]:
             ext = not _is_private_ip_str(c.dst_ip)
@@ -346,6 +356,15 @@ def _network_html(result) -> str:
             # IP → 도메인 역매핑
             domains = pcap.ip_to_domain.get(c.dst_ip, [])
             domain_str = f"<br><span style='color:#8b949e;font-size:0.72rem'>{_e(', '.join(domains[:2]))}</span>" if domains else ""
+            # 프로세스 매핑
+            procs = proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
+            if procs:
+                proc_html = "<br>".join(
+                    f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
+                    for p in procs[:3]
+                )
+            else:
+                proc_html = "<span style='color:#8b949e'>-</span>"
             rows += (
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
@@ -354,12 +373,13 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
+                f"<td>{proc_html}</td>"
                 f"</tr>"
             )
         parts.append(
             "<h3>네트워크 연결 (송신량 순)</h3>"
             "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
-            "<th>포트</th><th>횟수</th><th>송신량</th></tr>"
+            "<th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
             f"{rows}</table>"
         )
 
@@ -566,10 +586,6 @@ def generate_html_report(result, output_path: str) -> None:
 <!-- ── MITRE ATT&CK ── -->
 <h2>🎯 MITRE ATT&CK 매핑</h2>
 {_section_html(result)}
-
-<!-- ── 프로세스↔네트워크 매핑 ── -->
-<h2>🔗 프로세스↔네트워크 연결 매핑 (ProcMon)</h2>
-{_process_network_html(result)}
 
 <!-- ── 프로세스 트리 ── -->
 <h2>🌲 신규 프로세스 (Process Hacker / psutil)</h2>
