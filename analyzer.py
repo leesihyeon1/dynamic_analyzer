@@ -127,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-tshark",   action="store_true", help="tshark 스킵")
     g.add_argument("--no-ph",       action="store_true", help="Process Hacker GUI 실행 안 함")
     g.add_argument("--no-export",   action="store_true", help="파일 저장 없이 콘솔 출력만")
+    g.add_argument("--no-open",     action="store_true", help="분석 완료 후 HTML 리포트 자동 열기 비활성화")
 
     # PCAP 입력
     pg = p.add_argument_group("PCAP 분석")
@@ -271,6 +272,14 @@ def main() -> None:
 
         generate_html_report(result, str(html_path))
         console.print(f"  [green]HTML[/green] → {html_path}")
+
+        if not args.no_open:
+            import os
+            try:
+                os.startfile(str(html_path))
+                console.print("  [dim]브라우저에서 리포트를 열었습니다.[/dim]")
+            except Exception as exc:
+                console.print(f"  [yellow]리포트 자동 열기 실패: {exc}[/yellow]")
 
     console.rule("[bold white]분석 완료")
 
