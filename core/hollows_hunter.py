@@ -24,6 +24,11 @@ _SEARCH_DIRS: list[Path] = [
     Path(r"C:\Tools\hollows_hunter"),
     Path(r"C:\Tools"),
     Path(r"C:\Analysis"),
+    Path(r"C:\analysis"),
+    Path(r"C:\Users\Public\Tools"),
+    Path(r"C:\ProgramData\chocolatey\bin"),
+    Path(r"C:\flare-tools"),
+    Path(r"C:\FLARE"),
 ]
 
 _HH_NAMES: list[str] = [
@@ -112,14 +117,15 @@ class HollowsHunter:
 
         cmd: list[str] = [
             str(self.hh_path),
-            "/dir", str(self.output_dir),
+            "/dir",   str(self.output_dir),
             "/dmode", str(dump_mode),
-            "/json",
+            "/json",  # stdout으로 JSON 출력
         ]
+        # /shellc, /hooks 는 단독 플래그 (값 없음)
         if shellcode:
-            cmd += ["/shellc", "1"]
+            cmd.append("/shellc")
         if hooks:
-            cmd += ["/hooks"]
+            cmd.append("/hooks")
         if pname_filter:
             cmd += ["/pname", pname_filter]
 
@@ -135,32 +141,38 @@ class HollowsHunter:
         except Exception as exc:
             return {"error": f"hollows-hunter 실행 오류: {exc}"}
 
-        # hollows-hunter writes a summary JSON to the output dir
-        json_candidates = list(self.output_dir.glob("*.json"))
+        # 1순위: stdout JSON
+        stdout = result.stdout.strip()
+        if stdout:
+            brace = stdout.rfind("{")
+            if brace != -1:
+                try:
+                    data = json.loads(stdout[brace:])
+                    data["dump_dir"] = str(self.output_dir)
+                    return data
+                except Exception:
+                    pass
+
+        # 2순위: 파일 폴백 — 가장 최근 .json 파일
+        json_candidates = sorted(
+            self.output_dir.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
         if json_candidates:
-            latest = max(json_candidates, key=lambda p: p.stat().st_mtime)
             try:
-                data = json.loads(latest.read_text(encoding="utf-8", errors="replace"))
+                data = json.loads(json_candidates[0].read_text(encoding="utf-8", errors="replace"))
                 data["dump_dir"] = str(self.output_dir)
                 return data
             except Exception as exc:
                 return {"error": f"JSON 파싱 실패: {exc}",
                         "dump_dir": str(self.output_dir)}
 
-        # Fallback: stdout
-        stdout = result.stdout.strip()
-        if stdout:
-            try:
-                data = json.loads(stdout)
-                data["dump_dir"] = str(self.output_dir)
-                return data
-            except Exception:
-                pass
-
         return {
-            "error": "hollows-hunter 출력 파싱 실패",
-            "stdout": result.stdout[:2000],
+            "error": "hollows-hunter 출력 파싱 실패 — JSON을 찾을 수 없음",
+            "stdout": stdout[:2000],
             "stderr": result.stderr[:500],
+            "returncode": result.returncode,
             "dump_dir": str(self.output_dir),
         }
 

@@ -27,8 +27,12 @@ from pathlib import Path
 _SEARCH_DIRS: list[Path] = [
     Path(r"C:\Tools\pe-sieve"),
     Path(r"C:\Tools"),
-    Path(r"C:\Tools\SysinternalsSuite"),
     Path(r"C:\Analysis"),
+    Path(r"C:\analysis"),
+    Path(r"C:\Users\Public\Tools"),
+    Path(r"C:\ProgramData\chocolatey\bin"),   # choco install
+    Path(r"C:\flare-tools"),                  # FLARE-VM
+    Path(r"C:\FLARE"),
 ]
 
 _PESIEVE_NAMES: list[str] = ["pe-sieve64.exe", "pe-sieve.exe", "pesieve64.exe", "pesieve.exe"]
@@ -111,22 +115,23 @@ class PeSieveScanner:
             return {"error": "pe-sieve를 찾을 수 없음 — PATH 또는 C:\\Tools 에 설치 필요", "pid": pid}
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        pid_out = self.output_dir / str(pid)
-        pid_out.mkdir(parents=True, exist_ok=True)
 
+        # pe-sieve는 /dir 아래에 "<pid>_<procname>\" 서브디렉터리를 자동 생성한다.
+        # 미리 서브디렉터리를 만들면 안 됨 — pe-sieve가 직접 생성함.
         cmd: list[str] = [
             str(self.pesieve_path),
-            "/pid", str(pid),
-            "/dir", str(pid_out),
+            "/pid",   str(pid),
+            "/dir",   str(self.output_dir),
             "/dmode", str(dump_mode),
-            "/json",
+            "/json",  # stdout으로 JSON 출력
         ]
+        # /shellc, /hooks 는 단독 플래그 (값 없음)
         if shellcode:
-            cmd += ["/shellc", "1"]
+            cmd.append("/shellc")
         if hooks:
-            cmd += ["/hooks"]
+            cmd.append("/hooks")
         if quiet:
-            cmd += ["/quiet"]
+            cmd.append("/quiet")
 
         try:
             result = subprocess.run(
@@ -140,42 +145,59 @@ class PeSieveScanner:
         except Exception as exc:
             return {"error": f"pe-sieve 실행 오류: {exc}", "pid": pid}
 
-        # pe-sieve writes the JSON report as <pid>.json inside the output dir
-        json_path = pid_out / f"{pid}.json"
-        if not json_path.exists():
-            # Some versions write directly to the parent dir
-            json_path = self.output_dir / f"{pid}.json"
+        # 1순위: stdout JSON (pe-sieve /json 플래그의 기본 출력 경로)
+        stdout = result.stdout.strip()
+        if stdout:
+            # pe-sieve 는 스캔 진행 텍스트 + JSON 을 섞어서 출력할 수 있음
+            # → 마지막으로 등장하는 '{' 부터 파싱 시도
+            brace = stdout.rfind("{")
+            if brace != -1:
+                try:
+                    data = json.loads(stdout[brace:])
+                    data["dump_dir"] = self._find_dump_dir(pid)
+                    return data
+                except Exception:
+                    pass
 
-        if json_path.exists():
+        # 2순위: 파일 폴백 — "<output_dir>/<pid>*.json" 패턴으로 탐색
+        candidates = sorted(
+            self.output_dir.glob(f"{pid}*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
             try:
-                data = json.loads(json_path.read_text(encoding="utf-8", errors="replace"))
-                data["dump_dir"] = str(pid_out)
+                data = json.loads(candidates[0].read_text(encoding="utf-8", errors="replace"))
+                data["dump_dir"] = self._find_dump_dir(pid)
                 return data
             except Exception as exc:
                 return {"error": f"JSON 파싱 실패: {exc}", "pid": pid,
-                        "dump_dir": str(pid_out)}
-
-        # Fallback: try to parse stdout
-        stdout = result.stdout.strip()
-        if stdout:
-            try:
-                data = json.loads(stdout)
-                data["dump_dir"] = str(pid_out)
-                return data
-            except Exception:
-                pass
+                        "dump_dir": self._find_dump_dir(pid)}
 
         return {
-            "error": "pe-sieve 출력 파싱 실패",
-            "pid": pid,
-            "stdout": result.stdout[:2000],
+            "error": "pe-sieve 출력 파싱 실패 — JSON을 찾을 수 없음",
+            "pid":    pid,
+            "stdout": stdout[:2000],
             "stderr": result.stderr[:500],
-            "dump_dir": str(pid_out),
+            "returncode": result.returncode,
+            "dump_dir": self._find_dump_dir(pid),
         }
+
+    def _find_dump_dir(self, pid: int) -> str:
+        """pe-sieve가 생성한 '<pid>_<procname>' 서브디렉터리를 탐색."""
+        matches = [
+            d for d in self.output_dir.iterdir()
+            if d.is_dir() and d.name.startswith(f"{pid}_")
+        ]
+        if matches:
+            return str(matches[0])
+        # 프로세스 이름 없이 숫자만으로 된 디렉터리 폴백
+        plain = self.output_dir / str(pid)
+        return str(plain) if plain.exists() else str(self.output_dir)
 
     def list_dumps(self, pid: int) -> list[Path]:
         """Return all dumped files for a given PID."""
-        pid_dir = self.output_dir / str(pid)
-        if not pid_dir.exists():
+        dump_dir = Path(self._find_dump_dir(pid))
+        if not dump_dir.exists():
             return []
-        return [p for p in pid_dir.iterdir() if p.is_file() and p.suffix != ".json"]
+        return [p for p in dump_dir.iterdir() if p.is_file() and p.suffix != ".json"]
