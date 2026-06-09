@@ -56,6 +56,18 @@ SUSPICIOUS_PORTS: frozenset[int] = frozenset({
     1080,               # SOCKS
 })
 
+# 정보 탈취 C2에 사용되는 프로토콜별 포트 목록
+# 의심 포트와 별개로 관리 — 정상 서비스와 겹치지만 분석 컨텍스트에서는 C2로 사용됨
+SMTP_PORTS:  frozenset[int] = frozenset({25, 465, 587})
+FTP_PORTS:   frozenset[int] = frozenset({21, 2121})
+POP3_PORTS:  frozenset[int] = frozenset({110, 995})
+IMAP_PORTS:  frozenset[int] = frozenset({143, 993})
+IRC_PORTS:   frozenset[int] = frozenset({6660, 6661, 6662, 6663, 6664,
+                                          6665, 6666, 6667, 6668, 6669, 6670, 7000})
+
+# C2 프로토콜 포트 통합 → suspicious_port 판정에 포함
+SUSPICIOUS_PORTS = SUSPICIOUS_PORTS | SMTP_PORTS | FTP_PORTS | POP3_PORTS | IMAP_PORTS
+
 # 잘 알려진 정상 포트 (연결 통계에서 강조 제외)
 BENIGN_PORTS: frozenset[int] = frozenset({80, 443, 53, 123, 67, 68})
 
@@ -125,6 +137,32 @@ class TLSInfo:
 
 
 @dataclass
+class SmtpSession:
+    """SMTP 세션에서 추출한 C2 통신 정보 (AgentTesla, FormBook 등)."""
+    src_ip:      str
+    dst_ip:      str
+    dst_port:    int
+    ehlo_domain: str       = ""   # EHLO/HELO 도메인 (공격자 식별)
+    mail_from:   str       = ""   # MAIL FROM 주소
+    rcpt_to:     list[str] = field(default_factory=list)  # RCPT TO 주소 목록
+    auth_user:   str       = ""   # AUTH LOGIN 디코딩된 사용자명
+    has_auth:    bool      = False
+    has_data:    bool      = False  # DATA 명령 확인 여부
+
+
+@dataclass
+class FtpSession:
+    """FTP 세션에서 추출한 C2 통신 정보."""
+    src_ip:     str
+    dst_ip:     str
+    dst_port:   int
+    username:   str       = ""
+    has_auth:   bool      = False
+    uploaded:   list[str] = field(default_factory=list)   # STOR 파일명
+    downloaded: list[str] = field(default_factory=list)   # RETR 파일명
+
+
+@dataclass
 class BeaconCandidate:
     """주기적 C2 연결 패턴 후보"""
     dst_ip:        str
@@ -152,6 +190,8 @@ class PcapResult:
     http_requests:      list[HTTPRequest]       = field(default_factory=list)
     tls_info:           list[TLSInfo]           = field(default_factory=list)
     beacon_candidates:  list[BeaconCandidate]   = field(default_factory=list)
+    smtp_sessions:      list[SmtpSession]       = field(default_factory=list)
+    ftp_sessions:       list[FtpSession]        = field(default_factory=list)
     suspicious_domains: list[str]               = field(default_factory=list)
     dns_tunnel_suspects:list[str]               = field(default_factory=list)
     summary:            PcapSummary             = field(default_factory=PcapSummary)
@@ -289,6 +329,98 @@ def _extract_tls_sni(raw_bytes: bytes) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# SMTP / FTP 페이로드 파싱
+# ---------------------------------------------------------------------------
+
+_SMTP_CMD_RE   = re.compile(rb"^(?:EHLO|HELO|AUTH|MAIL FROM|RCPT TO|DATA|QUIT)", re.IGNORECASE | re.MULTILINE)
+_SMTP_FROM_RE  = re.compile(rb"MAIL FROM:\s*<([^>]+)>", re.IGNORECASE)
+_SMTP_RCPT_RE  = re.compile(rb"RCPT TO:\s*<([^>]+)>",  re.IGNORECASE)
+_SMTP_EHLO_RE  = re.compile(rb"(?:EHLO|HELO)\s+(\S+)",  re.IGNORECASE)
+_SMTP_AUTH_RE  = re.compile(rb"AUTH\s+LOGIN",            re.IGNORECASE)
+
+_FTP_CMD_RE    = re.compile(rb"^(USER|PASS|STOR|RETR|MKD|CWD|PWD|QUIT)\s*(\S*)", re.IGNORECASE | re.MULTILINE)
+
+
+def _parse_smtp_raw(
+    raw: bytes,
+    src_ip: str,
+    dst_ip: str,
+    dst_port: int,
+) -> Optional[SmtpSession]:
+    """TCP 페이로드에서 SMTP 세션 데이터를 추출.
+
+    AUTH LOGIN의 경우 base64 인코딩된 자격증명 라인을 디코딩한다.
+    비밀번호는 존재 여부만 `has_auth=True`로 표시하고 평문 저장하지 않음.
+    """
+    if not _SMTP_CMD_RE.search(raw):
+        return None  # SMTP 명령 없음
+
+    import base64
+
+    sess = SmtpSession(src_ip=src_ip, dst_ip=dst_ip, dst_port=dst_port)
+
+    m = _SMTP_EHLO_RE.search(raw)
+    if m:
+        sess.ehlo_domain = m.group(1).decode(errors="replace")
+
+    m = _SMTP_FROM_RE.search(raw)
+    if m:
+        sess.mail_from = m.group(1).decode(errors="replace")
+
+    for m in _SMTP_RCPT_RE.finditer(raw):
+        addr = m.group(1).decode(errors="replace")
+        if addr not in sess.rcpt_to:
+            sess.rcpt_to.append(addr)
+
+    if _SMTP_AUTH_RE.search(raw):
+        sess.has_auth = True
+        # AUTH LOGIN 다음 줄 = base64 사용자명
+        lines = raw.splitlines()
+        for i, line in enumerate(lines):
+            if _SMTP_AUTH_RE.search(line):
+                if i + 1 < len(lines):
+                    try:
+                        decoded = base64.b64decode(lines[i + 1].strip()).decode(errors="replace")
+                        # 이메일 주소 형태면 사용자명으로 저장
+                        if "@" in decoded or len(decoded) < 64:
+                            sess.auth_user = decoded
+                    except Exception:
+                        pass
+                break
+
+    if b"DATA" in raw.upper():
+        sess.has_data = True
+
+    return sess
+
+
+def _parse_ftp_raw(
+    raw: bytes,
+    src_ip: str,
+    dst_ip: str,
+    dst_port: int,
+) -> Optional[FtpSession]:
+    """TCP 페이로드에서 FTP 세션 데이터를 추출."""
+    matches = _FTP_CMD_RE.findall(raw)
+    if not matches:
+        return None
+
+    sess = FtpSession(src_ip=src_ip, dst_ip=dst_ip, dst_port=dst_port)
+    for cmd_b, arg_b in matches:
+        cmd = cmd_b.decode(errors="replace").upper()
+        arg = arg_b.decode(errors="replace").strip()
+        if cmd == "USER" and arg:
+            sess.username = arg
+            sess.has_auth = True
+        elif cmd == "STOR" and arg:
+            sess.uploaded.append(arg)
+        elif cmd == "RETR" and arg:
+            sess.downloaded.append(arg)
+
+    return sess
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +760,9 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     packets_loaded   = len(packets)   # rdpcap 성공 후 총 패킷 수
     packets_skipped  = 0
     pkt_errors: list[str] = []
+    # C2 프로토콜 페이로드 수집: connection key → 누적 바이트
+    smtp_raw: dict[tuple, bytearray] = defaultdict(bytearray)
+    ftp_raw:  dict[tuple, bytearray] = defaultdict(bytearray)
 
     for pkt in packets:
         try:
@@ -764,6 +899,15 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                     if req:
                         http_list.append(req)
 
+            # --- SMTP / FTP 페이로드 수집 ---
+            if proto == "TCP" and Raw in pkt:
+                raw_bytes = bytes(pkt[Raw])
+                c2_key = (src_ip, dst_ip, dst_port)
+                if dst_port in SMTP_PORTS:
+                    smtp_raw[c2_key].extend(raw_bytes)
+                elif dst_port in FTP_PORTS:
+                    ftp_raw[c2_key].extend(raw_bytes)
+
         except Exception as e:
             # 처음 10개 패킷 오류만 기록 (과도한 로그 방지)
             if len(pkt_errors) < 10:
@@ -794,6 +938,19 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     # --- 비콘 탐지 ---
     beacon_candidates = _detect_beacons(beacon_ts)
 
+    # --- SMTP / FTP 세션 파싱 ---
+    smtp_sessions: list[SmtpSession] = []
+    for (src, dst, dport), payload in smtp_raw.items():
+        s = _parse_smtp_raw(bytes(payload), src, dst, dport)
+        if s:
+            smtp_sessions.append(s)
+
+    ftp_sessions: list[FtpSession] = []
+    for (src, dst, dport), payload in ftp_raw.items():
+        s = _parse_ftp_raw(bytes(payload), src, dst, dport)
+        if s:
+            ftp_sessions.append(s)
+
     # --- 요약 ---
     summary = PcapSummary(
         total_packets=total_packets,
@@ -813,6 +970,8 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
         http_requests=http_list,
         tls_info=tls_list,
         beacon_candidates=beacon_candidates,
+        smtp_sessions=smtp_sessions,
+        ftp_sessions=ftp_sessions,
         suspicious_domains=sorted(set(suspicious_domains)),
         dns_tunnel_suspects=sorted(set(dns_tunnel_suspects)),
         summary=summary,

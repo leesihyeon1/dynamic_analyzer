@@ -458,6 +458,55 @@ def _network_html(result) -> str:
             f"{rows}</table>"
         )
 
+    # ── SMTP C2 세션 (AgentTesla 등 자격증명 탈취 악성코드) ─────────
+    smtp_sessions = getattr(pcap, "smtp_sessions", [])
+    if smtp_sessions:
+        rows = ""
+        for s in smtp_sessions:
+            auth_badge = _b("AUTH", "red")   if s.has_auth else ""
+            data_badge = _b("DATA", "orange") if s.has_data else ""
+            rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(s.dst_ip)}</td>"
+                f"<td class='mono'>{s.dst_port}</td>"
+                f"<td class='mono'>{_e(s.ehlo_domain or '-')}</td>"
+                f"<td class='mono'>{_e(s.mail_from or '-')}</td>"
+                f"<td class='mono'>{_e(', '.join(s.rcpt_to) or '-')}</td>"
+                f"<td class='mono'>{_e(s.auth_user or '-')}</td>"
+                f"<td>{auth_badge} {data_badge}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            "<h3 style='color:#ff7b72'>🚨 SMTP C2 세션</h3>"
+            "<table><tr><th>C2 서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
+            "<th>발신자 (MAIL FROM)</th><th>수신자 (RCPT TO)</th>"
+            "<th>AUTH 사용자명</th><th>플래그</th></tr>"
+            f"{rows}</table>"
+        )
+
+    # ── FTP C2 세션 ────────────────────────────────────────────
+    ftp_sessions = getattr(pcap, "ftp_sessions", [])
+    if ftp_sessions:
+        rows = ""
+        for s in ftp_sessions:
+            auth_badge = _b("AUTH", "red") if s.has_auth else ""
+            rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(s.dst_ip)}</td>"
+                f"<td class='mono'>{s.dst_port}</td>"
+                f"<td class='mono'>{_e(s.username or '-')}</td>"
+                f"<td class='mono'>{_e(', '.join(s.uploaded)  or '-')}</td>"
+                f"<td class='mono'>{_e(', '.join(s.downloaded) or '-')}</td>"
+                f"<td>{auth_badge}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            "<h3 style='color:#ff7b72'>🚨 FTP C2 세션</h3>"
+            "<table><tr><th>C2 서버 IP</th><th>포트</th><th>사용자명</th>"
+            "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th></tr>"
+            f"{rows}</table>"
+        )
+
     return "\n".join(parts) if parts else "<p class='alert alert-success'>외부 네트워크 활동 없음</p>"
 
 

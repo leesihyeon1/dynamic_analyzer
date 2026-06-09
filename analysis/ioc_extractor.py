@@ -197,11 +197,19 @@ def extract_iocs(
 
     # ------------------------------------------------------------------
     # IP addresses (external only)
+    # SMTP/FTP C2 서버 IP는 raw_ips에 이미 포함되지만,
+    # 세션 파싱 결과에서 명시적으로 추가해 누락 방지
     # ------------------------------------------------------------------
     try:
         for ip in pcap.raw_ips:
             if not _is_private_ip(ip):
                 report.ip_addresses.append(ip)
+        for s in getattr(pcap, "smtp_sessions", []):
+            if not _is_private_ip(s.dst_ip):
+                report.ip_addresses.append(s.dst_ip)
+        for s in getattr(pcap, "ftp_sessions", []):
+            if not _is_private_ip(s.dst_ip):
+                report.ip_addresses.append(s.dst_ip)
         report.ip_addresses = sorted(set(report.ip_addresses))
     except Exception:
         pass
