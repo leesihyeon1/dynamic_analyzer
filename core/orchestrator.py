@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -190,6 +191,29 @@ def run_analysis(
 
     # ── 4. 모니터링 대기 ──────────────────────────────────────────────
     status(f"[4/6] 모니터링 중... ({config.timeout}초)  Ctrl+C로 조기 종료 가능")
+
+    # ── 실시간 프로세스 감시 시작 (신규 PID → 즉시 pe-sieve 스캔)
+    # proc_before에 없는 PID가 생성되면 1초 이내에 자동 스캔하여
+    # 단명 프로세스(loader, injector 등)도 포착할 수 있도록 함
+    _rt_results: list[tuple[int, dict]] = []
+    _rt_lock    = threading.Lock()
+
+    def _rt_callback(pid: int, raw: dict) -> None:
+        with _rt_lock:
+            _rt_results.append((pid, raw))
+
+    from core.process_watcher import ProcessWatcher
+    watcher = ProcessWatcher(
+        initial_pids  = set(proc_before.keys()),
+        scanner       = ps_scanner,
+        on_result     = _rt_callback,
+        dump_mode     = 3,   # raw dump — PE + 쉘코드 모두 추출
+        poll_interval = 1.0,
+    )
+    watcher.start()
+    if watcher.available:
+        status("      [실시간] 신규 프로세스 감시 시작 (1초 폴링)")
+
     elapsed = 0
     interval = 5
     sample_exited = False
@@ -209,18 +233,52 @@ def run_analysis(
     # ── 5. 종료 ───────────────────────────────────────────────────────
     status("[5/6] 모니터링 종료...")
 
-    # ── 중간 프로세스 스냅샷 → 분석 중 생성된 신규 PID 목록 (프로세스가 살아있는 시점)
+    # ── 실시간 감시 중지 + 결과 병합 ────────────────────────────────────
+    # watcher가 스캔한 PID 집합 확보 (중복 스캔 방지에 사용)
+    rt_scanned_pids: set[int] = watcher.stop()
+    if watcher.available and rt_scanned_pids:
+        status(f"      [실시간] 스캔된 PID {len(rt_scanned_pids)}개 — 결과 취합 중...")
+
+    with _rt_lock:
+        rt_snapshot = list(_rt_results)
+
+    rt_suspicious = 0
+    for pid, raw in rt_snapshot:
+        pr = parse_pesieve(raw)
+        result.pe_sieve_results.append(pr)
+        if pr.suspicious > 0:
+            rt_suspicious += 1
+            inj_parts = []
+            if pr.implanted_pe:
+                inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
+            if pr.implanted_shc:
+                inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
+            inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
+            status(f"      [실시간] PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
+
+    if watcher.available:
+        status(f"      [실시간] 완료: 의심 {rt_suspicious}개 PID"
+               + (" 🚨" if rt_suspicious else " ✅"))
+
+    # ── 중간 프로세스 스냅샷 → 아직 살아있는 신규 PID 보완 스캔
+    # 실시간 감시에서 놓친 PID(감시 시작 전 생성됐거나 스캔 실패)를 추가 포착
     proc_mid  = take_process_snapshot()
     mid_diff  = diff_process_snapshots(proc_before, proc_mid)
-    scan_pids: list = [p.pid for p in mid_diff.get("new_processes", [])]
-    if result.sample_pid and result.sample_pid not in scan_pids:
-        scan_pids.insert(0, result.sample_pid)  # 샘플 PID 포함 보장
-    status(f"      스캔 대상 PID: {scan_pids if scan_pids else '없음'}")
+    # 이미 실시간 스캔된 PID는 제외 (중복 방지)
+    already_scanned = rt_scanned_pids | {r.pid for r in result.pe_sieve_results}
+    scan_pids: list = [
+        p.pid for p in mid_diff.get("new_processes", [])
+        if p.pid not in already_scanned
+    ]
+    if result.sample_pid and result.sample_pid not in already_scanned:
+        scan_pids.insert(0, result.sample_pid)
+    if scan_pids:
+        status(f"      [보완] 추가 스캔 대상 PID: {scan_pids}")
 
     # pe-sieve / hollows-hunter 스캔 (프로세스 종료 전 — 가능한 많은 PID가 살아있을 때)
     if hh_scanner.available:
         status("[분석] hollows-hunter 전체 프로세스 스캔...")
-        raw = hh_scanner.scan_all(dump_mode=1, shellcode=True, hooks=True)
+        raw = hh_scanner.scan_all(dump_mode=3, shellcode=True, hooks=True)
         result.hh_result = parse_hollows_hunter(raw)
         if result.hh_result.error:
             result.errors.append(f"hollows-hunter: {result.hh_result.error}")
@@ -246,7 +304,7 @@ def run_analysis(
             status(f"      [알림] 이미 종료된 PID (스캔 생략): {dead_pids}")
         status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(alive_pids)}개 PID)...")
         for pid in alive_pids:
-            raw = ps_scanner.scan_pid(pid, dump_mode=1, shellcode=True, hooks=True)
+            raw = ps_scanner.scan_pid(pid, dump_mode=3, shellcode=True, hooks=True)
             pr  = parse_pesieve(raw)
             result.pe_sieve_results.append(pr)
             if pr.error:
@@ -318,6 +376,35 @@ def run_analysis(
 
     result.registry_diff = diff_snapshots(reg_before, reg_after) if REG_AVAILABLE else {}
     result.process_diff  = diff_process_snapshots(proc_before, proc_after)
+
+    # ── proc_after 기반 추가 스캔 ─────────────────────────────────────
+    # 샘플 종료 후에도 살아있는 신규 프로세스 = 인젝션된 호스트 프로세스(RegSvcs.exe 등)
+    # 앞선 스캔에서 놓쳤거나 실시간 감지에서 오류가 난 경우를 보완
+    if ps_scanner.available:
+        already = {r.pid for r in result.pe_sieve_results}
+        after_new = [
+            p.pid
+            for p in result.process_diff.get("new_processes", [])
+            if p.pid not in already and _pid_alive(p.pid)
+        ]
+        if after_new:
+            status(f"[분석] pe-sieve 잔존 신규 프로세스 스캔 ({len(after_new)}개 PID)...")
+            for pid in after_new:
+                raw  = ps_scanner.scan_pid(pid, dump_mode=3, shellcode=True, hooks=True)
+                pr   = parse_pesieve(raw)
+                result.pe_sieve_results.append(pr)
+                if pr.error:
+                    status(f"      PID {pid}: {pr.error[:80]}")
+                elif pr.suspicious > 0:
+                    inj_parts = []
+                    if pr.implanted_pe:
+                        inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
+                    if pr.implanted_shc:
+                        inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
+                    inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
+                    status(f"      PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
+                else:
+                    status(f"      PID {pid}: 이상 없음 ✅")
 
     # ── 7. 파싱 ─────────────────────────────────────────────────────
     status("[분석] ProcMon CSV 파싱...")
