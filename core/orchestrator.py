@@ -13,11 +13,28 @@
 """
 from __future__ import annotations
 
+import ctypes
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+
+
+def _pid_alive(pid: int) -> bool:
+    """프로세스가 현재 살아있는지 확인 (Windows 전용)."""
+    try:
+        # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) — 최소 권한
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        # GetExitCodeProcess → STILL_ACTIVE(259) 이면 살아있음
+        code = ctypes.c_ulong(0)
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    except Exception:
+        return False
 
 
 @dataclass
@@ -208,6 +225,13 @@ def run_analysis(
         if result.hh_result.error:
             result.errors.append(f"hollows-hunter: {result.hh_result.error}")
             status(f"      [경고] {result.hh_result.error}")
+            # hollows-hunter가 실제로 출력한 텍스트 — 원인 진단용
+            hh_out = (raw.get("stdout") or "").strip()
+            hh_err = (raw.get("stderr") or "").strip()
+            if hh_out:
+                status(f"        [hh stdout] {hh_out[:200]}")
+            elif hh_err:
+                status(f"        [hh stderr] {hh_err[:200]}")
         else:
             susp_cnt = len(result.hh_result.suspicious_processes)
             shc_cnt  = sum(r.implanted_shc for r in result.hh_result.process_results)
@@ -215,13 +239,25 @@ def run_analysis(
                    + (" 🚨" if shc_cnt else " ✅"))
 
     if ps_scanner.available and scan_pids:
-        status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(scan_pids)}개 PID)...")
-        for pid in scan_pids:
+        # hollows-hunter 실행 후 일부 PID가 이미 종료됐을 수 있으므로 생존 여부 확인
+        alive_pids = [p for p in scan_pids if _pid_alive(p)]
+        dead_pids  = [p for p in scan_pids if p not in alive_pids]
+        if dead_pids:
+            status(f"      [알림] 이미 종료된 PID (스캔 생략): {dead_pids}")
+        status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(alive_pids)}개 PID)...")
+        for pid in alive_pids:
             raw = ps_scanner.scan_pid(pid, dump_mode=1, shellcode=True, hooks=True)
             pr  = parse_pesieve(raw)
             result.pe_sieve_results.append(pr)
             if pr.error:
                 status(f"      PID {pid}: {pr.error[:80]}")
+                # pe-sieve가 실제로 출력한 텍스트 — 원인 진단용
+                raw_out = (raw.get("stdout") or "").strip()
+                raw_err = (raw.get("stderr") or "").strip()
+                if raw_out:
+                    status(f"        [pe-sieve stdout] {raw_out[:200]}")
+                elif raw_err:
+                    status(f"        [pe-sieve stderr] {raw_err[:200]}")
             elif pr.suspicious > 0:
                 inj_parts = []
                 if pr.implanted_pe:
@@ -233,9 +269,11 @@ def run_analysis(
         susp_sum = sum(1 for r in result.pe_sieve_results if r.suspicious > 0)
         pe_inj   = sum(r.implanted_pe  for r in result.pe_sieve_results if not r.error)
         shc_sum  = sum(r.implanted_shc for r in result.pe_sieve_results if not r.error)
+        dead_note = f"  (종료된 PID {len(dead_pids)}개 생략)" if dead_pids else ""
         status(f"      pe-sieve 완료: 의심 {susp_sum}개 PID"
                + (f"  PE인젝션 {pe_inj}개" if pe_inj else "")
                + (f"  쉘코드 {shc_sum}개" if shc_sum else "")
+               + dead_note
                + (" 🚨" if susp_sum else " ✅"))
     elif not hh_scanner.available:
         status("      [알림] pe-sieve / hollows-hunter 없음 — 메모리 스캔 생략")
