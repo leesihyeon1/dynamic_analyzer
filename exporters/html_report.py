@@ -54,6 +54,22 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .pg-btn:hover{background:#30363d}
 .pg-active{background:#1f6feb!important;color:#fff!important;border-color:#1f6feb!important}
 .pg-ellipsis{color:#8b949e;padding:0 .2rem;line-height:2;font-size:.78rem}
+.tabs{display:flex;gap:0;border-bottom:1px solid #30363d;margin-bottom:1.5rem;overflow-x:auto;}
+.tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:#8b949e;
+         padding:.6rem 1.1rem;cursor:pointer;font-size:.85rem;white-space:nowrap;transition:color .15s;}
+.tab-btn:hover{color:#e6edf3;background:rgba(255,255,255,.03);}
+.tab-btn.active{color:#58a6ff;border-bottom-color:#58a6ff;font-weight:600;}
+.tab-panel{display:none;}
+.tab-panel.active{display:block;animation:fadeIn .18s ease;}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.tbadge{display:inline-flex;align-items:center;justify-content:center;min-width:1.6rem;
+        height:1.35rem;padding:0 .45rem;border-radius:9999px;font-size:.72rem;font-weight:700;
+        line-height:1;margin-left:.3rem;}
+.tbadge-red   {background:#3d1f1f;color:#ff7b72;}
+.tbadge-orange{background:#3d2a1f;color:#ffa657;}
+.tbadge-green {background:#1f3d2a;color:#56d364;}
+.tbadge-blue  {background:#1f2d3d;color:#79c0ff;}
+.tbadge-gray  {background:#21262d;color:#8b949e;}
 """
 
 _JS = """
@@ -112,6 +128,18 @@ function setupPagination(tableId, rowsPerPage) {
     }
     render(1);
 }
+document.addEventListener('DOMContentLoaded', function () {
+    var btns   = document.querySelectorAll('.tab-btn');
+    var panels = document.querySelectorAll('.tab-panel');
+    btns.forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            btns.forEach(function(b){ b.classList.remove('active'); });
+            panels.forEach(function(p){ p.classList.remove('active'); });
+            btn.classList.add('active');
+            document.getElementById(btn.dataset.tab).classList.add('active');
+        });
+    });
+});
 """
 
 _PG_INIT = """<script>
@@ -151,6 +179,12 @@ def _b(text: str, color: str = "gray") -> str:
 
 def _e(text: str) -> str:
     return _html.escape(str(text))
+
+def _tb(val, color: str = "gray") -> str:
+    """탭 배지 (숫자 0 이나 빈 값이면 생략)"""
+    if not val:
+        return ""
+    return f'<span class="tbadge tbadge-{color}">{_html.escape(str(val))}</span>'
 
 def _section_html(result) -> str:
     """MITRE ATT&CK 기법 테이블"""
@@ -564,6 +598,110 @@ def _yara_html(result) -> str:
     return "\n".join(parts)
 
 
+def _shellcode_html(result) -> str:
+    """pe-sieve / hollows-hunter 쉘코드·인젝션 결과"""
+    pe_r = getattr(result, "pe_sieve_result", None)
+    hh_r = getattr(result, "hh_result",       None)
+
+    if pe_r is None and hh_r is None:
+        return (
+            "<p class='alert alert-info'>"
+            "ℹ pe-sieve / hollows-hunter 미설치 — 메모리 스캔 생략됨. "
+            "<code>C:\\Tools</code> 또는 <code>PATH</code>에 실행 파일 배치 후 재분석하면 표시됩니다.</p>"
+        )
+
+    scan_error       = ""
+    all_proc_results = []
+
+    if hh_r is not None:
+        if hh_r.error:
+            scan_error = hh_r.error
+        else:
+            all_proc_results = hh_r.process_results
+    elif pe_r is not None:
+        if pe_r.error:
+            scan_error = pe_r.error
+        else:
+            all_proc_results = [pe_r]
+
+    if scan_error:
+        return f"<p class='alert alert-warning'>⚠ {_e(scan_error)}</p>"
+
+    suspicious = [r for r in all_proc_results if r.suspicious > 0]
+
+    if not suspicious:
+        scanned = hh_r.total_scanned if hh_r else 0
+        scanner = "hollows-hunter" if hh_r else "pe-sieve"
+        return (
+            f"<p class='alert alert-success'>"
+            f"✅ 인젝션 / 쉘코드 미탐지 &mdash; {_e(scanner)}"
+            + (f": 프로세스 {scanned}개 스캔" if scanned else "")
+            + "</p>"
+        )
+
+    parts = []
+
+    total_shc    = sum(r.implanted_shc for r in all_proc_results)
+    total_pe_inj = sum(r.implanted_pe  for r in all_proc_results)
+    total_hooked = sum(r.hooked        for r in all_proc_results)
+    scanned_cnt  = hh_r.total_scanned if hh_r else 1
+    scanner_name = "hollows-hunter (전체 시스템)" if hh_r else (
+        f"pe-sieve (PID {pe_r.pid})" if pe_r else "-"
+    )
+    shc_color  = "#ff7b72" if total_shc    else "#8b949e"
+    inj_color  = "#ffa657" if total_pe_inj else "#8b949e"
+    hook_color = "#e3b341" if total_hooked else "#8b949e"
+
+    parts.append(
+        f"<div class='card' style='margin-bottom:1rem'>"
+        f"<table class='kv'>"
+        f"<tr><td>스캐너</td><td class='mono'>{_e(scanner_name)}</td></tr>"
+        f"<tr><td>스캔 프로세스</td><td>{scanned_cnt}개</td></tr>"
+        f"<tr><td>의심 프로세스</td><td><b style='color:#ff7b72'>{len(suspicious)}개</b></td></tr>"
+        f"<tr><td>쉘코드 영역</td><td><b style='color:{shc_color}'>{total_shc}개</b></td></tr>"
+        f"<tr><td>PE 인젝션</td><td><b style='color:{inj_color}'>{total_pe_inj}개</b></td></tr>"
+        f"<tr><td>훅 탐지</td><td><b style='color:{hook_color}'>{total_hooked}개</b></td></tr>"
+        f"</table></div>"
+    )
+
+    for proc in suspicious:
+        if not proc.modules:
+            continue
+        arch      = "64bit" if proc.is_64bit else "32bit"
+        shc_badge = _b(f"쉘코드 {proc.implanted_shc}개", "red") if proc.implanted_shc else ""
+        rows = ""
+        for mod in proc.modules:
+            mod_name  = Path(mod.module_path).name if mod.module_path else "-"
+            dump_name = Path(mod.dump_file).name   if mod.dump_file   else "-"
+            if mod.is_shellcode:
+                kind_badge = _b("쉘코드", "red")
+            elif mod.implanted_count:
+                kind_badge = _b("PE 인젝션", "orange")
+            else:
+                kind_badge = _b("훅/패치", "yellow")
+            rows += (
+                f"<tr>"
+                f"<td class='mono' style='color:#c9d1d9'>{_e(mod_name)}</td>"
+                f"<td>{kind_badge}</td>"
+                f"<td class='mono' style='color:#8b949e'>{mod.patches_count}</td>"
+                f"<td class='mono' style='color:#8b949e'>{mod.implanted_count}</td>"
+                f"<td class='mono ev-file'>{_e(dump_name)}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            f"<h3>PID {proc.pid} "
+            f"<span style='color:#8b949e;font-size:0.8rem;font-weight:normal'>"
+            f"({_e(arch)}) &nbsp;"
+            f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge}"
+            f"</span></h3>"
+            f"<table>"
+            f"<tr><th>모듈</th><th>유형</th><th>패치 수</th><th>이식 수</th><th>덤프 파일</th></tr>"
+            f"{rows}</table>"
+        )
+
+    return "\n".join(parts)
+
+
 def _ioc_html(result) -> str:
     ioc = result.ioc_report
     if not ioc:
@@ -588,21 +726,36 @@ def _ioc_html(result) -> str:
 
 def generate_html_report(result, output_path: str) -> None:
     """AnalysisResult → HTML 파일 저장"""
-    generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    generated   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sample_name = result.config.sample_path.name if result.config.sample_path else "전체 시스템 모니터링"
     techs = result.behavior_report.techniques if result.behavior_report else []
     ioc   = result.ioc_report
 
-    # 요약 배지
+    # ── 요약 카운트 ──────────────────────────────────────────────
     yara_r     = getattr(result, "yara_result", None)
     yara_count = len(yara_r.matches) if (yara_r and yara_r.available) else 0
 
-    tech_count = len(techs)
-    ip_count   = len(ioc.ip_addresses) if ioc else 0
-    file_count = len(ioc.dropped_files) if ioc else 0
+    _hh = getattr(result, "hh_result",       None)
+    _ps = getattr(result, "pe_sieve_result", None)
+    shc_total = 0
+    if _hh and not _hh.error:
+        shc_total = sum(r.implanted_shc for r in _hh.process_results)
+    elif _ps and not _ps.error:
+        shc_total = _ps.implanted_shc
 
-    # 위협 수준: YARA 탐지도 위협도에 반영
-    threat_score = tech_count + (1 if yara_count else 0)
+    tech_count = len(techs)
+    ip_count   = len(ioc.ip_addresses)  if ioc else 0
+    file_count = len(ioc.dropped_files) if ioc else 0
+    reg_added  = len(result.registry_diff.get("added",    []))
+    reg_mod    = len(result.registry_diff.get("modified", []))
+    conn_count = len(result.pcap_result.connections)  if result.pcap_result else 0
+    dns_count  = len(result.pcap_result.dns_queries)  if result.pcap_result else 0
+    ioc_total  = (ip_count + (len(ioc.domains) if ioc else 0)
+                  + file_count + (len(ioc.registry_keys) if ioc else 0)
+                  + (len(ioc.urls) if ioc else 0))
+
+    # ── 위협 수준 ────────────────────────────────────────────────
+    threat_score = tech_count + (1 if yara_count else 0) + (1 if shc_total else 0)
     threat_color = "red" if threat_score >= 3 else ("orange" if threat_score >= 1 else "green")
     threat_label = "HIGH" if threat_score >= 3 else ("MEDIUM" if threat_score >= 1 else "CLEAN")
 
@@ -610,6 +763,16 @@ def generate_html_report(result, output_path: str) -> None:
         f"{_b('✔ ' + k, 'green') if v else _b('✘ ' + k, 'gray')}"
         for k, v in result.tools_used.items()
     )
+
+    # ── 탭 배지 ──────────────────────────────────────────────────
+    tab1_b = _tb(tech_count, "red"    if tech_count else "gray") if tech_count else ""
+    tab2_b = _tb(file_count, "blue"   if file_count else "gray") if file_count else ""
+    tab3_b = _tb(reg_added + reg_mod,
+                 "yellow" if (reg_added + reg_mod) else "gray")  if (reg_added + reg_mod) else ""
+    tab4_b = _tb(conn_count, "green"  if conn_count else "gray") if conn_count else ""
+    tab5_b = (_tb(shc_total,  "red"    if shc_total  else "gray") if shc_total  else "") + \
+             (_tb(yara_count, "red"    if yara_count else "gray") if yara_count else "") + \
+             (_tb(ioc_total,  "orange" if ioc_total  else "gray") if ioc_total  else "")
 
     body = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -632,66 +795,111 @@ def generate_html_report(result, output_path: str) -> None:
 </p>
 <p style="margin-bottom:1rem">
   {_b('위협 수준: ' + threat_label, threat_color)}
+  &nbsp;
   {_b(f'MITRE {tech_count}건', 'red' if tech_count else 'gray')}
+  {_b(f'쉘코드 {shc_total}건', 'red' if shc_total else 'gray')}
   {_b(f'YARA {yara_count}건', 'red' if yara_count else 'gray')}
   {_b(f'외부 IP {ip_count}건', 'orange' if ip_count else 'gray')}
   {_b(f'드롭 파일 {file_count}건', 'orange' if file_count else 'gray')}
 </p>
-<p style="margin-bottom:2rem">{tools_html}</p>
-
-<!-- ── 기본 정보 ── -->
-<h2>📋 분석 개요</h2>
-<div class="grid2">
-  <div class="card">
-    <table class="kv">
-      <tr><td>샘플 이름</td><td class="mono">{_e(sample_name)}</td></tr>
-      <tr><td>샘플 PID</td><td class="mono">{result.sample_pid or '-'}</td></tr>
-      <tr><td>추적 PID</td><td class="mono">{', '.join(str(p) for p in sorted(result.all_pids)) or '-'}</td></tr>
-      <tr><td>전체 이벤트</td><td>{len(result.procmon_events):,}</td></tr>
-      <tr><td>필터 후 이벤트</td><td>{len(result.filtered_events):,}</td></tr>
-    </table>
-  </div>
-  <div class="card">
-    <table class="kv">
-      <tr><td>신규 프로세스</td><td>{len(result.process_diff.get('new_processes', []))}</td></tr>
-      <tr><td>레지스트리 추가</td><td>{len(result.registry_diff.get('added', []))}</td></tr>
-      <tr><td>레지스트리 변경</td><td>{len(result.registry_diff.get('modified', []))}</td></tr>
-      <tr><td>네트워크 연결</td><td>{len(result.pcap_result.connections) if result.pcap_result else 0}</td></tr>
-      <tr><td>DNS 쿼리</td><td>{len(result.pcap_result.dns_queries) if result.pcap_result else 0}</td></tr>
-      <tr><td>YARA 탐지</td><td><b style="color:{'#ff7b72' if yara_count else '#56d364'}">{yara_count}건</b></td></tr>
-    </table>
-  </div>
-</div>
+<p style="margin-bottom:1.5rem">{tools_html}</p>
 
 {"".join(f'<p class="alert alert-warning">⚠ {_e(e)}</p>' for e in result.errors) if result.errors else ""}
 
-<!-- ── MITRE ATT&CK ── -->
-<h2>🎯 MITRE ATT&CK 매핑</h2>
-{_section_html(result)}
+<!-- ── 탭 네비게이션 ── -->
+<div class="tabs">
+  <button class="tab-btn active" data-tab="tab-basic">
+    📋 기본 분석{tab1_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-filesystem">
+    📂 파일시스템{tab2_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-registry">
+    🔑 레지스트리{tab3_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-network">
+    🌐 네트워크{tab4_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-ioc">
+    🔍 IOC{tab5_b}
+  </button>
+</div>
 
-<!-- ── 프로세스 트리 ── -->
-<h2>🌲 신규 프로세스 (Process Hacker / psutil)</h2>
-{_process_html(result)}
+<!-- ══════════ 탭 1: 기본 분석 ══════════ -->
+<div id="tab-basic" class="tab-panel active">
 
-<!-- ── 파일 시스템 ── -->
-<h2>📂 파일 시스템 활동 (ProcMon)</h2>
-{_file_events_html(result)}
+  <h2>📋 분석 개요</h2>
+  <div class="grid2">
+    <div class="card">
+      <table class="kv">
+        <tr><td>샘플 이름</td><td class="mono">{_e(sample_name)}</td></tr>
+        <tr><td>샘플 PID</td><td class="mono">{result.sample_pid or '-'}</td></tr>
+        <tr><td>추적 PID</td><td class="mono">{', '.join(str(p) for p in sorted(result.all_pids)) or '-'}</td></tr>
+        <tr><td>전체 이벤트</td><td>{len(result.procmon_events):,}</td></tr>
+        <tr><td>필터 후 이벤트</td><td>{len(result.filtered_events):,}</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <table class="kv">
+        <tr><td>신규 프로세스</td><td>{len(result.process_diff.get('new_processes', []))}</td></tr>
+        <tr><td>레지스트리 추가</td><td>{reg_added}</td></tr>
+        <tr><td>레지스트리 변경</td><td>{reg_mod}</td></tr>
+        <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
+        <tr><td>DNS 쿼리</td><td>{dns_count}</td></tr>
+        <tr><td>쉘코드 / 인젝션</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}건</b></td></tr>
+        <tr><td>YARA 탐지</td><td><b style="color:{'#ff7b72' if yara_count else '#56d364'}">{yara_count}건</b></td></tr>
+      </table>
+    </div>
+  </div>
 
-<!-- ── 레지스트리 ── -->
-<h2>🔑 레지스트리 변경 (ProcMon + Regshot)</h2>
-{_registry_events_html(result)}
+  <h2>🎯 MITRE ATT&amp;CK 매핑</h2>
+  {_section_html(result)}
 
-<!-- ── 네트워크 ── -->
-<h2>🌐 네트워크 활동 (tshark)</h2>
-{_network_html(result)}
+  <h2>🌲 신규 프로세스</h2>
+  {_process_html(result)}
 
-<!-- ── YARA ── -->
-<h2>🔍 YARA 스캔 결과 (YARAify 커뮤니티 룰)</h2>
-{_yara_html(result)}
+</div>
 
-<!-- ── IOC ── -->
-<h2>💀 IOC 목록</h2>
-{_ioc_html(result)}
+<!-- ══════════ 탭 2: 파일시스템 활동 ══════════ -->
+<div id="tab-filesystem" class="tab-panel">
+
+  <h2>📂 파일 시스템 활동 (ProcMon)</h2>
+  {_file_events_html(result)}
+
+</div>
+
+<!-- ══════════ 탭 3: 레지스트리 활동 ══════════ -->
+<div id="tab-registry" class="tab-panel">
+
+  <h2>🔑 레지스트리 변경 (ProcMon + Regshot)</h2>
+  {_registry_events_html(result)}
+
+</div>
+
+<!-- ══════════ 탭 4: 네트워크 연결 ══════════ -->
+<div id="tab-network" class="tab-panel">
+
+  <h2>🌐 네트워크 활동 (tshark)</h2>
+  {_network_html(result)}
+
+  <h2>🔗 프로세스 ↔ 네트워크 매핑 (ProcMon)</h2>
+  {_process_network_html(result)}
+
+</div>
+
+<!-- ══════════ 탭 5: IOC ══════════ -->
+<div id="tab-ioc" class="tab-panel">
+
+  <h2>🔬 쉘코드 / 메모리 인젝션</h2>
+  {_shellcode_html(result)}
+
+  <h2>🔍 YARA 스캔 결과</h2>
+  {_yara_html(result)}
+
+  <h2>💀 IOC 목록</h2>
+  {_ioc_html(result)}
+
+</div>
 
 </div>
 {_PG_INIT}

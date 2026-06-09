@@ -59,6 +59,8 @@ class AnalysisResult:
     errors:             list  = field(default_factory=list)
     process_network_map: list = field(default_factory=list)  # list[ProcNetConnection]
     yara_result:        object = None                          # YaraScanResult
+    pe_sieve_result:    object = None                          # PeSieveResult
+    hh_result:          object = None                          # HollowsHunterResult
 
 
 def run_analysis(
@@ -93,6 +95,9 @@ def run_analysis(
     from analysis.ioc_extractor       import extract_iocs
     from analysis.process_network_map import build_process_network_map
     from analysis.yara_scanner        import run_yara_scan
+    from core.pesieve_scanner         import PeSieveScanner
+    from core.hollows_hunter          import HollowsHunter
+    from parsers.pesieve_result       import parse_pesieve, parse_hollows_hunter
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     pm = ProcMonController(
@@ -104,19 +109,25 @@ def run_analysis(
         tshark_path=config.tshark_path or find_tshark(),
         interface=config.interface,
     )
-    ph_path = config.ph_path or find_process_hacker()
+    ph_path    = config.ph_path or find_process_hacker()
+    ps_scanner = PeSieveScanner(config.output_dir / "dumps")
+    hh_scanner = HollowsHunter(config.output_dir / "dumps")
 
     result.tools_used = {
         "procmon":          pm.available and not config.no_procmon,
         "tshark":           ts.available and not config.no_tshark,
         "registry_snapshot": REG_AVAILABLE,
         "process_hacker":   ph_path is not None and not config.no_ph,
+        "pe_sieve":         ps_scanner.available,
+        "hollows_hunter":   hh_scanner.available,
     }
 
     status(f"[도구 확인] ProcMon={'✔' if result.tools_used['procmon'] else '✘'}  "
            f"tshark={'✔' if result.tools_used['tshark'] else '✘'}  "
            f"RegSnap={'✔' if result.tools_used['registry_snapshot'] else '✘'}  "
-           f"ProcHacker={'✔' if result.tools_used['process_hacker'] else '✘'}")
+           f"ProcHacker={'✔' if result.tools_used['process_hacker'] else '✘'}  "
+           f"pe-sieve={'✔' if result.tools_used['pe_sieve'] else '✘'}  "
+           f"HollowsHunter={'✔' if result.tools_used['hollows_hunter'] else '✘'}")
 
     # ── 1. 사전 스냅샷 ────────────────────────────────────────────────
     status("[1/6] 사전 스냅샷 수집 중...")
@@ -182,6 +193,31 @@ def run_analysis(
 
     # ── 5. 종료 ───────────────────────────────────────────────────────
     status("[5/6] 모니터링 종료...")
+
+    # pe-sieve / hollows-hunter 스캔 (프로세스 종료 전 — 가능한 많은 PID가 살아있을 때)
+    if hh_scanner.available:
+        status("[분석] hollows-hunter 전체 프로세스 스캔...")
+        raw = hh_scanner.scan_all(dump_mode=1, shellcode=True, hooks=True)
+        result.hh_result = parse_hollows_hunter(raw)
+        if result.hh_result.error:
+            result.errors.append(f"hollows-hunter: {result.hh_result.error}")
+        else:
+            susp_cnt = len(result.hh_result.suspicious_processes)
+            shc_cnt  = sum(r.implanted_shc for r in result.hh_result.process_results)
+            status(f"      의심 프로세스: {susp_cnt}개  쉘코드 영역: {shc_cnt}개"
+                   + (" 🚨" if shc_cnt else " ✅"))
+    elif ps_scanner.available and result.sample_pid:
+        status(f"[분석] pe-sieve 스캔 (PID {result.sample_pid})...")
+        raw = ps_scanner.scan_pid(result.sample_pid, dump_mode=1, shellcode=True, hooks=True)
+        result.pe_sieve_result = parse_pesieve(raw)
+        if result.pe_sieve_result.error:
+            result.errors.append(f"pe-sieve: {result.pe_sieve_result.error}")
+        else:
+            status(f"      의심 모듈: {result.pe_sieve_result.suspicious}개  "
+                   f"쉘코드: {result.pe_sieve_result.implanted_shc}개"
+                   + (" 🚨" if result.pe_sieve_result.implanted_shc else " ✅"))
+    else:
+        status("      [알림] pe-sieve / hollows-hunter 없음 — 메모리 스캔 생략")
 
     # 샘플 강제 종료
     if sample_proc and sample_proc.poll() is None:
