@@ -223,12 +223,20 @@ def run_analysis(
             if pr.error:
                 status(f"      PID {pid}: {pr.error[:80]}")
             elif pr.suspicious > 0:
-                status(f"      PID {pid}: 의심 {pr.suspicious}개  "
-                       f"쉘코드 {pr.implanted_shc}개 🚨")
-        shc_sum  = sum(r.implanted_shc for r in result.pe_sieve_results if not r.error)
+                inj_parts = []
+                if pr.implanted_pe:
+                    inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
+                if pr.implanted_shc:
+                    inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
+                inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
+                status(f"      PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
         susp_sum = sum(1 for r in result.pe_sieve_results if r.suspicious > 0)
-        status(f"      pe-sieve 완료: 의심 {susp_sum}개 PID  쉘코드 {shc_sum}개"
-               + (" 🚨" if shc_sum else " ✅"))
+        pe_inj   = sum(r.implanted_pe  for r in result.pe_sieve_results if not r.error)
+        shc_sum  = sum(r.implanted_shc for r in result.pe_sieve_results if not r.error)
+        status(f"      pe-sieve 완료: 의심 {susp_sum}개 PID"
+               + (f"  PE인젝션 {pe_inj}개" if pe_inj else "")
+               + (f"  쉘코드 {shc_sum}개" if shc_sum else "")
+               + (" 🚨" if susp_sum else " ✅"))
     elif not hh_scanner.available:
         status("      [알림] pe-sieve / hollows-hunter 없음 — 메모리 스캔 생략")
 

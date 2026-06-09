@@ -582,6 +582,7 @@ def _shellcode_html(result) -> str:
     hh_scanned = 0
     hh_susp    = 0
     hh_shc     = 0
+    hh_pe_inj  = 0
     if hh_r is not None:
         if hh_r.error:
             parts.append(f"<p class='alert alert-warning'>⚠ hollows-hunter: {_e(hh_r.error)}</p>")
@@ -589,12 +590,14 @@ def _shellcode_html(result) -> str:
             hh_scanned = hh_r.total_scanned
             hh_susp    = len(hh_r.suspicious_processes)
             hh_shc     = sum(r.implanted_shc for r in hh_r.process_results)
+            hh_pe_inj  = sum(r.implanted_pe  for r in hh_r.process_results)
 
     # ── pe-sieve 신규 프로세스 집계 ───────────────────────────────
-    pe_valid  = [r for r in pe_list if not r.error]
-    pe_errors = [r for r in pe_list if r.error]
-    pe_susp   = [r for r in pe_valid if r.suspicious > 0]
-    pe_shc    = sum(r.implanted_shc for r in pe_valid)
+    pe_valid   = [r for r in pe_list if not r.error]
+    pe_errors  = [r for r in pe_list if r.error]
+    pe_susp    = [r for r in pe_valid if r.suspicious > 0]
+    pe_shc     = sum(r.implanted_shc for r in pe_valid)
+    pe_pe_inj  = sum(r.implanted_pe  for r in pe_valid)
 
     has_hh_data = hh_r is not None and not hh_r.error
     has_pe_data = bool(pe_valid)
@@ -603,22 +606,26 @@ def _shellcode_html(result) -> str:
     if has_hh_data or has_pe_data:
         rows = ""
         if has_hh_data:
-            sc = "#ff7b72" if hh_shc  else "#8b949e"
-            ss = "#ff7b72" if hh_susp else "#56d364"
+            ss = "#ff7b72" if hh_susp   else "#56d364"
+            pi = "#e3b341" if hh_pe_inj else "#8b949e"
+            sc = "#ff7b72" if hh_shc    else "#8b949e"
             rows += (
                 f"<tr><td>hollows-hunter (전체 시스템)</td><td>"
                 f"{hh_scanned}개 스캔 &nbsp;"
                 f"<b style='color:{ss}'>의심 {hh_susp}개</b> &nbsp;"
+                f"<b style='color:{pi}'>PE인젝션 {hh_pe_inj}개</b> &nbsp;"
                 f"<b style='color:{sc}'>쉘코드 {hh_shc}개</b>"
                 f"</td></tr>"
             )
         if has_pe_data:
-            psc = "#ff7b72" if pe_shc  else "#8b949e"
-            pss = "#ff7b72" if pe_susp else "#56d364"
+            pss = "#ff7b72" if pe_susp   else "#56d364"
+            ppi = "#e3b341" if pe_pe_inj else "#8b949e"
+            psc = "#ff7b72" if pe_shc    else "#8b949e"
             rows += (
                 f"<tr><td>pe-sieve (신규 프로세스)</td><td>"
                 f"{len(pe_valid)}개 스캔 &nbsp;"
                 f"<b style='color:{pss}'>의심 {len(pe_susp)}개</b> &nbsp;"
+                f"<b style='color:{ppi}'>PE인젝션 {pe_pe_inj}개</b> &nbsp;"
                 f"<b style='color:{psc}'>쉘코드 {pe_shc}개</b>"
                 f"</td></tr>"
             )
@@ -695,10 +702,11 @@ def generate_html_report(result, output_path: str) -> None:
     # ── 요약 카운트 ──────────────────────────────────────────────
     _hh      = getattr(result, "hh_result",        None)
     _ps_list = getattr(result, "pe_sieve_results",  None) or []
+    # 의심 프로세스 수 집계 (쉘코드 + PE 인젝션 + 훅 포함)
     shc_total = 0
     if _hh and not _hh.error:
-        shc_total += sum(r.implanted_shc for r in _hh.process_results)
-    shc_total += sum(r.implanted_shc for r in _ps_list if not r.error)
+        shc_total += len(_hh.suspicious_processes)
+    shc_total += sum(1 for r in _ps_list if not r.error and r.suspicious > 0)
 
     tech_count = len(techs)
     ip_count   = len(ioc.ip_addresses)  if ioc else 0
@@ -753,7 +761,7 @@ def generate_html_report(result, output_path: str) -> None:
   {_b('위협 수준: ' + threat_label, threat_color)}
   &nbsp;
   {_b(f'MITRE {tech_count}건', 'red' if tech_count else 'gray')}
-  {_b(f'쉘코드 {shc_total}건', 'red' if shc_total else 'gray')}
+  {_b(f'인젝션·쉘코드 {shc_total}건', 'red' if shc_total else 'gray')}
   {_b(f'외부 IP {ip_count}건', 'orange' if ip_count else 'gray')}
   {_b(f'드롭 파일 {file_count}건', 'orange' if file_count else 'gray')}
 </p>
@@ -801,7 +809,7 @@ def generate_html_report(result, output_path: str) -> None:
         <tr><td>레지스트리 변경</td><td>{reg_mod}</td></tr>
         <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
         <tr><td>DNS 쿼리</td><td>{dns_count}</td></tr>
-        <tr><td>쉘코드 / 인젝션</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}건</b></td></tr>
+        <tr><td>인젝션·쉘코드 의심</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}개 프로세스</b></td></tr>
       </table>
     </div>
   </div>
