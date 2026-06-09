@@ -157,10 +157,6 @@ window.addEventListener('load', function() {
   setupPagination('tbl-ioc-file', 100);
   setupPagination('tbl-ioc-reg', 100);
   setupPagination('tbl-ioc-url', 100);
-  // YARA 테이블은 파일 수에 따라 동적으로 생성되므로 자동 탐지
-  document.querySelectorAll('[id^="tbl-yara-"]').forEach(function(t) {
-    setupPagination(t.id, 100);
-  });
 });
 </script>"""
 
@@ -527,77 +523,6 @@ def _process_html(result) -> str:
     )
 
 
-def _yara_html(result) -> str:
-    """YARA 스캔 결과 섹션"""
-    yr = getattr(result, "yara_result", None)
-    if yr is None:
-        return "<p class='alert alert-info'>YARA 스캔 실행되지 않음</p>"
-
-    if not yr.available:
-        return (
-            f"<p class='alert alert-warning'>⚠ {_e(yr.error or 'yara-python 미설치')} &mdash; "
-            f"<code>pip install yara-python</code> 후 재실행하면 탐지됩니다.</p>"
-        )
-
-    parts = []
-
-    # ── 요약 카드 ──────────────────────────────────────────────
-    match_color = "#ff7b72" if yr.matches else "#56d364"
-    fail_note   = (f" <span style='color:#8b949e;font-size:0.8rem'>({yr.rules_failed}개 실패)</span>"
-                   if yr.rules_failed else "")
-    parts.append(
-        f"<div class='card' style='margin-bottom:1rem'>"
-        f"<table class='kv'>"
-        f"<tr><td>로드된 룰</td><td>{yr.rules_loaded:,}개{fail_note}</td></tr>"
-        f"<tr><td>스캔 파일</td><td>{len(yr.files_scanned)}개</td></tr>"
-        f"<tr><td>탐지 결과</td><td><b style='color:{match_color}'>{len(yr.matches)}건</b></td></tr>"
-        f"</table></div>"
-    )
-
-    if yr.error:
-        parts.append(f"<p class='alert alert-warning'>⚠ {_e(yr.error)}</p>")
-
-    if not yr.matches:
-        parts.append("<p class='alert alert-success'>✅ YARA 탐지 없음</p>")
-        return "\n".join(parts)
-
-    # ── 파일별 매칭 테이블 ─────────────────────────────────────
-    from collections import defaultdict
-    by_file: dict[str, list] = defaultdict(list)
-    for m in yr.matches:
-        by_file[m.file_scanned].append(m)
-
-    for idx, (file_path, matches) in enumerate(by_file.items()):
-        file_name = Path(file_path).name
-        tbl_id = f"tbl-yara-{idx}"
-        rows = ""
-        for m in matches:
-            desc     = m.meta.get("description", m.meta.get("desc", ""))
-            author   = m.meta.get("author", "")
-            tags_html = (" ".join(_b(t, "purple") for t in m.tags[:4])
-                         if m.tags else "<span style='color:#8b949e'>-</span>")
-            strings_html = (" ".join(f"<code>{_e(s)}</code>" for s in m.matched_strings[:6])
-                            if m.matched_strings
-                            else "<span style='color:#8b949e'>-</span>")
-            rows += (
-                f"<tr>"
-                f"<td class='mono' style='color:#ff7b72'>{_e(m.rule_name)}</td>"
-                f"<td style='color:#c9d1d9;font-size:0.8rem'>{_e(desc[:100])}</td>"
-                f"<td style='color:#8b949e;font-size:0.78rem'>{_e(author[:40])}</td>"
-                f"<td>{tags_html}</td>"
-                f"<td style='font-size:0.72rem'>{strings_html}</td>"
-                f"</tr>"
-            )
-        parts.append(
-            f"<h3>📄 {_e(file_name)} &mdash; {len(matches)}개 룰 매칭</h3>"
-            f"<table id='{tbl_id}'>"
-            f"<tr><th>룰 이름</th><th>설명</th><th>작성자</th><th>태그</th><th>매칭 패턴</th></tr>"
-            f"{rows}</table>"
-        )
-
-    return "\n".join(parts)
-
-
 def _shellcode_html(result) -> str:
     """pe-sieve / hollows-hunter 쉘코드·인젝션 결과"""
     pe_r = getattr(result, "pe_sieve_result", None)
@@ -732,9 +657,6 @@ def generate_html_report(result, output_path: str) -> None:
     ioc   = result.ioc_report
 
     # ── 요약 카운트 ──────────────────────────────────────────────
-    yara_r     = getattr(result, "yara_result", None)
-    yara_count = len(yara_r.matches) if (yara_r and yara_r.available) else 0
-
     _hh = getattr(result, "hh_result",       None)
     _ps = getattr(result, "pe_sieve_result", None)
     shc_total = 0
@@ -755,7 +677,7 @@ def generate_html_report(result, output_path: str) -> None:
                   + (len(ioc.urls) if ioc else 0))
 
     # ── 위협 수준 ────────────────────────────────────────────────
-    threat_score = tech_count + (1 if yara_count else 0) + (1 if shc_total else 0)
+    threat_score = tech_count + (1 if shc_total else 0)
     threat_color = "red" if threat_score >= 3 else ("orange" if threat_score >= 1 else "green")
     threat_label = "HIGH" if threat_score >= 3 else ("MEDIUM" if threat_score >= 1 else "CLEAN")
 
@@ -771,7 +693,6 @@ def generate_html_report(result, output_path: str) -> None:
                  "yellow" if (reg_added + reg_mod) else "gray")  if (reg_added + reg_mod) else ""
     tab4_b = _tb(conn_count, "green"  if conn_count else "gray") if conn_count else ""
     tab5_b = (_tb(shc_total,  "red"    if shc_total  else "gray") if shc_total  else "") + \
-             (_tb(yara_count, "red"    if yara_count else "gray") if yara_count else "") + \
              (_tb(ioc_total,  "orange" if ioc_total  else "gray") if ioc_total  else "")
 
     body = f"""<!DOCTYPE html>
@@ -798,7 +719,6 @@ def generate_html_report(result, output_path: str) -> None:
   &nbsp;
   {_b(f'MITRE {tech_count}건', 'red' if tech_count else 'gray')}
   {_b(f'쉘코드 {shc_total}건', 'red' if shc_total else 'gray')}
-  {_b(f'YARA {yara_count}건', 'red' if yara_count else 'gray')}
   {_b(f'외부 IP {ip_count}건', 'orange' if ip_count else 'gray')}
   {_b(f'드롭 파일 {file_count}건', 'orange' if file_count else 'gray')}
 </p>
@@ -847,7 +767,6 @@ def generate_html_report(result, output_path: str) -> None:
         <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
         <tr><td>DNS 쿼리</td><td>{dns_count}</td></tr>
         <tr><td>쉘코드 / 인젝션</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}건</b></td></tr>
-        <tr><td>YARA 탐지</td><td><b style="color:{'#ff7b72' if yara_count else '#56d364'}">{yara_count}건</b></td></tr>
       </table>
     </div>
   </div>
@@ -892,9 +811,6 @@ def generate_html_report(result, output_path: str) -> None:
 
   <h2>🔬 쉘코드 / 메모리 인젝션</h2>
   {_shellcode_html(result)}
-
-  <h2>🔍 YARA 스캔 결과</h2>
-  {_yara_html(result)}
 
   <h2>💀 IOC 목록</h2>
   {_ioc_html(result)}
