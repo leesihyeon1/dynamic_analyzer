@@ -523,106 +523,142 @@ def _process_html(result) -> str:
     )
 
 
+def _render_proc_result(proc) -> str:
+    """PeSieveResult → HTML 블록 (헤더 + 모듈 테이블)"""
+    arch      = "64bit" if proc.is_64bit else "32bit"
+    shc_badge = _b(f"쉘코드 {proc.implanted_shc}개", "red") if proc.implanted_shc else ""
+    if not proc.modules:
+        return (
+            f"<p style='margin:.4rem 0;font-size:0.85rem'>PID {proc.pid} "
+            f"<span style='color:#8b949e'>({_e(arch)})</span> "
+            f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge}</p>"
+        )
+    rows = ""
+    for mod in proc.modules:
+        mod_name  = Path(mod.module_path).name if mod.module_path else "-"
+        dump_name = Path(mod.dump_file).name   if mod.dump_file   else "-"
+        if mod.is_shellcode:
+            kind_badge = _b("쉘코드", "red")
+        elif mod.implanted_count:
+            kind_badge = _b("PE 인젝션", "orange")
+        else:
+            kind_badge = _b("훅/패치", "yellow")
+        rows += (
+            f"<tr>"
+            f"<td class='mono' style='color:#c9d1d9'>{_e(mod_name)}</td>"
+            f"<td>{kind_badge}</td>"
+            f"<td class='mono' style='color:#8b949e'>{mod.patches_count}</td>"
+            f"<td class='mono' style='color:#8b949e'>{mod.implanted_count}</td>"
+            f"<td class='mono ev-file'>{_e(dump_name)}</td>"
+            f"</tr>"
+        )
+    return (
+        f"<h3>PID {proc.pid} "
+        f"<span style='color:#8b949e;font-size:0.8rem;font-weight:normal'>"
+        f"({_e(arch)}) &nbsp;"
+        f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge}"
+        f"</span></h3>"
+        f"<table>"
+        f"<tr><th>모듈</th><th>유형</th><th>패치 수</th><th>이식 수</th><th>덤프 파일</th></tr>"
+        f"{rows}</table>"
+    )
+
+
 def _shellcode_html(result) -> str:
     """pe-sieve / hollows-hunter 쉘코드·인젝션 결과"""
-    pe_r = getattr(result, "pe_sieve_result", None)
-    hh_r = getattr(result, "hh_result",       None)
+    hh_r    = getattr(result, "hh_result",        None)
+    pe_list = getattr(result, "pe_sieve_results",  None) or []
 
-    if pe_r is None and hh_r is None:
+    if hh_r is None and not pe_list:
         return (
             "<p class='alert alert-info'>"
-            "ℹ pe-sieve / hollows-hunter 미설치 — 메모리 스캔 생략됨. "
+            "pe-sieve / hollows-hunter 미설치 — 메모리 스캔 생략됨. "
             "<code>C:\\Tools</code> 또는 <code>PATH</code>에 실행 파일 배치 후 재분석하면 표시됩니다.</p>"
-        )
-
-    scan_error       = ""
-    all_proc_results = []
-
-    if hh_r is not None:
-        if hh_r.error:
-            scan_error = hh_r.error
-        else:
-            all_proc_results = hh_r.process_results
-    elif pe_r is not None:
-        if pe_r.error:
-            scan_error = pe_r.error
-        else:
-            all_proc_results = [pe_r]
-
-    if scan_error:
-        return f"<p class='alert alert-warning'>⚠ {_e(scan_error)}</p>"
-
-    suspicious = [r for r in all_proc_results if r.suspicious > 0]
-
-    if not suspicious:
-        scanned = hh_r.total_scanned if hh_r else 0
-        scanner = "hollows-hunter" if hh_r else "pe-sieve"
-        return (
-            f"<p class='alert alert-success'>"
-            f"✅ 인젝션 / 쉘코드 미탐지 &mdash; {_e(scanner)}"
-            + (f": 프로세스 {scanned}개 스캔" if scanned else "")
-            + "</p>"
         )
 
     parts = []
 
-    total_shc    = sum(r.implanted_shc for r in all_proc_results)
-    total_pe_inj = sum(r.implanted_pe  for r in all_proc_results)
-    total_hooked = sum(r.hooked        for r in all_proc_results)
-    scanned_cnt  = hh_r.total_scanned if hh_r else 1
-    scanner_name = "hollows-hunter (전체 시스템)" if hh_r else (
-        f"pe-sieve (PID {pe_r.pid})" if pe_r else "-"
-    )
-    shc_color  = "#ff7b72" if total_shc    else "#8b949e"
-    inj_color  = "#ffa657" if total_pe_inj else "#8b949e"
-    hook_color = "#e3b341" if total_hooked else "#8b949e"
+    # ── hollows-hunter 집계 ────────────────────────────────────────
+    hh_scanned = 0
+    hh_susp    = 0
+    hh_shc     = 0
+    if hh_r is not None:
+        if hh_r.error:
+            parts.append(f"<p class='alert alert-warning'>⚠ hollows-hunter: {_e(hh_r.error)}</p>")
+        else:
+            hh_scanned = hh_r.total_scanned
+            hh_susp    = len(hh_r.suspicious_processes)
+            hh_shc     = sum(r.implanted_shc for r in hh_r.process_results)
 
-    parts.append(
-        f"<div class='card' style='margin-bottom:1rem'>"
-        f"<table class='kv'>"
-        f"<tr><td>스캐너</td><td class='mono'>{_e(scanner_name)}</td></tr>"
-        f"<tr><td>스캔 프로세스</td><td>{scanned_cnt}개</td></tr>"
-        f"<tr><td>의심 프로세스</td><td><b style='color:#ff7b72'>{len(suspicious)}개</b></td></tr>"
-        f"<tr><td>쉘코드 영역</td><td><b style='color:{shc_color}'>{total_shc}개</b></td></tr>"
-        f"<tr><td>PE 인젝션</td><td><b style='color:{inj_color}'>{total_pe_inj}개</b></td></tr>"
-        f"<tr><td>훅 탐지</td><td><b style='color:{hook_color}'>{total_hooked}개</b></td></tr>"
-        f"</table></div>"
-    )
+    # ── pe-sieve 신규 프로세스 집계 ───────────────────────────────
+    pe_valid  = [r for r in pe_list if not r.error]
+    pe_errors = [r for r in pe_list if r.error]
+    pe_susp   = [r for r in pe_valid if r.suspicious > 0]
+    pe_shc    = sum(r.implanted_shc for r in pe_valid)
 
-    for proc in suspicious:
-        if not proc.modules:
-            continue
-        arch      = "64bit" if proc.is_64bit else "32bit"
-        shc_badge = _b(f"쉘코드 {proc.implanted_shc}개", "red") if proc.implanted_shc else ""
+    has_hh_data = hh_r is not None and not hh_r.error
+    has_pe_data = bool(pe_valid)
+
+    # ── 요약 카드 ──────────────────────────────────────────────────
+    if has_hh_data or has_pe_data:
         rows = ""
-        for mod in proc.modules:
-            mod_name  = Path(mod.module_path).name if mod.module_path else "-"
-            dump_name = Path(mod.dump_file).name   if mod.dump_file   else "-"
-            if mod.is_shellcode:
-                kind_badge = _b("쉘코드", "red")
-            elif mod.implanted_count:
-                kind_badge = _b("PE 인젝션", "orange")
-            else:
-                kind_badge = _b("훅/패치", "yellow")
+        if has_hh_data:
+            sc = "#ff7b72" if hh_shc  else "#8b949e"
+            ss = "#ff7b72" if hh_susp else "#56d364"
             rows += (
-                f"<tr>"
-                f"<td class='mono' style='color:#c9d1d9'>{_e(mod_name)}</td>"
-                f"<td>{kind_badge}</td>"
-                f"<td class='mono' style='color:#8b949e'>{mod.patches_count}</td>"
-                f"<td class='mono' style='color:#8b949e'>{mod.implanted_count}</td>"
-                f"<td class='mono ev-file'>{_e(dump_name)}</td>"
-                f"</tr>"
+                f"<tr><td>hollows-hunter (전체 시스템)</td><td>"
+                f"{hh_scanned}개 스캔 &nbsp;"
+                f"<b style='color:{ss}'>의심 {hh_susp}개</b> &nbsp;"
+                f"<b style='color:{sc}'>쉘코드 {hh_shc}개</b>"
+                f"</td></tr>"
+            )
+        if has_pe_data:
+            psc = "#ff7b72" if pe_shc  else "#8b949e"
+            pss = "#ff7b72" if pe_susp else "#56d364"
+            rows += (
+                f"<tr><td>pe-sieve (신규 프로세스)</td><td>"
+                f"{len(pe_valid)}개 스캔 &nbsp;"
+                f"<b style='color:{pss}'>의심 {len(pe_susp)}개</b> &nbsp;"
+                f"<b style='color:{psc}'>쉘코드 {pe_shc}개</b>"
+                f"</td></tr>"
             )
         parts.append(
-            f"<h3>PID {proc.pid} "
-            f"<span style='color:#8b949e;font-size:0.8rem;font-weight:normal'>"
-            f"({_e(arch)}) &nbsp;"
-            f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge}"
-            f"</span></h3>"
-            f"<table>"
-            f"<tr><th>모듈</th><th>유형</th><th>패치 수</th><th>이식 수</th><th>덤프 파일</th></tr>"
-            f"{rows}</table>"
+            f"<div class='card' style='margin-bottom:1rem'>"
+            f"<table class='kv'>{rows}</table>"
+            f"</div>"
         )
+
+    # ── hollows-hunter 상세 (의심 프로세스만) ─────────────────────
+    if has_hh_data:
+        if hh_r.suspicious_processes:
+            for proc in hh_r.suspicious_processes:
+                parts.append(_render_proc_result(proc))
+        else:
+            parts.append(
+                "<p class='alert alert-success'>✅ hollows-hunter: 인젝션 / 쉘코드 미탐지</p>"
+            )
+
+    # ── pe-sieve 신규 프로세스 상세 ───────────────────────────────
+    if pe_list:
+        parts.append(
+            "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;padding-top:.75rem'>"
+            "pe-sieve — 신규 프로세스 스캔 결과</h3>"
+        )
+        for r in pe_list:
+            if r.error:
+                # 이미 종료됐거나 권한 없는 프로세스 — 회색으로
+                parts.append(
+                    f"<p style='color:#8b949e;font-size:0.82rem;margin:.25rem 0'>"
+                    f"PID {r.pid}: {_e(r.error[:120])}</p>"
+                )
+            elif r.suspicious > 0:
+                parts.append(_render_proc_result(r))
+            else:
+                arch = "64bit" if r.is_64bit else "32bit"
+                parts.append(
+                    f"<p style='color:#56d364;font-size:0.82rem;margin:.25rem 0'>"
+                    f"✅ PID {r.pid} ({_e(arch)}): 이상 없음</p>"
+                )
 
     return "\n".join(parts)
 
@@ -657,13 +693,12 @@ def generate_html_report(result, output_path: str) -> None:
     ioc   = result.ioc_report
 
     # ── 요약 카운트 ──────────────────────────────────────────────
-    _hh = getattr(result, "hh_result",       None)
-    _ps = getattr(result, "pe_sieve_result", None)
+    _hh      = getattr(result, "hh_result",        None)
+    _ps_list = getattr(result, "pe_sieve_results",  None) or []
     shc_total = 0
     if _hh and not _hh.error:
-        shc_total = sum(r.implanted_shc for r in _hh.process_results)
-    elif _ps and not _ps.error:
-        shc_total = _ps.implanted_shc
+        shc_total += sum(r.implanted_shc for r in _hh.process_results)
+    shc_total += sum(r.implanted_shc for r in _ps_list if not r.error)
 
     tech_count = len(techs)
     ip_count   = len(ioc.ip_addresses)  if ioc else 0

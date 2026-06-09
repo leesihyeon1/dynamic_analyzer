@@ -58,8 +58,8 @@ class AnalysisResult:
     all_pids:           set   = field(default_factory=set)    # 샘플 + 자식 PID
     errors:             list  = field(default_factory=list)
     process_network_map: list = field(default_factory=list)  # list[ProcNetConnection]
-    pe_sieve_result:    object = None                          # PeSieveResult
-    hh_result:          object = None                          # HollowsHunterResult
+    pe_sieve_results:   list  = field(default_factory=list)    # list[PeSieveResult] — 신규 프로세스별 스캔
+    hh_result:          object = None                          # HollowsHunterResult — 전체 시스템 스캔
 
 
 def run_analysis(
@@ -192,6 +192,14 @@ def run_analysis(
     # ── 5. 종료 ───────────────────────────────────────────────────────
     status("[5/6] 모니터링 종료...")
 
+    # ── 중간 프로세스 스냅샷 → 분석 중 생성된 신규 PID 목록 (프로세스가 살아있는 시점)
+    proc_mid  = take_process_snapshot()
+    mid_diff  = diff_process_snapshots(proc_before, proc_mid)
+    scan_pids: list = [p.pid for p in mid_diff.get("new_processes", [])]
+    if result.sample_pid and result.sample_pid not in scan_pids:
+        scan_pids.insert(0, result.sample_pid)  # 샘플 PID 포함 보장
+    status(f"      스캔 대상 PID: {scan_pids if scan_pids else '없음'}")
+
     # pe-sieve / hollows-hunter 스캔 (프로세스 종료 전 — 가능한 많은 PID가 살아있을 때)
     if hh_scanner.available:
         status("[분석] hollows-hunter 전체 프로세스 스캔...")
@@ -199,22 +207,29 @@ def run_analysis(
         result.hh_result = parse_hollows_hunter(raw)
         if result.hh_result.error:
             result.errors.append(f"hollows-hunter: {result.hh_result.error}")
+            status(f"      [경고] {result.hh_result.error}")
         else:
             susp_cnt = len(result.hh_result.suspicious_processes)
             shc_cnt  = sum(r.implanted_shc for r in result.hh_result.process_results)
             status(f"      의심 프로세스: {susp_cnt}개  쉘코드 영역: {shc_cnt}개"
                    + (" 🚨" if shc_cnt else " ✅"))
-    elif ps_scanner.available and result.sample_pid:
-        status(f"[분석] pe-sieve 스캔 (PID {result.sample_pid})...")
-        raw = ps_scanner.scan_pid(result.sample_pid, dump_mode=1, shellcode=True, hooks=True)
-        result.pe_sieve_result = parse_pesieve(raw)
-        if result.pe_sieve_result.error:
-            result.errors.append(f"pe-sieve: {result.pe_sieve_result.error}")
-        else:
-            status(f"      의심 모듈: {result.pe_sieve_result.suspicious}개  "
-                   f"쉘코드: {result.pe_sieve_result.implanted_shc}개"
-                   + (" 🚨" if result.pe_sieve_result.implanted_shc else " ✅"))
-    else:
+
+    if ps_scanner.available and scan_pids:
+        status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(scan_pids)}개 PID)...")
+        for pid in scan_pids:
+            raw = ps_scanner.scan_pid(pid, dump_mode=1, shellcode=True, hooks=True)
+            pr  = parse_pesieve(raw)
+            result.pe_sieve_results.append(pr)
+            if pr.error:
+                status(f"      PID {pid}: {pr.error[:80]}")
+            elif pr.suspicious > 0:
+                status(f"      PID {pid}: 의심 {pr.suspicious}개  "
+                       f"쉘코드 {pr.implanted_shc}개 🚨")
+        shc_sum  = sum(r.implanted_shc for r in result.pe_sieve_results if not r.error)
+        susp_sum = sum(1 for r in result.pe_sieve_results if r.suspicious > 0)
+        status(f"      pe-sieve 완료: 의심 {susp_sum}개 PID  쉘코드 {shc_sum}개"
+               + (" 🚨" if shc_sum else " ✅"))
+    elif not hh_scanner.available:
         status("      [알림] pe-sieve / hollows-hunter 없음 — 메모리 스캔 생략")
 
     # 샘플 강제 종료
