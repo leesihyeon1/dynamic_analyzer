@@ -14,6 +14,10 @@ from pathlib import Path
 
 # ── 기본값 ──────────────────────────────────────────────────────────
 _DEFAULTS: dict = {
+    "tools": {
+        "pe_sieve":       "",   # 비워두면 PATH + 알려진 디렉터리 자동 탐색
+        "hollows_hunter": "",
+    },
     "capa": {
         "enabled": True,
         "path":    "capa.exe",

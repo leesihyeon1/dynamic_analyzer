@@ -1,6 +1,12 @@
 {
   "_comment": "dynamic_analyzer 설정 파일 — 수정 후 다음 실행부터 적용됩니다",
 
+  "tools": {
+    "_comment": "pe-sieve / hollows-hunter 경로. 비워두면 PATH + 알려진 디렉터리에서 자동 탐색.",
+    "pe_sieve":       "",
+    "hollows_hunter": ""
+  },
+
   "capa": {
     "_comment": "CAPA 정적 분석 (https://github.com/mandiant/capa). FLARE VM에 기본 포함됨.",
     "enabled": true,

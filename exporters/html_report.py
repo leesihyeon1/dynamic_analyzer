@@ -125,9 +125,48 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .hunt-link{color:#58a6ff;font-size:.76rem;text-decoration:none}
 .hunt-link:hover{text-decoration:underline}
 .hunt-none{color:#8b949e;font-size:.83rem}
+/* ── Process Tree ── */
+.ptree{font-family:'Cascadia Code','Consolas',monospace;font-size:.82rem;
+       background:#0d1117;border:1px solid #30363d;border-radius:8px;
+       padding:1rem 1.25rem;margin-bottom:1.5rem}
+.pt-wrap{margin-left:0}
+.pt-children{padding-left:1.4rem;border-left:1px solid #21262d;margin-left:.5rem}
+.pt-row{display:flex;align-items:baseline;gap:.4rem;padding:.22rem .4rem;
+        border-radius:4px;flex-wrap:wrap;line-height:1.5}
+.pt-row.pt-clickable{cursor:pointer}
+.pt-row.pt-clickable:hover{background:#161b22}
+.pt-arr{color:#484f58;font-size:.65rem;min-width:12px;flex-shrink:0;transition:transform .15s}
+.pt-leaf{color:#30363d;font-size:.55rem;min-width:12px;flex-shrink:0}
+.pt-name-new{color:#ffa657;font-weight:600}
+.pt-name-existing{color:#8b949e}
+.pt-name-suspicious{color:#ff7b72;font-weight:700}
+.pt-name-sample{color:#e3b341;font-weight:700}
+.pt-pid{color:#484f58;font-size:.73rem}
+.pt-meta{color:#3d444d;font-size:.70rem;padding:.02rem 0 .05rem 1.6rem;
+         word-break:break-all;line-height:1.35}
+.pt-legend{display:flex;gap:1.2rem;font-size:.74rem;color:#8b949e;
+           margin-bottom:.75rem;flex-wrap:wrap}
+.pt-legend span{display:flex;align-items:center;gap:.3rem}
 """
 
 _JS = """
+function togglePT(id) {
+  var el  = document.getElementById(id);
+  var arr = document.getElementById('arr_' + id);
+  if (!el) return;
+  var hidden = el.style.display === 'none';
+  el.style.display = hidden ? '' : 'none';
+  if (arr) arr.textContent = hidden ? '▼' : '▶';
+}
+function expandAllPT() {
+  document.querySelectorAll('.pt-children').forEach(function(el){el.style.display=''});
+  document.querySelectorAll('.pt-arr').forEach(function(el){el.textContent='▼'});
+}
+function collapseAllPT() {
+  document.querySelectorAll('.pt-children').forEach(function(el){el.style.display='none'});
+  document.querySelectorAll('.pt-arr').forEach(function(el){el.textContent='▶'});
+}
+
 function setupTableControls(tableId, rowsPerPage) {
     var table = document.getElementById(tableId);
     if (!table) return;
@@ -984,10 +1023,178 @@ def _process_network_html(result) -> str:
     )
 
 
+def _process_tree_html(result) -> str:
+    """신규 프로세스를 부모-자식 트리로 시각화합니다."""
+    new_procs  = result.process_diff.get("new_processes", [])
+    snapshot   = getattr(result, "proc_after_snapshot", {}) or {}
+    sample_pid = getattr(result, "sample_pid", None)
+
+    if not new_procs:
+        return ""
+
+    # ── 주석 맵 빌드 ────────────────────────────────────────────────
+    # pe-sieve: 의심 있는 것만
+    pe_map: dict[int, object] = {
+        r.pid: r
+        for r in (getattr(result, "pe_sieve_results", None) or [])
+        if not r.error and r.suspicious > 0
+    }
+    # hollows-hunter: 의심 프로세스
+    hh_map: dict[int, object] = {}
+    hh_r = getattr(result, "hh_result", None)
+    if hh_r and not getattr(hh_r, "error", None):
+        for pr in getattr(hh_r, "process_results", []):
+            if getattr(pr, "suspicious", 0) > 0:
+                hh_map[pr.pid] = pr
+
+    # 종료된 프로세스 PID
+    term_pids = {p.pid for p in result.process_diff.get("terminated_processes", [])}
+
+    new_pid_set = {p.pid for p in new_procs}
+
+    # ── 부모→자식 매핑 (신규만) ──────────────────────────────────────
+    children: dict[int, list] = {}
+    for proc in new_procs:
+        children.setdefault(proc.ppid, []).append(proc)
+
+    # ── 루트 부모 PIDs (신규가 아닌 부모) ────────────────────────────
+    root_parent_pids: set[int] = {
+        p.ppid for p in new_procs if p.ppid not in new_pid_set
+    }
+
+    def get_snap(pid: int):
+        if pid in snapshot:
+            return snapshot[pid]
+        for p in new_procs:
+            if p.pid == pid:
+                return p
+        return None
+
+    # ── 노드 렌더러 ─────────────────────────────────────────────────
+    def render_node(pid: int, proc, is_new: bool, depth: int = 0) -> str:
+        pe_r  = pe_map.get(pid)
+        hh_r_ = hh_map.get(pid)
+        is_suspicious = bool(pe_r or hh_r_)
+        is_sample     = (pid == sample_pid)
+        is_terminated = pid in term_pids
+        node_children = children.get(pid, [])
+        has_children  = bool(node_children)
+
+        # 이름·경로·커맨드라인
+        name = f"PID {pid}"
+        exe  = ""
+        cmd  = ""
+        if proc:
+            name = getattr(proc, "name", "") or name
+            exe  = getattr(proc, "exe",  "") or ""
+            cl   = getattr(proc, "cmdline", []) or []
+            if len(cl) > 1:
+                cmd = " ".join(cl[1:])[:160]
+
+        # 노드 스타일
+        if is_suspicious:
+            name_cls = "pt-name-suspicious"
+            icon = "🚨"
+        elif is_sample:
+            name_cls = "pt-name-sample"
+            icon = "🎯"
+        elif is_new:
+            name_cls = "pt-name-new"
+            icon = "⚡"
+        else:
+            name_cls = "pt-name-existing"
+            icon = "💻"
+
+        # 배지
+        bdg = ""
+        if is_new:
+            bdg += _b("신규", "orange")
+        if is_terminated:
+            bdg += _b("종료됨", "gray")
+        if pe_r:
+            shc = getattr(pe_r, "implanted_shc", 0)
+            pei = getattr(pe_r, "implanted_pe",  0)
+            hk  = getattr(pe_r, "hooked",        0)
+            if shc: bdg += _b(f"쉘코드 {shc}", "red")
+            if pei: bdg += _b(f"PE인젝션 {pei}", "orange")
+            if hk:  bdg += _b(f"훅 {hk}", "yellow")
+        elif hh_r_:
+            shc = getattr(hh_r_, "implanted_shc", 0)
+            pei = getattr(hh_r_, "implanted_pe",  0)
+            if shc: bdg += _b(f"HH 쉘코드 {shc}", "red")
+            if pei: bdg += _b(f"HH PE인젝션 {pei}", "orange")
+
+        # 토글 ID
+        uid = f"ptc_{depth}_{pid}"
+        if has_children:
+            arr  = f"<span class='pt-arr' id='arr_{uid}'>▼</span>"
+            rclick = f"class='pt-row pt-clickable' onclick=\"togglePT('{uid}')\""
+        else:
+            arr    = "<span class='pt-leaf'>◆</span>"
+            rclick = "class='pt-row'"
+
+        html  = "<div class='pt-wrap'>"
+        html += (
+            f"<div {rclick}>"
+            f"{arr} {icon}&nbsp;"
+            f"<span class='{name_cls}'>{_e(name)}</span>"
+            f"<span class='pt-pid'>&nbsp;PID {pid}</span>"
+            f"&nbsp;{bdg}"
+            f"</div>"
+        )
+        if exe:
+            html += f"<div class='pt-meta'>{_e(exe)}</div>"
+        if cmd:
+            html += f"<div class='pt-meta' style='color:#484f58'>▸ {_e(cmd)}</div>"
+
+        if has_children:
+            html += f"<div class='pt-children' id='{uid}'>"
+            for child in sorted(node_children, key=lambda p: p.pid):
+                html += render_node(child.pid, child, is_new=True, depth=depth + 1)
+            html += "</div>"
+
+        html += "</div>"
+        return html
+
+    # ── 전체 트리 렌더링 ─────────────────────────────────────────────
+    parts = [
+        "<div style='display:flex;gap:.6rem;align-items:center;margin-bottom:.6rem'>",
+        "<span style='font-size:.78rem;color:#8b949e'>",
+        "💻 기존 프로세스&nbsp;&nbsp;",
+        "⚡ <span style='color:#ffa657'>신규 프로세스</span>&nbsp;&nbsp;",
+        "🎯 <span style='color:#e3b341'>샘플</span>&nbsp;&nbsp;",
+        "🚨 <span style='color:#ff7b72'>의심 (pe-sieve/HH)</span>",
+        "</span>",
+        "<button onclick='expandAllPT()' style='background:#21262d;border:1px solid #30363d;"
+        "color:#8b949e;border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 펼치기</button>",
+        "<button onclick='collapseAllPT()' style='background:#21262d;border:1px solid #30363d;"
+        "color:#8b949e;border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 접기</button>",
+        "</div>",
+        "<div class='ptree'>",
+    ]
+
+    for ppid in sorted(root_parent_pids):
+        if ppid == 0:
+            # PID 0 자식들은 직접 루트로 표시
+            for proc in sorted(children.get(0, []), key=lambda p: p.pid):
+                parts.append(render_node(proc.pid, proc, is_new=True, depth=0))
+        else:
+            parent = get_snap(ppid)
+            parts.append(render_node(ppid, parent, is_new=False, depth=0))
+
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
 def _process_html(result) -> str:
     new_procs = result.process_diff.get("new_processes", [])
     if not new_procs:
         return "<p class='alert alert-success'>신규 프로세스 없음</p>"
+
+    # ── 프로세스 트리 ────────────────────────────────────────────────
+    tree_html = _process_tree_html(result)
+
+    # ── 플랫 테이블 ──────────────────────────────────────────────────
     rows = ""
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
@@ -996,24 +1203,35 @@ def _process_html(result) -> str:
             f"<td class='mono'>{p.pid}</td>"
             f"<td class='mono ev-process'>{_e(p.name)}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
-            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:100])}</td>"
+            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
             f"</tr>"
         )
-    return (
+    table_html = (
         "<table id='tbl-process'><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
         f"{rows}</table>"
     )
+
+    return tree_html + table_html
 
 
 def _render_proc_result(proc) -> str:
     """PeSieveResult → HTML 블록 (헤더 + 모듈 테이블)"""
     arch      = "64bit" if proc.is_64bit else "32bit"
     shc_badge = _b(f"쉘코드 {proc.implanted_shc}개", "red") if proc.implanted_shc else ""
+    pe_badge  = _b(f"PE 인젝션 {proc.implanted_pe}개", "orange") if proc.implanted_pe else ""
+    # 프로세스 이름 표시 (hollows-hunter summary 에는 name 포함)
+    proc_name = _e(proc.name) if getattr(proc, "name", "") else ""
+    name_tag  = (
+        f" <span style='color:#e3b341;font-weight:600'>{proc_name}</span>"
+        if proc_name else ""
+    )
+
     if not proc.modules:
         return (
-            f"<p style='margin:.4rem 0;font-size:0.85rem'>PID {proc.pid} "
+            f"<p style='margin:.4rem 0;font-size:0.85rem'>🚨 PID {proc.pid}"
+            f"{name_tag} "
             f"<span style='color:#8b949e'>({_e(arch)})</span> "
-            f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge}</p>"
+            f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}</p>"
         )
     rows = ""
     for mod in proc.modules:
@@ -1035,10 +1253,10 @@ def _render_proc_result(proc) -> str:
             f"</tr>"
         )
     return (
-        f"<h3>PID {proc.pid} "
+        f"<h3>🚨 PID {proc.pid}{name_tag} "
         f"<span style='color:#8b949e;font-size:0.8rem;font-weight:normal'>"
         f"({_e(arch)}) &nbsp;"
-        f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge}"
+        f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}"
         f"</span></h3>"
         f"<table>"
         f"<tr><th>모듈</th><th>유형</th><th>패치 수</th><th>이식 수</th><th>덤프 파일</th></tr>"
@@ -1067,10 +1285,11 @@ def _shellcode_html(result) -> str:
     hh_pe_inj  = 0
     if hh_r is not None:
         if hh_r.error:
-            # JSON 파싱 실패는 의심 프로세스 없을 때 정상 케이스 — 눈에 띄지 않게 표시
+            full_err  = _e(hh_r.error)
+            short_err = _e(hh_r.error[:200]) + ("…" if len(hh_r.error) > 200 else "")
             parts.append(
-                f"<p style='color:#484f58;font-size:.78rem;margin:.3rem 0'>"
-                f"hollows-hunter: {_e(hh_r.error)}</p>"
+                f"<p style='color:#484f58;font-size:.78rem;margin:.3rem 0' title='{full_err}'>"
+                f"hollows-hunter: {short_err}</p>"
             )
         else:
             hh_scanned = hh_r.total_scanned
@@ -1139,10 +1358,12 @@ def _shellcode_html(result) -> str:
         )
         for r in pe_list:
             if r.error:
-                # 이미 종료됐거나 권한 없는 프로세스 — 회색으로
+                # 에러 전문을 title 툴팁에, 앞 160자를 본문에 표시
+                full_err  = _e(r.error)
+                short_err = _e(r.error[:160]) + ("…" if len(r.error) > 160 else "")
                 parts.append(
-                    f"<p style='color:#8b949e;font-size:0.82rem;margin:.25rem 0'>"
-                    f"PID {r.pid}: {_e(r.error[:120])}</p>"
+                    f"<p style='color:#8b949e;font-size:0.82rem;margin:.25rem 0' title='{full_err}'>"
+                    f"PID {r.pid}: {short_err}</p>"
                 )
             elif r.suspicious > 0:
                 parts.append(_render_proc_result(r))
@@ -1152,6 +1373,104 @@ def _shellcode_html(result) -> str:
                     f"<p style='color:#56d364;font-size:0.82rem;margin:.25rem 0'>"
                     f"✅ PID {r.pid} ({_e(arch)}): 이상 없음</p>"
                 )
+
+    # ── 쉘코드 덤프 재분석 결과 ───────────────────────────────────────
+    analyses = getattr(result, "shellcode_analyses", None) or []
+    if analyses:
+        parts.append(
+            "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;"
+            "padding-top:.75rem'>🔬 쉘코드 덤프 재분석 (YARA + CAPA)</h3>"
+        )
+        hits      = [sa for sa in analyses if sa.has_findings]
+        no_hits   = [sa for sa in analyses if not sa.has_findings and not sa.error]
+        err_items = [sa for sa in analyses if sa.error and not sa.has_findings]
+
+        hit_color = "#ff7b72" if hits else "#56d364"
+        parts.append(
+            f"<p style='color:#8b949e;font-size:.82rem;margin:.3rem 0 .75rem'>"
+            f"분석 파일 {len(analyses)}개 &nbsp;·&nbsp; "
+            f"<b style='color:{hit_color}'>시그니처 히트 {len(hits)}개</b>"
+            + (f" &nbsp;·&nbsp; 이상 없음 {len(no_hits)}개" if no_hits else "")
+            + f"</p>"
+        )
+
+        if not hits and not err_items:
+            parts.append(
+                "<p class='alert alert-success'>"
+                "✅ 필터 통과 쉘코드 덤프에서 알려진 패턴 미탐지</p>"
+            )
+        else:
+            for sa in hits:
+                yara_html = " ".join(_b(m, "red") for m in sa.yara_matches)
+                capa_html = " ".join(
+                    "<span class='badge badge-purple' title='"
+                    + _e((t.tactic or "") + " / " + (t.technique_name or ""))
+                    + "'>" + _e(t.technique_id) + "</span>"
+                    for t in sa.capa_techs
+                )
+                fname     = Path(sa.dump_file).name
+                size_str  = f"{sa.size_bytes:,} B" if sa.size_bytes else "?"
+                # 해시 행 (있는 경우만)
+                hash_rows = ""
+                if sa.md5 or sa.sha256:
+                    hash_rows = "<table style='border-collapse:collapse;margin-top:.45rem;width:100%'>"
+                    if sa.md5:
+                        hash_rows += (
+                            "<tr>"
+                            "<td style='color:#8b949e;font-size:.72rem;white-space:nowrap;"
+                            "padding-right:.6rem;vertical-align:top'>MD5</td>"
+                            "<td class='mono' style='font-size:.72rem;word-break:break-all;"
+                            "color:#adbac7'>"
+                            + _e(sa.md5) + "</td></tr>"
+                        )
+                    if sa.sha256:
+                        hash_rows += (
+                            "<tr>"
+                            "<td style='color:#8b949e;font-size:.72rem;white-space:nowrap;"
+                            "padding-right:.6rem;vertical-align:top'>SHA256</td>"
+                            "<td class='mono' style='font-size:.72rem;word-break:break-all;"
+                            "color:#adbac7'>"
+                            + _e(sa.sha256) + "</td></tr>"
+                        )
+                    hash_rows += "</table>"
+                parts.append(
+                    f"<div class='card' style='margin:.35rem 0;padding:.6rem 1rem'>"
+                    # 헤더 행: 프로세스명 + PID / 파일명 + 크기
+                    f"<div style='display:flex;justify-content:space-between;"
+                    f"align-items:baseline;flex-wrap:wrap;gap:.3rem'>"
+                    f"<span><b style='color:#ffa657'>{_e(sa.proc_name)}</b> "
+                    f"<span style='color:#8b949e;font-size:.8rem'>PID {sa.pid}</span></span>"
+                    f"<span class='mono' style='color:#484f58;font-size:.72rem'>"
+                    f"{_e(fname)}&nbsp;&nbsp;{size_str}</span>"
+                    f"</div>"
+                    # 전체 경로 (접힌 상태)
+                    f"<details style='margin-top:.25rem'>"
+                    f"<summary style='color:#484f58;font-size:.72rem;cursor:pointer'>"
+                    f"전체 경로</summary>"
+                    f"<p class='mono' style='font-size:.7rem;color:#8b949e;"
+                    f"margin:.15rem 0 0;word-break:break-all'>{_e(sa.dump_file)}</p>"
+                    f"</details>"
+                    # 해시
+                    + hash_rows +
+                    # 시그니처 배지
+                    f"<div style='margin-top:.4rem'>{yara_html} {capa_html}</div>"
+                    f"</div>"
+                )
+
+            # 오류 항목 (YARA/CAPA 실패한 덤프)
+            if err_items:
+                parts.append(
+                    f"<details style='margin-top:.5rem'>"
+                    f"<summary style='color:#484f58;font-size:.78rem;cursor:pointer'>"
+                    f"분석 오류 {len(err_items)}개</summary>"
+                )
+                for sa in err_items:
+                    fname = Path(sa.dump_file).name
+                    parts.append(
+                        f"<p style='color:#484f58;font-size:.77rem;margin:.2rem .5rem'>"
+                        f"PID {sa.pid} / {_e(fname)}: {_e(sa.error[:160])}</p>"
+                    )
+                parts.append("</details>")
 
     return "\n".join(parts)
 
@@ -1468,7 +1787,7 @@ def generate_html_report(result, output_path: str) -> None:
 <!-- ══════════ 탭 3: 프로세스 ══════════ -->
 <div id="tab-process" class="tab-panel">
 
-  <h2>⚙️ 신규 프로세스</h2>
+  <h2>⚙️ 프로세스 트리</h2>
   {_process_html(result)}
 
 </div>

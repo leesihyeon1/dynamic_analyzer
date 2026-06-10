@@ -56,6 +56,7 @@ class InjectedModule:
 class PeSieveResult:
     """단일 PID에 대한 pe-sieve 스캔 결과."""
     pid:            int
+    name:           str               = ""    # 프로세스 이름 (hollows-hunter summary 포함)
     is_64bit:       bool              = False
     total_scanned:  int               = 0
     suspicious:     int               = 0
@@ -109,8 +110,59 @@ def parse_pesieve(raw: dict, dump_dir: str = "") -> PeSieveResult:
         )
 
     scanned = raw.get("scanned", {}) or {}
+
+    # ── HH summary 형식 감지 ──────────────────────────────────────────
+    # hollows-hunter summary.json 은 anomaly 필드를 중첩 없이 최상위에 씁니다:
+    #   {"pid": 476, "name": "dwm.exe", "implanted_shc": 60, ...}
+    # pe-sieve JSON 은 "scanned" 딕셔너리 아래에 씁니다:
+    #   {"pid": 476, "scanned": {"implanted_shc": 60, ...}}
+    # scanned 딕셔너리가 없고 최상위에 anomaly 필드가 있으면 HH summary 형식으로 처리.
+    hh_summary_fmt = (not scanned) and ("implanted_shc" in raw or "implanted_pe" in raw
+                                        or "replaced" in raw or "patched" in raw)
+
+    def _top(key: str, *alt: str) -> int:
+        """최상위 필드에서 정수값을 읽습니다 (HH summary 전용)."""
+        for k in (key,) + alt:
+            v = raw.get(k, 0)
+            if isinstance(v, int):
+                return v
+        return 0
+
+    if hh_summary_fmt:
+        shc   = _top("implanted_shc")
+        pe_i  = _top("implanted_pe")
+        repl  = _top("replaced")
+        patch = _top("patched")
+        hdr   = _top("hdr_modified")
+        other = _top("other")
+        total_susp = shc + pe_i + repl + patch + hdr + other
+        result = PeSieveResult(
+            pid           = raw.get("pid", 0),
+            name          = raw.get("name", ""),
+            is_64bit      = bool(raw.get("is_64bit", 0)),
+            total_scanned = 1,           # HH summary 는 프로세스 단위, scanned=1
+            suspicious    = total_susp,
+            replaced      = repl,
+            implanted_pe  = pe_i,
+            implanted_shc = shc,
+            hooked        = patch + hdr,
+            dump_dir      = raw.get("dump_dir", dump_dir),
+        )
+        # 의심 항목이 있으면 모듈 항목 1개 생성 (프로세스 이름으로)
+        if total_susp > 0:
+            result.modules.append(InjectedModule(
+                module_path      = raw.get("name", f"pid_{raw.get('pid',0)}"),
+                suspicious_count = total_susp,
+                patches_count    = patch + hdr,
+                implanted_count  = shc + pe_i,
+                is_shellcode     = shc > 0 and pe_i == 0,
+                status           = 1,
+            ))
+        return result
+
     result = PeSieveResult(
         pid          = raw.get("pid", 0),
+        name         = raw.get("name", ""),
         is_64bit     = bool(raw.get("is_64bit", 0)),
         total_scanned = scanned.get("total", 0),
         suspicious   = scanned.get("suspicious", 0),
@@ -159,21 +211,68 @@ def parse_pesieve(raw: dict, dump_dir: str = "") -> PeSieveResult:
 # ---------------------------------------------------------------------------
 
 def parse_hollows_hunter(raw: dict) -> HollowsHunterResult:
-    """Convert a raw hollows-hunter JSON dict to a HollowsHunterResult."""
+    """Convert a raw hollows-hunter JSON dict to a HollowsHunterResult.
+
+    hollows-hunter 버전에 따라 JSON 키 이름이 다를 수 있으므로
+    여러 후보 키를 순서대로 시도합니다.
+    """
     if "error" in raw:
         return HollowsHunterResult(error=raw["error"], dump_dir=raw.get("dump_dir", ""))
 
     dump_dir = raw.get("dump_dir", "")
-    result   = HollowsHunterResult(
-        total_scanned    = raw.get("total_scanned", 0),
-        suspicious_count = raw.get("suspicious", 0),
+
+    def _get_int(*keys: str, default: int = 0) -> int:
+        """여러 키 이름을 시도해 정수값을 반환. int가 아니면(dict 등) 스킵."""
+        for k in keys:
+            v = raw.get(k)
+            if isinstance(v, int):
+                return v
+        return default
+
+    # ── 프로세스 목록 키 후보 ─────────────────────────────────────────
+    # HH summary.json: "suspicious" 키에 의심 프로세스 목록만 있음
+    # HH full output:  "processes" 키에 전체 스캔 결과
+    proc_list = (
+        raw.get("processes")
+        or raw.get("scanned_processes")
+        or raw.get("results")
+        or raw.get("suspicious")   # HH summary.json 형식
+        or []
+    )
+    if not isinstance(proc_list, list):
+        proc_list = []
+
+    # ── 스캔된 프로세스 수 ────────────────────────────────────────────
+    # HH summary.json: "scanned_count"
+    # HH full output:  "total_scanned" 또는 "scanned" (int)
+    scanned_raw = raw.get("scanned")
+    if isinstance(scanned_raw, int):
+        total_sc = scanned_raw
+    elif isinstance(scanned_raw, dict):
+        total_sc = scanned_raw.get("total", 0)
+    else:
+        total_sc = _get_int("scanned_count", "total_scanned", "scanned_total",
+                            "total", default=len(proc_list))
+
+    # ── 의심 프로세스 수 ──────────────────────────────────────────────
+    # HH summary.json: "suspicious_count"
+    # HH full output:  "suspicious" (int, dict가 아닌 경우)
+    suspicious_raw = raw.get("suspicious")
+    if isinstance(suspicious_raw, int):
+        susp_cnt = suspicious_raw
+    else:
+        susp_cnt = _get_int("suspicious_count", "total_suspicious",
+                            "suspicious_total", default=len(proc_list))
+
+    result = HollowsHunterResult(
+        total_scanned    = total_sc,
+        suspicious_count = susp_cnt,
         dump_dir         = dump_dir,
     )
 
-    for proc in raw.get("processes") or []:
+    for proc in proc_list:
         if not isinstance(proc, dict):
             continue
-        pid      = proc.get("pid", 0)
         proc_raw = dict(proc)
         proc_raw["dump_dir"] = dump_dir
         result.process_results.append(parse_pesieve(proc_raw, dump_dir))

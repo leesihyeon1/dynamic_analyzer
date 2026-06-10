@@ -164,8 +164,7 @@ class ProcessWatcher:
             raw = self._scanner.scan_pid(
                 pid,
                 dump_mode=self._dmode,
-                shellcode=True,
-                hooks=True,
+                shellcode=1,   # 패턴 기반 쉘코드 탐지
             )
             self._callback(pid, raw)
         except Exception:

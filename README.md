@@ -1,7 +1,7 @@
 # dynamic_analyzer
 
 Windows 악성코드 동적 분석 자동화 도구.  
-ProcMon · tshark · pe-sieve · psutil 을 조합해 **Noriben.py** 스타일로 동작하며,  
+ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA 를 조합해 **Noriben.py** 스타일로 동작하며,  
 실행 한 줄로 샘플 모니터링 → MITRE ATT&CK 매핑 → HTML/JSON 리포트까지 자동 생성합니다.
 
 ---
@@ -19,9 +19,13 @@ ProcMon · tshark · pe-sieve · psutil 을 조합해 **Noriben.py** 스타일�
 | **프로세스 추적** | psutil로 자식 PID 추적, 신규/종료 프로세스 감지 |
 | **실시간 프로세스 감시** | 1초 폴링으로 신규 PID 즉시 pe-sieve 스캔 (타이밍 문제 해소) |
 | **pe-sieve / hollows-hunter** | 프로세스 인젝션·PE 할로잉·쉘코드 삽입 탐지, raw dump 자동 추출 |
+| **쉘코드 덤프 재분석** | pe-sieve/HH가 덤프한 `.shc`·`.bin` 파일에 YARA + CAPA `--shellcode` 적용, 오탐 필터링 포함 |
+| **CAPA 정적 분석** | 샘플 바이너리에 CAPA 적용 → ATT&CK 기법 자동 추출 |
+| **VirusTotal 연동** | SHA256 기반 샌드박스 ATT&CK 기법 조회 (API 키 선택 설정) |
 | **프로세스↔네트워크 매핑** | ProcMon TCP/UDP 이벤트 기반, 프로세스별 외부 연결 집계 |
 | **노이즈 필터** | 시스템 프로세스 + 분석 도구(ProcMon·tshark·SystemInformer 등) 이벤트 자동 제거 |
-| **MITRE ATT&CK** | 행동 패턴 → 기법 자동 매핑 (T1059, T1547, T1486 등) |
+| **인젝션 이벤트 표시** | HH/pe-sieve 탐지 인젝션 대상 PID의 파일·레지스트리 이벤트 자동 포함 |
+| **MITRE ATT&CK** | 행동 패턴 + CAPA + VirusTotal → 기법 자동 매핑 (T1059, T1547, T1486 등) |
 | **IOC 추출** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL (SMTP/FTP C2 IP 포함) |
 | **리포트 생성** | 다크 테마 HTML(검색바 + 페이지네이션) + 구조화된 JSON, 분석 완료 후 자동 열기 |
 | **Hunt 탭** | abuse.ch 실시간 IOC 조회 — MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker를 HTML 내에서 직접 검색 |
@@ -45,9 +49,10 @@ pip install -r requirements.txt
 psutil>=5.9.0
 scapy>=2.5.0   # 없으면 tshark fallback 파서로 자동 대체
 rich>=13.7.0
+yara-python    # 선택 — 쉘코드 YARA 스캔 (pip install yara-python)
 ```
 
-### 선택 (자동 감지)
+### 선택 도구 (자동 감지)
 | 도구 | 기본 경로 | 없으면 |
 |------|-----------|--------|
 | **ProcMon** (`Procmon64.exe`) | `C:\Tools\SysinternalsSuite\` 또는 PATH | ProcMon 기능 스킵 |
@@ -55,6 +60,7 @@ rich>=13.7.0
 | **Process Hacker** / **System Informer** | `C:\Tools\processhacker\` | psutil로 대체 |
 | **pe-sieve** (`pe-sieve64.exe`) | `C:\Tools\pe-sieve\` 또는 PATH | 인젝션/쉘코드 탐지 스킵 |
 | **hollows_hunter** (`hollows_hunter64.exe`) | `C:\Tools\hollows_hunter\` 또는 PATH | 전체 시스템 스캔 스킵 |
+| **CAPA** (`capa.exe`) | `C:\Tools\capa\` 또는 PATH | 정적 ATT&CK 분석 스킵 |
 
 ---
 
@@ -116,6 +122,23 @@ python analyzer.py --check-tools
 python analyzer.py --list-interfaces
 ```
 
+### config.json 설정
+
+```json
+{
+  "capa": {
+    "enabled": true,
+    "path": "capa.exe",
+    "timeout": 120
+  },
+  "virustotal": {
+    "enabled": false,
+    "api_key": "YOUR_VT_API_KEY",
+    "timeout": 20
+  }
+}
+```
+
 ---
 
 ## 분석 흐름
@@ -147,10 +170,15 @@ python analyzer.py malware.exe
         │
         ▼
 [6/6] 분석              사후 스냅샷 → 레지스트리·프로세스 diff
+                        조기 종료 프로세스 pe-sieve 결과로 보완
                         ProcMon CSV 파싱 + 노이즈 필터
+                        인젝션 대상 PID 이벤트 자동 포함
                         PCAP 파싱 (연결, DNS, TLS SNI, HTTP, SMTP, FTP)
                         프로세스↔네트워크 연결 매핑
                         MITRE ATT&CK 매핑
+                        CAPA 정적 분석 → ATT&CK 기법 병합
+                        쉘코드 덤프 재분석 (YARA + CAPA --shellcode)
+                        VirusTotal 조회 → ATT&CK 기법 병합 (선택)
                         IOC 추출 (SMTP/FTP C2 IP 포함)
         │
         ▼
@@ -161,6 +189,9 @@ python analyzer.py malware.exe
                           ├── procmon.csv
                           ├── capture.pcap
                           └── pe_dumps/                    ← pe-sieve raw dump
+                              └── process_<pid>/
+                                  ├── *.exe / *.dll        ← PE 덤프
+                                  └── *.shc / *.bin        ← 쉘코드 덤프
 ```
 
 ---
@@ -186,26 +217,28 @@ python analyzer.py malware.exe
         샘플 종료 감지 (15s)
   [5/6] 모니터링 종료...
         ProcMon 로그 변환 중...
+        hollows-hunter 스캔: 의심 프로세스 3개
         Process Hacker 종료됨
   [6/6] 사후 스냅샷 수집 중...
+        [보완] 조기 종료 프로세스 1개 추가 (malware.exe)
   [분석] ProcMon CSV 파싱...
-        이벤트 18,432개 → 필터 후 247개
-  [분석] PCAP 파싱...
-        연결 3개  DNS 5건
-  [분석] 프로세스↔네트워크 연결 매핑...
-        12개 연결 집계
+        이벤트 18,432개 → 필터 후 512개
+  [분석] CAPA 정적 분석 중...
+        CAPA 완료: 기법 7개 탐지 (누적 7개)
+  [분석] 쉘코드 덤프 재분석 중 (YARA + CAPA --shellcode)...
+        쉘코드 파일 3개 분석  시그니처 히트 2개 🚨
 
-  MITRE 기법       3건
+  MITRE 기법       9건
   외부 IP          2개
   드롭 파일        1개
   레지스트리 추가  4건
   신규 프로세스    2개
-  ProcMon 이벤트   18,432개 → 필터 후 247개
+  ProcMon 이벤트   18,432개 → 필터 후 512개
 
 탐지된 MITRE ATT&CK 기법:
+  ✔ T1055.001  Process Injection: DLL Injection  Defense Evasion
   ✔ T1059.003  Windows Command Shell  Execution
   ✔ T1547.001  Registry Run Keys / Startup Folder  Persistence
-  ✔ T1071.001  Application Layer Protocol: Web Protocols  Command and Control
 
   [*] 결과 저장 중...
   JSON → results\malware_20260526_120000\malware_dynamic_report.json
@@ -219,8 +252,9 @@ python analyzer.py malware.exe
 
 ```
 dynamic_analyzer/
-├── analyzer.py               # CLI 진입점 (--no-open 옵션 포함)
+├── analyzer.py               # CLI 진입점
 ├── requirements.txt
+├── config.json               # CAPA·VT 설정
 ├── README.md
 │
 ├── core/
@@ -230,21 +264,34 @@ dynamic_analyzer/
 │   ├── registry_snapshot.py  # winreg 스냅샷 + diff
 │   ├── process_tracker.py    # psutil 프로세스 추적 + 분석 도구 필터
 │   ├── process_watcher.py    # 실시간 신규 PID 감지 + 즉시 pe-sieve 스캔
-│   └── vm_setup.py           # 스냅샷 복원 후 캡처 최적화 레지스트리 정책 자동 적용 (신규)
+│   ├── pesieve_scanner.py    # pe-sieve 실행 래퍼
+│   ├── hollows_hunter.py     # hollows-hunter 실행 래퍼
+│   ├── config_loader.py      # config.json 로더
+│   └── vm_setup.py           # 캡처 최적화 레지스트리 정책 자동 적용
 │
 ├── parsers/
 │   ├── procmon_csv.py        # ProcMon CSV → ProcMonEvent 파싱
-│   └── pcap_parser.py        # PCAP → 연결/DNS/TLS SNI/HTTP/SMTP/FTP
+│   ├── pcap_parser.py        # PCAP → 연결/DNS/TLS SNI/HTTP/SMTP/FTP
+│   └── pesieve_result.py     # pe-sieve / hollows-hunter JSON 파싱
 │
 ├── analysis/
 │   ├── noise_filter.py       # 시스템·분석 도구 노이즈 제거
 │   ├── behavior_classifier.py # MITRE ATT&CK 매핑
 │   ├── ioc_extractor.py      # IOC 추출 (SMTP/FTP C2 IP 포함)
-│   └── process_network_map.py # 프로세스↔네트워크 연결 매핑
+│   ├── process_network_map.py # 프로세스↔네트워크 연결 매핑
+│   ├── injection_classifier.py # 인젝션 유형 분류
+│   ├── shellcode_analyzer.py # 쉘코드 덤프 재분석 (YARA + CAPA --shellcode)
+│   ├── capa_analyzer.py      # CAPA 정적 분석 래퍼
+│   ├── vt_analyzer.py        # VirusTotal API 연동
+│   ├── yara_scanner.py       # YARA 룰 스캔
+│   └── attack_lookup.py      # ATT&CK T-ID → 이름·전술 조회 테이블
 │
-└── exporters/
-    ├── html_report.py        # 다크 테마 HTML 리포트 (검색바 + 페이지네이션)
-    └── json_report.py        # 구조화 JSON 저장
+├── exporters/
+│   ├── html_report.py        # 다크 테마 HTML 리포트 (검색바 + 페이지네이션)
+│   └── json_report.py        # 구조화 JSON 저장
+│
+└── rules/
+    └── yaraify/              # YARA 룰 디렉터리 (YARAify 형식)
 ```
 
 ---
@@ -253,6 +300,9 @@ dynamic_analyzer/
 
 | ID | 기법 | 전술 |
 |----|------|------|
+| T1055.001 | Process Injection: DLL Injection | Defense Evasion |
+| T1055.002 | Process Injection: PE Injection | Defense Evasion |
+| T1055.012 | Process Hollowing | Defense Evasion |
 | T1059.001 | PowerShell | Execution |
 | T1059.003 | Windows Command Shell | Execution |
 | T1059.005 | Visual Basic | Execution |
@@ -275,9 +325,46 @@ dynamic_analyzer/
 | T1041 | Exfiltration Over C2 Channel | Exfiltration |
 | T1114 | Email Collection (SMTP 탈취) | Collection |
 
+> CAPA 및 VirusTotal 연동 시 추가 기법이 자동으로 병합됩니다.
+
 ---
 
 ## 변경 이력
+
+### v1.6 — 쉘코드 재분석 · CAPA/VT 통합 · 이벤트 필터 개선
+
+- **쉘코드 덤프 재분석** (`analysis/shellcode_analyzer.py` 신규)
+  - pe-sieve / hollows-hunter 가 `process_<pid>/` 에 덤프한 `.shc`·`.bin` 파일을 자동 재분석
+  - YARA 룰 스캔 (`rules/yaraify/`) + CAPA `--shellcode` 플래그로 ATT&CK 기법 추출
+  - 오탐 필터링 2단계:
+    - **화이트리스트**: dwm, explorer, chrome, svchost 등 시스템/브라우저 프로세스 제외
+    - **의심도 점수**: PE인젝션(+40), 프로세스할로잉(+40), 훅(+20), 쉘코드단독(+10) — 임계값 30 미만 제외
+  - 신규 생성 PID는 점수 무관 포함 (드로퍼 즉시 종료 대응)
+  - 발견된 ATT&CK 기법은 `behavior_report` 에 자동 병합
+
+- **CAPA 정적 분석 통합** (`analysis/capa_analyzer.py` 신규)
+  - 샘플 바이너리에 CAPA 적용, 결과 ATT&CK 기법을 메모리·ATT&CK 탭에 통합 표시
+  - `config.json` > `capa.enabled / path / timeout` 으로 제어
+
+- **VirusTotal ATT&CK 조회** (`analysis/vt_analyzer.py` 신규)
+  - SHA256 기반 `/files/{hash}/behaviours` + `behaviour_summary` 엔드포인트 조회
+  - `config.json` > `virustotal.enabled / api_key / timeout` 으로 제어 (기본 비활성)
+
+- **🧠 메모리 탭 개편** (`exporters/html_report.py`)
+  - 쉘코드 덤프 재분석 결과 섹션 추가 (YARA 룰명 · CAPA ATT&CK 배지)
+  - 덤프 파일별 **MD5·SHA256** 해시 표시
+  - 전체 경로 접힘(`<details>`) + 파일명·크기 헤더
+
+- **이벤트 필터 개선** (`core/orchestrator.py`)
+  - HH/pe-sieve가 탐지한 인젝션 대상 프로세스 PID를 `focus_pids` 에 자동 포함  
+    → 드로퍼가 dwm.exe·PanGPA.exe 등 기존 프로세스에 주입한 경우에도 파일·레지스트리 이벤트 표시
+  - 조기 종료된 샘플(드로퍼·로더)을 pe-sieve 스캔 결과로 프로세스 탭에 보완  
+    → proc_after 스냅샷 이전에 종료된 프로세스도 프로세스 탭에 표시
+
+- **pe-sieve / hollows-hunter 파싱 개선** (`parsers/pesieve_result.py`, `core/hollows_hunter.py`, `core/pesieve_scanner.py`)
+  - HH summary.json 형식 양방향 파싱 (full output / summary 자동 감지)
+  - 다중 JSON 키 후보 처리 (버전별 차이 흡수)
+  - 덤프 디렉터리 경로 자동 해석
 
 ### v1.5 — Hunt 탭 · 탭 분리 · VM 자동 세팅
 
@@ -312,59 +399,32 @@ dynamic_analyzer/
     | LLMNR 비활성화 | `.in-addr.arpa` PTR 노이즈 제거 |
     | NetBIOS-NS 비활성화 | UDP 137 브로드캐스트 노이즈 제거 |
   - 이미 적용된 경우 멱등(덮어쓰기) — 중복 실행 안전
-  - 권한 부족 시 경고 표시 후 분석 계속 진행
-  - 비-Windows 환경에서는 조용히 스킵
 
 ### v1.4 — pe-sieve 통합 · SMTP/FTP C2 분석 · HTML 검색바
 
 - **pe-sieve / hollows-hunter 통합**
-  - 모니터링 중 `ProcessWatcher` (`core/process_watcher.py` 신규): 1초 폴링으로 신규 PID를 즉시 pe-sieve 스캔  
-    → 로더 프로세스처럼 수초 내 사라지는 단명 프로세스도 탐지 가능
+  - 모니터링 중 `ProcessWatcher`: 1초 폴링으로 신규 PID를 즉시 pe-sieve 스캔
   - hollows_hunter 전체 시스템 스캔 (`/dmode 3`) + pe-sieve 신규 프로세스 개별 스캔 병행
-  - 분석 종료 후 살아있는 신규 PID 재스캔 (`proc_after pass`)
-  - HTML 리포트 **인젝션·쉘코드** 탭: PE 할로잉(`implanted_pe`) + 쉘코드(`implanted_shc`) + 훅 모두 포함한 올바른 의심 프로세스 수 집계 (이전에 `implanted_shc`만 계산하던 버그 수정)
-  - PE 인젝션 건수(`PE인젝션 N개`) 별도 표기
 
 - **SMTP/FTP C2 통신 분석** (`parsers/pcap_parser.py`)
   - AgentTesla, FormBook 등 정보탈취 악성코드의 SMTP(25/465/587/2525) · FTP(21/2121) 세션 자동 파싱
-  - SMTP: EHLO 도메인, MAIL FROM, RCPT TO, AUTH LOGIN base64 사용자명 추출
-  - FTP: USER/PASS 인증 + STOR(업로드) / RETR(다운로드) 파일 목록 추출
-  - HTML 리포트 네트워크 탭에 **SMTP C2 세션**, **FTP C2 세션** 전용 테이블 추가
-  - `ioc_extractor.py`: SMTP/FTP C2 서버 IP 자동 IOC 등록
 
-- **분석 완료 후 HTML 자동 열기** (`analyzer.py`)
-  - 분석 종료 시 `os.startfile()`로 기본 브라우저에서 리포트 자동 오픈
-  - `--no-open` 플래그로 비활성화 가능
-
-- **HTML 리포트 전 탭 검색바 + 페이지네이션 개선** (`exporters/html_report.py`)
-  - 모든 테이블 위에 검색바(`.srch-input`) 자동 삽입 — 입력 즉시 행 실시간 필터링
-  - 페이지네이션은 검색 결과 기준으로 동작 (검색 없을 때: `X–Y / Z행`, 있을 때: `N건 일치 (전체 M행)`)
-  - 신규 테이블 ID 추가: `tbl-mitre`, `tbl-process`, `tbl-net-dga`, `tbl-net-smtp`, `tbl-net-ftp`
-  - `setupPagination` → `setupTableControls`로 통합 (하위 호환 포함)
+- **HTML 리포트 전 탭 검색바 + 페이지네이션 개선**
 
 ### v1.3 — 프로세스↔네트워크 매핑 · 노이즈 필터 강화
 
-- **프로세스↔네트워크 연결 매핑** (`analysis/process_network_map.py` 신규)
-  - ProcMon TCP/UDP 이벤트 기반으로 프로세스별 외부 연결 자동 집계
-  - HTML 리포트에 전용 섹션 추가, JSON 리포트에도 포함
-- **분석 도구 노이즈 필터 강화**
-  - `noise_filter.py`: ProcMon, tshark, SystemInformer, Process Hacker, ZoomIt 등 분석 도구 프로세스 이벤트 전체 제거
-  - `process_tracker.py`: 신규 프로세스 목록에서 분석 도구 자동 제외
-  - `ioc_extractor.py`: dropped_files IOC에서 분석 도구 경로 패턴 제외, `WriteFile`만 실제 드롭으로 판정 (`CreateFile` 제외)
-- **분석 종료 후 자동 정리**: Process Hacker / System Informer 프로세스 자동 종료
+- `analysis/process_network_map.py` 신규: ProcMon TCP/UDP 기반 프로세스별 연결 집계
+- 노이즈 필터 강화: ProcMon, tshark, SystemInformer, Process Hacker 이벤트 전체 제거
 
 ### v1.2 — PCAP 분석 강화 · HTML 페이지네이션
 
-- **scapy 없이 PCAP 분석**: scapy 미설치 시 tshark fallback 파서 자동 전환
-- **외부 PCAP 파일 지원**: `--pcap <FILE>` 옵션으로 Wireshark 캡처 파일 직접 분석
-- **HTML 페이지네이션**: 모든 결과 테이블에 1·2·3… 페이지 네비게이션 추가 (100행/페이지)
-- **TLS SNI 분석**: HTTPS 트래픽의 도메인 식별 지원
+- scapy 없이 PCAP 분석 (tshark fallback)
+- 외부 PCAP 파일 지원 (`--pcap`)
+- HTML 페이지네이션, TLS SNI 분석
 
 ### v1.1 — 초기 기능 개선
 
-- PCAP 분석 (연결, DNS, HTTP)
-- 비콘 탐지 (규칙적 C2 통신 감지)
-- DGA / 고엔트로피 도메인 탐지
+- PCAP 분석, 비콘 탐지, DGA / 고엔트로피 도메인 탐지
 
 ---
 
@@ -383,3 +443,6 @@ dynamic_analyzer/
 - [FLARE VM](https://github.com/mandiant/flare-vm) — Windows 악성코드 분석 환경
 - [Sysinternals ProcMon](https://learn.microsoft.com/en-us/sysinternals/downloads/procmon)
 - [MITRE ATT&CK](https://attack.mitre.org/)
+- [CAPA](https://github.com/mandiant/capa) — 실행 파일 기능 탐지
+- [pe-sieve](https://github.com/hasherezade/pe-sieve) — 프로세스 인젝션 탐지
+- [hollows-hunter](https://github.com/hasherezade/hollows_hunter) — 전체 시스템 인젝션 스캔

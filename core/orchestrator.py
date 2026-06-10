@@ -248,6 +248,8 @@ class AnalysisResult:
     process_network_map: list = field(default_factory=list)  # list[ProcNetConnection]
     pe_sieve_results:   list  = field(default_factory=list)    # list[PeSieveResult] — 신규 프로세스별 스캔
     hh_result:          object = None                          # HollowsHunterResult — 전체 시스템 스캔
+    proc_after_snapshot: dict = field(default_factory=dict)   # dict[int, ProcessSnapshot] — 사후 스냅샷 (트리 빌드용)
+    shellcode_analyses: list  = field(default_factory=list)  # list[ShellcodeAnalysis] — 쉘코드 덤프 재분석 결과
 
 
 def run_analysis(
@@ -284,8 +286,12 @@ def run_analysis(
     from core.pesieve_scanner         import PeSieveScanner
     from core.hollows_hunter          import HollowsHunter
     from parsers.pesieve_result       import parse_pesieve, parse_hollows_hunter
+    from core.config_loader           import load_config as _load_cfg_early
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
+    _early_cfg  = _load_cfg_early()
+    _tools_cfg  = _early_cfg.get("tools", {})
+
     pm = ProcMonController(
         config.output_dir,
         procmon_path=config.procmon_path or find_procmon(),
@@ -296,8 +302,14 @@ def run_analysis(
         interface=config.interface,
     )
     ph_path    = config.ph_path or find_process_hacker()
-    ps_scanner = PeSieveScanner(config.output_dir / "dumps")
-    hh_scanner = HollowsHunter(config.output_dir / "dumps")
+    ps_scanner = PeSieveScanner(
+        config.output_dir / "dumps",
+        config_path=_tools_cfg.get("pe_sieve") or None,
+    )
+    hh_scanner = HollowsHunter(
+        config.output_dir / "dumps",
+        config_path=_tools_cfg.get("hollows_hunter") or None,
+    )
 
     result.tools_used = {
         "procmon":          pm.available and not config.no_procmon,
@@ -448,13 +460,10 @@ def run_analysis(
     # pe-sieve / hollows-hunter 스캔 (프로세스 종료 전 — 가능한 많은 PID가 살아있을 때)
     if hh_scanner.available:
         status("[분석] hollows-hunter 전체 프로세스 스캔...")
-        raw = hh_scanner.scan_all(dump_mode=3, shellcode=True, hooks=True)
+        raw = hh_scanner.scan_all(dump_mode=3, shellcode=1, hooks=True)
         result.hh_result = parse_hollows_hunter(raw)
         if result.hh_result.error:
-            # 파싱 실패는 콘솔에만 표시 — 의심 프로세스 없을 때 HH 가
-            # JSON 대신 텍스트를 출력하는 정상 케이스이므로 result.errors 에 추가하지 않음
             status(f"      [hollows-hunter] {result.hh_result.error}")
-            # hollows-hunter가 실제로 출력한 텍스트 — 원인 진단용
             hh_out = (raw.get("stdout") or "").strip()
             hh_err = (raw.get("stderr") or "").strip()
             if hh_out:
@@ -462,6 +471,10 @@ def run_analysis(
             elif hh_err:
                 status(f"        [hh stderr] {hh_err[:200]}")
         else:
+            # total_scanned=0 은 JSON 키 불일치 가능성 — 실제 키 목록을 진단용으로 출력
+            if result.hh_result.total_scanned == 0 and not result.hh_result.error:
+                hh_keys = [k for k in raw if not k.startswith("_") and k != "dump_dir"]
+                status(f"      [hollows-hunter 진단] JSON 최상위 키: {hh_keys}")
             susp_cnt = len(result.hh_result.suspicious_processes)
             shc_cnt  = sum(r.implanted_shc for r in result.hh_result.process_results)
             status(f"      의심 프로세스: {susp_cnt}개  쉘코드 영역: {shc_cnt}개"
@@ -475,7 +488,7 @@ def run_analysis(
             status(f"      [알림] 이미 종료된 PID (스캔 생략): {dead_pids}")
         status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(alive_pids)}개 PID)...")
         for pid in alive_pids:
-            raw = ps_scanner.scan_pid(pid, dump_mode=3, shellcode=True, hooks=True)
+            raw = ps_scanner.scan_pid(pid, dump_mode=3, shellcode=1)
             pr  = parse_pesieve(raw)
             result.pe_sieve_results.append(pr)
             if pr.error:
@@ -544,8 +557,9 @@ def run_analysis(
     reg_after  = take_snapshot() if REG_AVAILABLE else {}
     proc_after = take_process_snapshot()
 
-    result.registry_diff = diff_snapshots(reg_before, reg_after) if REG_AVAILABLE else {}
-    result.process_diff  = diff_process_snapshots(proc_before, proc_after)
+    result.registry_diff     = diff_snapshots(reg_before, reg_after) if REG_AVAILABLE else {}
+    result.process_diff      = diff_process_snapshots(proc_before, proc_after)
+    result.proc_after_snapshot = proc_after   # 프로세스 트리 시각화용
 
     # ── proc_after 기반 추가 스캔 ─────────────────────────────────────
     # 샘플 종료 후에도 살아있는 신규 프로세스 = 인젝션된 호스트 프로세스(RegSvcs.exe 등)
@@ -560,7 +574,7 @@ def run_analysis(
         if after_new:
             status(f"[분석] pe-sieve 잔존 신규 프로세스 스캔 ({len(after_new)}개 PID)...")
             for pid in after_new:
-                raw  = ps_scanner.scan_pid(pid, dump_mode=3, shellcode=True, hooks=True)
+                raw  = ps_scanner.scan_pid(pid, dump_mode=3, shellcode=1)
                 pr   = parse_pesieve(raw)
                 result.pe_sieve_results.append(pr)
                 if pr.error:
@@ -576,6 +590,39 @@ def run_analysis(
                 else:
                     status(f"      PID {pid}: 이상 없음 ✅")
 
+    # ── 조기 종료 프로세스 보완 ───────────────────────────────────────
+    # 드로퍼·로더처럼 쉘코드 주입 후 자가종료하는 샘플은 proc_after 에 없어
+    # new_processes 목록이 비고 프로세스 탭이 빈 화면이 됩니다.
+    # pe-sieve 가 스캔한 PID 중 proc_after 에 없는 신규 PID 를 보완합니다.
+    try:
+        from core.process_tracker import ProcessSnapshot as _PS
+        _after_pids         = set(proc_after.keys())
+        _before_pids        = set(proc_before.keys())
+        _existing_new_pids  = {p.pid for p in result.process_diff.get("new_processes", [])}
+        _supplemental: list = []
+        for _psr in result.pe_sieve_results:
+            if (not _psr.error
+                    and _psr.pid not in _after_pids      # 종료됨
+                    and _psr.pid not in _before_pids     # 분석 전부터 있던 프로세스 제외
+                    and _psr.pid not in _existing_new_pids):
+                _supplemental.append(_PS(
+                    pid         = _psr.pid,
+                    ppid        = 0,   # 부모 정보 없음 → ppid=0 = 루트로 표시
+                    name        = _psr.name or f"pid_{_psr.pid}",
+                    exe         = "",
+                    cmdline     = [],
+                    create_time = 0.0,
+                ))
+        if _supplemental:
+            result.process_diff.setdefault("new_processes", []).extend(_supplemental)
+            status(
+                "      [보완] 조기 종료 프로세스 "
+                + str(len(_supplemental)) + "개 추가 ("
+                + ", ".join(p.name for p in _supplemental) + ")"
+            )
+    except Exception as _supp_err:
+        status(f"      [경고] 프로세스 보완 실패: {_supp_err}")
+
     # ── 7. 파싱 ─────────────────────────────────────────────────────
     status("[분석] ProcMon CSV 파싱...")
     if pm.csv_path.exists():
@@ -584,6 +631,16 @@ def run_analysis(
         if result.sample_pid:
             child_pids = pm_child_pids(result.procmon_events, result.sample_pid)
             result.all_pids.update(child_pids)
+        # HH / pe-sieve 가 탐지한 인젝션 대상 프로세스 PID 도 포커스에 포함
+        # (악성코드가 기존 프로세스에 쉘코드를 주입하면 그 PID 의 파일·레지스트리
+        #  이벤트가 focus_pids 에서 제외되어 탭에 아무것도 안 보이는 문제 방지)
+        if result.hh_result and not result.hh_result.error:
+            for _hpr in result.hh_result.suspicious_processes:
+                if _hpr.implanted_shc > 0 or _hpr.implanted_pe > 0:
+                    result.all_pids.add(_hpr.pid)
+        for _psr in result.pe_sieve_results:
+            if not _psr.error and (_psr.implanted_shc > 0 or _psr.implanted_pe > 0):
+                result.all_pids.add(_psr.pid)
         # 포커스 PID 기반 필터
         result.filtered_events = filter_events(
             result.procmon_events,
@@ -713,6 +770,47 @@ def run_analysis(
             status("      CAPA 건너뜀 (Ctrl+C)")
         except Exception as _e:
             status(f"      CAPA 오류: {_e}")
+
+    # ── 쉘코드 덤프 재분석 (pe-sieve / HH 덤프 → YARA + CAPA --shellcode) ──
+    if result.pe_sieve_results or result.hh_result:
+        try:
+            from analysis.shellcode_analyzer import analyze_shellcode_dumps
+            _sc_capa_cfg = _cfg.get("capa", {})
+            _sc_capa_exe = (
+                _sc_capa_cfg.get("path") or None
+                if _sc_capa_cfg.get("enabled", True) else None
+            )
+            # 분석 중 신규 생성된 PID + ProcMon 추적 PID
+            _new_pids = (
+                {p.pid for p in result.process_diff.get("new_processes", [])}
+                | result.all_pids
+            )
+            status("[분석] 쉘코드 덤프 재분석 중 (YARA + CAPA --shellcode)...")
+            result.shellcode_analyses = analyze_shellcode_dumps(
+                result.pe_sieve_results,
+                result.hh_result,
+                new_pids = _new_pids,
+                capa_exe = _sc_capa_exe,
+                timeout  = 60,
+            )
+            _sc_total = len(result.shellcode_analyses)
+            _sc_hits  = sum(1 for s in result.shellcode_analyses if s.has_findings)
+            if _sc_total == 0:
+                status("      쉘코드 재분석: 필터 통과 파일 없음 (화이트리스트 / 오탐 기준 제외)")
+            else:
+                status(
+                    f"      쉘코드 파일 {_sc_total}개 분석  시그니처 히트 {_sc_hits}개"
+                    + (" 🚨" if _sc_hits else " ✅")
+                )
+            # 발견된 ATT&CK 기법을 behavior_report 에 병합
+            if result.behavior_report:
+                for _sa in result.shellcode_analyses:
+                    if _sa.capa_techs:
+                        _merge_external_techniques(result.behavior_report, _sa.capa_techs)
+        except KeyboardInterrupt:
+            status("      쉘코드 재분석 건너뜀 (Ctrl+C)")
+        except Exception as _sc_err:
+            status(f"      쉘코드 재분석 오류: {_sc_err}")
 
     # ── VirusTotal API 쿼리 (선택적) ─────────────────────────────────
     _vt_cfg = _cfg.get("virustotal", {})

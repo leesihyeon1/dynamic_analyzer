@@ -40,8 +40,19 @@ _HH_NAMES: list[str] = [
 ]
 
 
-def find_hollows_hunter() -> Path | None:
-    """Locate the hollows-hunter executable."""
+def find_hollows_hunter(config_path: str | None = None) -> Path | None:
+    """Locate the hollows-hunter executable.
+
+    Search order:
+    1. config_path (config.json 의 tools.hollows_hunter).
+    2. Each name on the system PATH.
+    3. Known tool directories.
+    """
+    if config_path:
+        p = Path(config_path)
+        if p.is_file():
+            return p
+
     for name in _HH_NAMES:
         found = shutil.which(name)
         if found:
@@ -71,9 +82,11 @@ class HollowsHunter:
         self,
         output_dir: Path,
         hh_path: Path | None = None,
+        *,
+        config_path: str | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
-        self.hh_path    = hh_path or find_hollows_hunter()
+        self.hh_path    = hh_path or find_hollows_hunter(config_path)
         self.available  = self.hh_path is not None and self.hh_path.is_file()
 
     # ------------------------------------------------------------------
@@ -82,8 +95,8 @@ class HollowsHunter:
         self,
         *,
         dump_mode: int = 1,
-        shellcode: bool = True,
-        hooks: bool = True,
+        shellcode: int = 1,   # 0=비활성, 1=패턴, 2=통계, 3=패턴+통계
+        hooks: bool = True,   # hollows-hunter /hooks 는 값 없는 토글 플래그
         pname_filter: str | None = None,
     ) -> dict:
         """Scan all running processes with hollows-hunter.
@@ -94,9 +107,11 @@ class HollowsHunter:
             /dmode flag passed through to pe-sieve.
             1 = PE dump (default), 3 = shellcode + PE.
         shellcode:
-            Enable shellcode detection.
+            Shellcode detection mode (/shellc <mode>).
+            0=disabled, 1=patterns, 2=stats, 3=patterns+stats.
         hooks:
-            Enable hook detection.
+            Enable inline hook / in-memory patch detection (/hooks toggle).
+            hollows-hunter treats this as a boolean switch (no mode value).
         pname_filter:
             If set, only scan processes whose name contains this string
             (hollows-hunter /pname flag). Useful to focus on a known target.
@@ -120,11 +135,12 @@ class HollowsHunter:
             str(self.hh_path),
             "/dir",   str(self.output_dir),
             "/dmode", str(dump_mode),
-            "/json",  # stdout으로 JSON 출력
+            "/json",
         ]
-        # /shellc, /hooks 는 단독 플래그 (값 없음)
+        # /shellc 는 모드 값 필수:  1=패턴, 2=통계, 3=패턴+통계
+        # /hooks  는 값 없는 토글 플래그 (bool)
         if shellcode:
-            cmd.append("/shellc")
+            cmd += ["/shellc", str(int(shellcode))]
         if hooks:
             cmd.append("/hooks")
         if pname_filter:
@@ -142,19 +158,44 @@ class HollowsHunter:
         except Exception as exc:
             return {"error": f"hollows-hunter 실행 오류: {exc}"}
 
-        # 1순위: stdout JSON
+        # 실패 원인을 단계별로 누적합니다
+        _diag: list[str] = []
+
+        if result.returncode >= 2:
+            _diag.append(f"hollows-hunter 종료코드 {result.returncode}")
+
+        # 1순위: stdout JSON ───────────────────────────────────────────
         stdout = result.stdout.strip()
-        if stdout:
-            brace = stdout.rfind("{")
-            if brace != -1:
+        stderr = result.stderr.strip()
+
+        if not stdout:
+            _diag.append("stdout 없음" + (f" (stderr: {stderr[:120]})" if stderr else ""))
+        else:
+            brace = stdout.find("{")
+            if brace == -1:
+                # 3순위: 평문 출력 ("Total scanned: N, Suspicious: N")
+                import re as _re
+                ts = _re.search(r"Total scanned[:\s]+(\d+)", stdout, _re.IGNORECASE)
+                ss = _re.search(r"Suspicious[:\s]+(\d+)",    stdout, _re.IGNORECASE)
+                if ts:
+                    return {
+                        "total_scanned": int(ts.group(1)),
+                        "suspicious":    int(ss.group(1)) if ss else 0,
+                        "processes":     [],
+                        "dump_dir":      str(self.output_dir),
+                    }
+                preview = stdout[:120].replace("\n", " ")
+                _diag.append(f"stdout에 JSON 없음 — 출력: {preview!r}")
+            else:
                 try:
                     data = json.loads(stdout[brace:])
                     data["dump_dir"] = str(self.output_dir)
                     return data
-                except Exception:
-                    pass
+                except Exception as e:
+                    preview = stdout[brace:brace + 80].replace("\n", " ")
+                    _diag.append(f"stdout JSON 파싱 오류: {e} — 내용: {preview!r}")
 
-        # 2순위: 파일 폴백 — 가장 최근 .json 파일
+        # 2순위: 파일 폴백 — 가장 최근 .json 파일 ─────────────────────
         json_candidates = sorted(
             self.output_dir.glob("*.json"),
             key=lambda p: p.stat().st_mtime,
@@ -166,30 +207,13 @@ class HollowsHunter:
                 data["dump_dir"] = str(self.output_dir)
                 return data
             except Exception as exc:
-                return {"error": f"JSON 파싱 실패: {exc}",
-                        "dump_dir": str(self.output_dir)}
-
-        # 3순위: stdout 평문 파싱 —————————————————————————————————————
-        # 의심 프로세스가 없을 때 일부 HH 버전이 JSON 대신 평문을 출력합니다.
-        #   예: "Total scanned: 150\nSuspicious: 0\n"
-        # 이 경우를 에러가 아닌 "정상 실행, 0건 탐지"로 처리합니다.
-        if stdout:
-            import re as _re
-            ts = _re.search(r"Total scanned[:\s]+(\d+)", stdout, _re.IGNORECASE)
-            ss = _re.search(r"Suspicious[:\s]+(\d+)",    stdout, _re.IGNORECASE)
-            if ts:
-                return {
-                    "total_scanned": int(ts.group(1)),
-                    "suspicious":    int(ss.group(1)) if ss else 0,
-                    "processes":     [],
-                    "dump_dir":      str(self.output_dir),
-                }
+                _diag.append(f"파일 {json_candidates[0].name} JSON 파싱 오류: {exc}")
+                return {"error": " / ".join(_diag), "dump_dir": str(self.output_dir)}
+        else:
+            _diag.append(f"JSON 파일 없음 (탐색 경로: {self.output_dir})")
 
         return {
-            "error": "hollows-hunter 출력 파싱 실패 — JSON을 찾을 수 없음",
-            "stdout": stdout[:2000],
-            "stderr": result.stderr[:500],
-            "returncode": result.returncode,
+            "error": " / ".join(_diag) if _diag else "hollows-hunter 출력 없음",
             "dump_dir": str(self.output_dir),
         }
 
