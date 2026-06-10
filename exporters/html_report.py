@@ -1342,8 +1342,8 @@ def generate_html_report(result, output_path: str) -> None:
     tab3_b    = _tb(reg_added + reg_mod,
                     "yellow" if (reg_added + reg_mod) else "gray") if (reg_added + reg_mod) else ""
     tab4_b    = _tb(conn_count,  "green"  if conn_count  else "gray") if conn_count  else ""
-    tab5_b    = (_tb(shc_total,  "red"    if shc_total   else "gray") if shc_total   else "") + \
-                (_tb(ioc_total,  "orange" if ioc_total   else "gray") if ioc_total   else "")
+    tab_mem_b = _tb(shc_total,  "red"    if shc_total   else "gray") if shc_total   else ""
+    tab5_b    = _tb(ioc_total,  "orange" if ioc_total   else "gray") if ioc_total   else ""
 
     _hunt_cfg_js = _build_hunt_cfg_js()
     body = f"""<!DOCTYPE html>
@@ -1397,6 +1397,9 @@ def generate_html_report(result, output_path: str) -> None:
   </button>
   <button class="tab-btn" data-tab="tab-network">
     🌐 네트워크{tab4_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-memory">
+    🧠 메모리{tab_mem_b}
   </button>
   <button class="tab-btn" data-tab="tab-ioc">
     🔍 IOC{tab5_b}
@@ -1477,18 +1480,23 @@ def generate_html_report(result, output_path: str) -> None:
 
 </div>
 
-<!-- ══════════ 탭 5: IOC ══════════ -->
-<div id="tab-ioc" class="tab-panel">
+<!-- ══════════ 탭 5: 메모리 ══════════ -->
+<div id="tab-memory" class="tab-panel">
 
-  <h2>🔬 쉘코드 / 메모리 인젝션</h2>
+  <h2>🧠 메모리 인젝션 / 쉘코드 탐지</h2>
   {_shellcode_html(result)}
+
+</div>
+
+<!-- ══════════ 탭 6: IOC ══════════ -->
+<div id="tab-ioc" class="tab-panel">
 
   <h2>💀 IOC 목록</h2>
   {_ioc_html(result)}
 
 </div>
 
-<!-- ══════════ 탭 6: Hunt ══════════ -->
+<!-- ══════════ 탭 7: Hunt ══════════ -->
 <div id="tab-hunt" class="tab-panel">
   {_hunt_html(sample_sha256, ioc)}
 </div>
