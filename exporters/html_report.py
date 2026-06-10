@@ -1010,7 +1010,11 @@ def _shellcode_html(result) -> str:
     hh_pe_inj  = 0
     if hh_r is not None:
         if hh_r.error:
-            parts.append(f"<p class='alert alert-warning'>⚠ hollows-hunter: {_e(hh_r.error)}</p>")
+            # JSON 파싱 실패는 의심 프로세스 없을 때 정상 케이스 — 눈에 띄지 않게 표시
+            parts.append(
+                f"<p style='color:#484f58;font-size:.78rem;margin:.3rem 0'>"
+                f"hollows-hunter: {_e(hh_r.error)}</p>"
+            )
         else:
             hh_scanned = hh_r.total_scanned
             hh_susp    = len(hh_r.suspicious_processes)

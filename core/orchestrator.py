@@ -357,8 +357,9 @@ def run_analysis(
         raw = hh_scanner.scan_all(dump_mode=3, shellcode=True, hooks=True)
         result.hh_result = parse_hollows_hunter(raw)
         if result.hh_result.error:
-            result.errors.append(f"hollows-hunter: {result.hh_result.error}")
-            status(f"      [경고] {result.hh_result.error}")
+            # 파싱 실패는 콘솔에만 표시 — 의심 프로세스 없을 때 HH 가
+            # JSON 대신 텍스트를 출력하는 정상 케이스이므로 result.errors 에 추가하지 않음
+            status(f"      [hollows-hunter] {result.hh_result.error}")
             # hollows-hunter가 실제로 출력한 텍스트 — 원인 진단용
             hh_out = (raw.get("stdout") or "").strip()
             hh_err = (raw.get("stderr") or "").strip()
