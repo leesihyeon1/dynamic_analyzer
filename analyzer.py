@@ -44,12 +44,13 @@ def _open_report(html_path, console) -> None:
     """
     리포트를 브라우저로 엽니다.
 
-    config.json > hunt.serve_port > 0 이면 로컬 HTTP 서버로 서빙합니다.
-    → file:// 에서 발생하는 CORS null-origin 차단 문제를 해소합니다.
+    config.json > hunt.serve_port > 0 이면 hunt_relay.py 를 백그라운드
+    프로세스로 실행해 로컬 HTTP 서버 + abuse.ch API 릴레이를 제공합니다.
+    → file:// CORS 및 VM 방화벽 우회 (Python 프로세스가 직접 API 호출).
     serve_port == 0 이면 os.startfile() 로 직접 열기합니다.
     """
-    import os, threading, socketserver, webbrowser
-    import http.server as _http
+    import os, sys, subprocess, webbrowser
+    from pathlib import Path as _Path
 
     try:
         from core.config_loader import get_hunt_cfg
@@ -61,38 +62,46 @@ def _open_report(html_path, console) -> None:
         directory = str(html_path.parent)
         filename  = html_path.name
 
-        class _Handler(_http.SimpleHTTPRequestHandler):
-            def __init__(self, *a, **kw):
-                super().__init__(*a, directory=directory, **kw)
-            def log_message(self, fmt, *args):   # 서버 로그 숨김
-                pass
-
+        # ── 기존 릴레이 프로세스 종료 (포트 재사용) ─────────────────
         try:
-            httpd = socketserver.TCPServer(("127.0.0.1", serve_port), _Handler)
-            httpd.allow_reuse_address = True
-        except OSError:
-            # 포트 사용 중 → file:// fallback
-            console.print(
-                f"  [yellow]⚠ 포트 {serve_port} 사용 중 — file:// 로 열기[/yellow]"
+            import psutil as _ps
+            for conn in _ps.net_connections(kind="inet"):
+                if getattr(conn.laddr, "port", None) == serve_port and conn.status == "LISTEN":
+                    try:
+                        _ps.Process(conn.pid).terminate()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # ── hunt_relay.py 백그라운드 실행 ────────────────────────────
+        relay_py = _Path(__file__).parent / "core" / "hunt_relay.py"
+        try:
+            subprocess.Popen(
+                [sys.executable, str(relay_py),
+                 "--port", str(serve_port), "--dir", directory],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
             )
+        except Exception as exc:
+            console.print(f"  [yellow]⚠ 릴레이 서버 시작 실패: {exc} — file:// 로 열기[/yellow]")
             try:
                 os.startfile(str(html_path))
-            except Exception as exc:
-                console.print(f"  [yellow]리포트 자동 열기 실패: {exc}[/yellow]")
+            except Exception as exc2:
+                console.print(f"  [yellow]리포트 자동 열기 실패: {exc2}[/yellow]")
             return
 
+        # 릴레이 프로세스가 포트를 바인딩할 시간 확보
+        import time as _t
+        _t.sleep(1.2)
+
         url = f"http://127.0.0.1:{serve_port}/{filename}"
-        t = threading.Thread(target=httpd.serve_forever, daemon=True)
-        t.start()
         webbrowser.open(url)
         console.print(
-            f"  [dim]리포트 서빙 중 →[/dim] [blue]{url}[/blue]"
-            f"  [dim](브라우저에서 로드 후 서버 자동 종료)[/dim]"
+            f"  [dim]Hunt 릴레이 →[/dim] [blue]{url}[/blue]  "
+            f"[dim](abuse.ch API 릴레이 활성 / 백그라운드 실행 중)[/dim]"
         )
-        # 브라우저가 HTML 을 받을 시간만큼 대기 후 서버 종료
-        import time as _time
-        _time.sleep(6)
-        httpd.shutdown()
     else:
         # serve_port = 0 → 직접 열기 (CORS 주의)
         try:

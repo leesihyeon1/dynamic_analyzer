@@ -243,6 +243,20 @@ var _SVC_NAMES = {
     feodo: '👾 Feodo Tracker'
 };
 
+// ── 릴레이 fetch 헬퍼 ─────────────────────────────────────────────────
+// HUNT_CFG.relay_port 가 설정된 경우 로컬 릴레이(Python)를 통해 요청합니다.
+// 릴레이 실패 시 abuse.ch 직접 호출로 폴백합니다.
+async function _relayFetch(svcKey, directUrl, options) {
+    if (HUNT_CFG.relay_port) {
+        var relayUrl = 'http://127.0.0.1:' + HUNT_CFG.relay_port + '/hunt/relay/' + svcKey;
+        try {
+            var r = await fetch(relayUrl, options);
+            if (r.ok || r.status === 502) return r;  // 502 = relay got upstream error, still JSON
+        } catch(e) { /* 릴레이 없음 → 직접 요청 */ }
+    }
+    return fetch(directUrl, options);
+}
+
 function huntDetect(val) {
     val = (val || '').trim();
     if (!val) return null;
@@ -363,7 +377,7 @@ async function _huntMB(hash, type) {
         if      (type === 'md5')  body.append('md5_hash',  hash);
         else if (type === 'sha1') body.append('sha1_hash', hash);
         else                      body.append('hash',      hash);
-        var r = await fetch(HUNT_CFG.services.mb.url, {method:'POST', body:body});
+        var r = await _relayFetch('mb', HUNT_CFG.services.mb.url, {method:'POST', body:body});
         var d = await r.json();
         if (d.query_status !== 'hash_found' || !d.data || !d.data.length) {
             huntSetSvc('mb', 'clean');
@@ -395,7 +409,7 @@ async function _huntMB(hash, type) {
 
 async function _huntTF(ioc) {
     try {
-        var r = await fetch(HUNT_CFG.services.tf.url, {
+        var r = await _relayFetch('tf', HUNT_CFG.services.tf.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({query: 'search_ioc', search_term: ioc})
@@ -435,7 +449,8 @@ async function _huntUH(ioc, type) {
             : HUNT_CFG.services.uh_host.url;
         var body = new URLSearchParams();
         body.append(isURL ? 'url' : 'host', ioc);
-        var r = await fetch(ep, {method:'POST', body:body});
+        var relayKey = isURL ? 'uh_url' : 'uh_host';
+        var r = await _relayFetch(relayKey, ep, {method:'POST', body:body});
         var d = await r.json();
         var notFound = (d.query_status === 'no_results' || d.query_status === 'invalid_url'
                         || (!isURL && d.query_status !== 'is_host'));
@@ -479,7 +494,7 @@ async function _huntUH(ioc, type) {
 
 async function _huntFeodo(ip) {
     try {
-        var r = await fetch(HUNT_CFG.services.feodo.url, {
+        var r = await _relayFetch('feodo', HUNT_CFG.services.feodo.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({host: ip})
@@ -1205,8 +1220,12 @@ def _build_hunt_cfg_js() -> str:
                 "feodo":  {"enabled": True,  "label": "Feodo Tracker",   "url": "https://feodotracker.abuse.ch/api/v1/host_info/"},
             },
         }
-    # serve_port 는 Python-side 전용이므로 JS 객체에서 제외
-    js_obj = {"services": hunt.get("services", {})}
+    # relay_port: JS 가 릴레이 사용 여부를 판단하는 데 사용
+    relay_port = hunt.get("serve_port", 0)
+    js_obj = {
+        "relay_port": relay_port if relay_port and relay_port > 0 else None,
+        "services":   hunt.get("services", {}),
+    }
     return _json.dumps(js_obj, ensure_ascii=False)
 
 
