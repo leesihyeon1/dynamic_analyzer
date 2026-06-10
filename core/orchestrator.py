@@ -98,6 +98,35 @@ def _kill_analysis_tool(
             pass
 
 
+def _merge_external_techniques(report, new_techs: list) -> None:
+    """
+    외부 도구(CAPA, VT) 기법을 BehaviorReport 에 병합합니다.
+
+    - 이미 존재하는 technique_id: evidence + sources 만 보완
+    - 신규 technique_id: 목록 끝에 추가 후 전술 우선순위로 재정렬
+    """
+    from analysis.behavior_classifier import _tactic_key
+
+    existing = {t.technique_id: t for t in report.techniques}
+    added: list = []
+
+    for nt in new_techs:
+        if nt.technique_id in existing:
+            et = existing[nt.technique_id]
+            for ev in nt.evidence:
+                if ev not in et.evidence:
+                    et.evidence.append(ev)
+            for src in (nt.sources or []):
+                if src not in et.sources:
+                    et.sources.append(src)
+        else:
+            added.append(nt)
+            existing[nt.technique_id] = nt
+
+    report.techniques.extend(added)
+    report.techniques.sort(key=_tactic_key)
+
+
 def _pid_alive(pid: int) -> bool:
     """프로세스가 현재 살아있는지 확인 (Windows 전용)."""
     try:
@@ -555,6 +584,66 @@ def run_analysis(
         result.registry_diff,
         result.process_diff,
     )
+
+    # ── CAPA 정적 분석 (선택적) ──────────────────────────────────────
+    from core.config_loader import load_config as _load_cfg
+    _cfg = _load_cfg()
+
+    _capa_cfg = _cfg.get("capa", {})
+    if config.sample_path and _capa_cfg.get("enabled", True):
+        _capa_exe     = _capa_cfg.get("path", "capa.exe")
+        _capa_timeout = int(_capa_cfg.get("timeout", 120))
+        status(f"[분석] CAPA 정적 분석 중... (최대 {_capa_timeout}초, Ctrl+C로 건너뜀)")
+        try:
+            from analysis.capa_analyzer import run_capa
+            _capa_techs = run_capa(config.sample_path, _capa_exe, _capa_timeout)
+            if _capa_techs:
+                _merge_external_techniques(result.behavior_report, _capa_techs)
+                _capa_new = sum(1 for t in result.behavior_report.techniques
+                                if "CAPA" in (t.sources or []))
+                status(f"      CAPA 완료: 기법 {len(_capa_techs)}개 탐지  "
+                       f"(누적 {_capa_new}개)")
+            else:
+                status("      CAPA: 탐지 없음 / 실행 불가 (config.json > capa.path 확인)")
+        except KeyboardInterrupt:
+            status("      CAPA 건너뜀 (Ctrl+C)")
+        except Exception as _e:
+            status(f"      CAPA 오류: {_e}")
+
+    # ── VirusTotal API 쿼리 (선택적) ─────────────────────────────────
+    _vt_cfg = _cfg.get("virustotal", {})
+    if _vt_cfg.get("enabled") and _vt_cfg.get("api_key", ""):
+        _vt_key     = _vt_cfg["api_key"]
+        _vt_timeout = int(_vt_cfg.get("timeout", 20))
+        _sha256 = ""
+        if config.sample_path:
+            try:
+                import hashlib as _hl
+                _h = _hl.sha256()
+                with open(config.sample_path, "rb") as _f:
+                    for _chunk in iter(lambda: _f.read(65536), b""):
+                        _h.update(_chunk)
+                _sha256 = _h.hexdigest()
+            except Exception:
+                pass
+
+        if _sha256:
+            status(f"[분석] VirusTotal 쿼리 중... ({_sha256[:16]}…)")
+            try:
+                from analysis.vt_analyzer import query_vt
+                _vt_techs = query_vt(_sha256, _vt_key, _vt_timeout)
+                if _vt_techs:
+                    _merge_external_techniques(result.behavior_report, _vt_techs)
+                    _vt_new = sum(1 for t in result.behavior_report.techniques
+                                  if "VirusTotal" in (t.sources or []))
+                    status(f"      VT 완료: 기법 {len(_vt_techs)}개 탐지  "
+                           f"(누적 {_vt_new}개)")
+                else:
+                    status("      VT: 탐지 없음 (미등록 샘플이거나 API 오류)")
+            except Exception as _e:
+                status(f"      VT 오류: {_e}")
+        else:
+            status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
 
     status("[분석] 프로세스↔네트워크 연결 매핑...")
     result.process_network_map = build_process_network_map(result.filtered_events)

@@ -27,6 +27,7 @@ class MitreTechnique:
     tactic:         str                # e.g. "Persistence"
     evidence:       list[str] = field(default_factory=list)   # supporting paths/details
     reference:      str = ""           # https://attack.mitre.org/techniques/…
+    sources:        list[str] = field(default_factory=list)   # e.g. ["로컬룰", "CAPA", "VirusTotal"]
 
 
 @dataclass
@@ -483,12 +484,15 @@ def _add_evidence(
     tactic: str,
     evidence: str,
     reference: str = "",
+    source: str = "로컬룰",
 ) -> None:
-    """Insert or update a technique in *technique_map*, appending *evidence*."""
+    """Insert or update a technique in *technique_map*, appending *evidence* and *source*."""
     if technique_id in technique_map:
         existing = technique_map[technique_id]
         if evidence and evidence not in existing.evidence:
             existing.evidence.append(evidence)
+        if source and source not in existing.sources:
+            existing.sources.append(source)
     else:
         technique_map[technique_id] = MitreTechnique(
             technique_id=technique_id,
@@ -496,6 +500,7 @@ def _add_evidence(
             tactic=tactic,
             evidence=[evidence] if evidence else [],
             reference=reference,
+            sources=[source] if source else [],
         )
 
 

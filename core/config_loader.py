@@ -14,6 +14,16 @@ from pathlib import Path
 
 # ── 기본값 ──────────────────────────────────────────────────────────
 _DEFAULTS: dict = {
+    "capa": {
+        "enabled": True,
+        "path":    "capa.exe",
+        "timeout": 120,
+    },
+    "virustotal": {
+        "enabled": False,
+        "api_key": "",
+        "timeout": 20,
+    },
     "hunt": {
         "serve_port": 18080,
         "services": {

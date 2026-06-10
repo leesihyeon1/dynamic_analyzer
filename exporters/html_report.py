@@ -546,6 +546,22 @@ _TACTIC_COLOR = {
     "Impact":           "red",
 }
 
+_SOURCE_COLOR = {
+    "로컬룰":      "gray",
+    "CAPA":       "blue",
+    "VirusTotal": "green",
+}
+
+
+def _source_badges(sources: list) -> str:
+    """출처 배지 HTML 반환. 빈 리스트면 '로컬룰' 배지 기본 표시."""
+    if not sources:
+        sources = ["로컬룰"]
+    return " ".join(
+        f"<span class='badge badge-{_SOURCE_COLOR.get(s, 'gray')}'>{_e(s)}</span>"
+        for s in sources
+    )
+
 def _b(text: str, color: str = "gray") -> str:
     return f'<span class="badge badge-{color}">{_html.escape(str(text))}</span>'
 
@@ -584,17 +600,21 @@ def _section_html(result) -> str:
             f"<div class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(ev[:120])}</div>"
             for ev in t.evidence[:5]
         )
+        # sources 필드는 구버전 JSON 호환을 위해 getattr 사용
+        src_badges = _source_badges(getattr(t, "sources", []) or [])
         rows += (
             f"<tr>"
             f"<td><a href='{_e(ref)}' target='_blank' style='color:#f97583;text-decoration:none'>"
             f"{_e(t.technique_id)}</a></td>"
             f"<td>{_e(t.technique_name)}</td>"
             f"<td>{_b(t.tactic, color)}</td>"
+            f"<td style='white-space:nowrap'>{src_badges}</td>"
             f"<td>{evidence_html}</td>"
             f"</tr>"
         )
     return (
-        "<table id='tbl-mitre'><tr><th>ID</th><th>기법</th><th>전술</th><th>근거 (최대 5건)</th></tr>"
+        "<table id='tbl-mitre'>"
+        "<tr><th>ID</th><th>기법</th><th>전술</th><th>출처</th><th>근거 (최대 5건)</th></tr>"
         f"{rows}</table>"
     )
 
