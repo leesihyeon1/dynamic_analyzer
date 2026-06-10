@@ -246,14 +246,22 @@ var _SVC_NAMES = {
 function huntDetect(val) {
     val = (val || '').trim();
     if (!val) return null;
-    if (/^[a-fA-F0-9]{64}$/.test(val)) return {type:'sha256', label:'SHA256',   svcs:['mb','tf']};
-    if (/^[a-fA-F0-9]{40}$/.test(val)) return {type:'sha1',   label:'SHA1',     svcs:['mb','tf']};
-    if (/^[a-fA-F0-9]{32}$/.test(val)) return {type:'md5',    label:'MD5',      svcs:['mb','tf']};
-    if (/^\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?$/.test(val))
-                                        return {type:'ip',     label:'IP 주소',   svcs:['tf','uh','feodo']};
-    if (/^https?:\\/\\//i.test(val))     return {type:'url',    label:'URL',      svcs:['uh','tf']};
-    if (val.indexOf('.') > 0 && !/\\s/.test(val))
-                                        return {type:'domain', label:'도메인',    svcs:['tf','uh']};
+    // HUNT_CFG 에서 활성화된 서비스만 포함
+    function _svcs(list) {
+        return list.filter(function(id) {
+            var svc = HUNT_CFG.services[id] || HUNT_CFG.services['uh_url'];
+            // uh 는 uh_url / uh_host 두 키를 대표 — enabled 는 둘 중 하나가 켜져 있으면 활성
+            if (id === 'uh') return (HUNT_CFG.services.uh_url  && HUNT_CFG.services.uh_url.enabled  !== false)
+                                 || (HUNT_CFG.services.uh_host && HUNT_CFG.services.uh_host.enabled !== false);
+            return svc && svc.enabled !== false;
+        });
+    }
+    if (/^[a-fA-F0-9]{64}$/.test(val)) { var s1=_svcs(['mb','tf']); return s1.length?{type:'sha256',label:'SHA256',svcs:s1}:null; }
+    if (/^[a-fA-F0-9]{40}$/.test(val)) { var s2=_svcs(['mb','tf']); return s2.length?{type:'sha1',  label:'SHA1',  svcs:s2}:null; }
+    if (/^[a-fA-F0-9]{32}$/.test(val)) { var s3=_svcs(['mb','tf']); return s3.length?{type:'md5',   label:'MD5',   svcs:s3}:null; }
+    if (/^\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?$/.test(val)) { var s4=_svcs(['tf','uh','feodo']); return s4.length?{type:'ip',    label:'IP 주소',svcs:s4}:null; }
+    if (/^https?:\\/\\//i.test(val))    { var s5=_svcs(['uh','tf']);    return s5.length?{type:'url',   label:'URL',   svcs:s5}:null; }
+    if (val.indexOf('.') > 0 && !/\\s/.test(val)) { var s6=_svcs(['tf','uh']); return s6.length?{type:'domain',label:'도메인',svcs:s6}:null; }
     return null;
 }
 
@@ -355,7 +363,7 @@ async function _huntMB(hash, type) {
         if      (type === 'md5')  body.append('md5_hash',  hash);
         else if (type === 'sha1') body.append('sha1_hash', hash);
         else                      body.append('hash',      hash);
-        var r = await fetch('https://mb-api.abuse.ch/api/v1/', {method:'POST', body:body});
+        var r = await fetch(HUNT_CFG.services.mb.url, {method:'POST', body:body});
         var d = await r.json();
         if (d.query_status !== 'hash_found' || !d.data || !d.data.length) {
             huntSetSvc('mb', 'clean');
@@ -387,7 +395,7 @@ async function _huntMB(hash, type) {
 
 async function _huntTF(ioc) {
     try {
-        var r = await fetch('https://threatfox-api.abuse.ch/api/v1/', {
+        var r = await fetch(HUNT_CFG.services.tf.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({query: 'search_ioc', search_term: ioc})
@@ -423,8 +431,8 @@ async function _huntUH(ioc, type) {
     try {
         var isURL = (type === 'url');
         var ep = isURL
-            ? 'https://urlhaus-api.abuse.ch/v1/url/'
-            : 'https://urlhaus-api.abuse.ch/v1/host/';
+            ? HUNT_CFG.services.uh_url.url
+            : HUNT_CFG.services.uh_host.url;
         var body = new URLSearchParams();
         body.append(isURL ? 'url' : 'host', ioc);
         var r = await fetch(ep, {method:'POST', body:body});
@@ -471,7 +479,7 @@ async function _huntUH(ioc, type) {
 
 async function _huntFeodo(ip) {
     try {
-        var r = await fetch('https://feodotracker.abuse.ch/api/v1/host_info/', {
+        var r = await fetch(HUNT_CFG.services.feodo.url, {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({host: ip})
@@ -1130,11 +1138,28 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
     return f"""
 <h2>🕵️ Threat Hunt — abuse.ch</h2>
 
-<div class="alert alert-info" style="font-size:.82rem;margin-bottom:1rem">
+<div class="alert alert-info" style="font-size:.82rem;margin-bottom:.6rem">
   <strong>MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker</strong>
   를 브라우저에서 직접 조회합니다.
   인터넷 연결이 필요하며, 격리 VM에서는 네트워크 정책을 확인하세요.
 </div>
+
+<div id="hunt-cors-warn" class="alert alert-warning"
+     style="display:none;font-size:.82rem;margin-bottom:.8rem">
+  ⚠ <strong>file:// 프로토콜 감지 — API 요청이 차단될 수 있습니다.</strong><br>
+  브라우저는 <code>file://</code>에서 열린 페이지의 외부 fetch 를 CORS origin=null 로 처리합니다.<br>
+  <strong>해결:</strong> <code>config.json</code> → <code>hunt.serve_port</code> 값을 설정하면 다음 실행부터
+  <code>http://127.0.0.1:PORT</code>로 자동 서빙됩니다.
+  현재 기본값: <code>18080</code> (이미 설정되어 있으면 리포트를 다시 생성하세요).
+</div>
+<script>
+(function(){{
+    if (window.location.protocol === 'file:') {{
+        var w = document.getElementById('hunt-cors-warn');
+        if (w) w.style.display = 'block';
+    }}
+}})();
+</script>
 
 <!-- 검색 박스 -->
 <div class="hunt-box">
@@ -1160,6 +1185,29 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
 <!-- 결과 영역 -->
 <div id="hunt-results"></div>
 """
+
+
+def _build_hunt_cfg_js() -> str:
+    """config.json 의 hunt 설정을 JS window.HUNT_CFG 객체 문자열로 반환합니다."""
+    import json as _json
+    try:
+        from core.config_loader import get_hunt_cfg
+        hunt = get_hunt_cfg()
+    except Exception:
+        # config_loader 로드 실패 시 하드코딩 기본값
+        hunt = {
+            "serve_port": 18080,
+            "services": {
+                "mb":     {"enabled": True,  "label": "MalwareBazaar",   "url": "https://mb-api.abuse.ch/api/v1/"},
+                "tf":     {"enabled": True,  "label": "ThreatFox",       "url": "https://threatfox-api.abuse.ch/api/v1/"},
+                "uh_url": {"enabled": True,  "label": "URLhaus (URL)",   "url": "https://urlhaus-api.abuse.ch/v1/url/"},
+                "uh_host":{"enabled": True,  "label": "URLhaus (Host)",  "url": "https://urlhaus-api.abuse.ch/v1/host/"},
+                "feodo":  {"enabled": True,  "label": "Feodo Tracker",   "url": "https://feodotracker.abuse.ch/api/v1/host_info/"},
+            },
+        }
+    # serve_port 는 Python-side 전용이므로 JS 객체에서 제외
+    js_obj = {"services": hunt.get("services", {})}
+    return _json.dumps(js_obj, ensure_ascii=False)
 
 
 def generate_html_report(result, output_path: str) -> None:
@@ -1221,6 +1269,7 @@ def generate_html_report(result, output_path: str) -> None:
     tab5_b    = (_tb(shc_total,  "red"    if shc_total   else "gray") if shc_total   else "") + \
                 (_tb(ioc_total,  "orange" if ioc_total   else "gray") if ioc_total   else "")
 
+    _hunt_cfg_js = _build_hunt_cfg_js()
     body = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -1228,6 +1277,7 @@ def generate_html_report(result, output_path: str) -> None:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dynamic Analysis — {_e(sample_name)}</title>
 <style>{_CSS}</style>
+<script>window.HUNT_CFG = {_hunt_cfg_js};</script>
 <script>{_JS}</script>
 </head>
 <body>

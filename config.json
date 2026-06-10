@@ -1,0 +1,37 @@
+{
+  "_comment": "dynamic_analyzer 설정 파일 — 수정 후 다음 실행부터 적용됩니다",
+
+  "hunt": {
+    "_comment_serve": "serve_port > 0 이면 리포트를 http://127.0.0.1:PORT 로 서빙합니다 (CORS 문제 해소). 0 이면 file:// 직접 열기.",
+    "serve_port": 18080,
+
+    "services": {
+      "_comment": "enabled: false 로 설정하면 해당 서비스를 Hunt 탭에서 숨깁니다. url 을 프록시/미러로 교체 가능.",
+      "mb": {
+        "enabled": true,
+        "label": "MalwareBazaar",
+        "url": "https://mb-api.abuse.ch/api/v1/"
+      },
+      "tf": {
+        "enabled": true,
+        "label": "ThreatFox",
+        "url": "https://threatfox-api.abuse.ch/api/v1/"
+      },
+      "uh_url": {
+        "enabled": true,
+        "label": "URLhaus (URL)",
+        "url": "https://urlhaus-api.abuse.ch/v1/url/"
+      },
+      "uh_host": {
+        "enabled": true,
+        "label": "URLhaus (Host)",
+        "url": "https://urlhaus-api.abuse.ch/v1/host/"
+      },
+      "feodo": {
+        "enabled": true,
+        "label": "Feodo Tracker",
+        "url": "https://feodotracker.abuse.ch/api/v1/host_info/"
+      }
+    }
+  }
+}

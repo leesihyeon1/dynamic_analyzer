@@ -40,6 +40,68 @@ from rich         import box
 console = Console()
 
 
+def _open_report(html_path, console) -> None:
+    """
+    리포트를 브라우저로 엽니다.
+
+    config.json > hunt.serve_port > 0 이면 로컬 HTTP 서버로 서빙합니다.
+    → file:// 에서 발생하는 CORS null-origin 차단 문제를 해소합니다.
+    serve_port == 0 이면 os.startfile() 로 직접 열기합니다.
+    """
+    import os, threading, socketserver, webbrowser
+    import http.server as _http
+
+    try:
+        from core.config_loader import get_hunt_cfg
+        serve_port = get_hunt_cfg().get("serve_port", 18080)
+    except Exception:
+        serve_port = 18080
+
+    if serve_port and serve_port > 0:
+        directory = str(html_path.parent)
+        filename  = html_path.name
+
+        class _Handler(_http.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, directory=directory, **kw)
+            def log_message(self, fmt, *args):   # 서버 로그 숨김
+                pass
+
+        try:
+            httpd = socketserver.TCPServer(("127.0.0.1", serve_port), _Handler)
+            httpd.allow_reuse_address = True
+        except OSError:
+            # 포트 사용 중 → file:// fallback
+            console.print(
+                f"  [yellow]⚠ 포트 {serve_port} 사용 중 — file:// 로 열기[/yellow]"
+            )
+            try:
+                os.startfile(str(html_path))
+            except Exception as exc:
+                console.print(f"  [yellow]리포트 자동 열기 실패: {exc}[/yellow]")
+            return
+
+        url = f"http://127.0.0.1:{serve_port}/{filename}"
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        webbrowser.open(url)
+        console.print(
+            f"  [dim]리포트 서빙 중 →[/dim] [blue]{url}[/blue]"
+            f"  [dim](브라우저에서 로드 후 서버 자동 종료)[/dim]"
+        )
+        # 브라우저가 HTML 을 받을 시간만큼 대기 후 서버 종료
+        import time as _time
+        _time.sleep(6)
+        httpd.shutdown()
+    else:
+        # serve_port = 0 → 직접 열기 (CORS 주의)
+        try:
+            os.startfile(str(html_path))
+            console.print("  [dim]브라우저에서 리포트를 열었습니다.[/dim]")
+        except Exception as exc:
+            console.print(f"  [yellow]리포트 자동 열기 실패: {exc}[/yellow]")
+
+
 def _check_admin() -> bool:
     """Windows 관리자 권한 여부 확인"""
     try:
@@ -288,12 +350,7 @@ def main() -> None:
         console.print(f"  [green]HTML[/green] → {html_path}")
 
         if not args.no_open:
-            import os
-            try:
-                os.startfile(str(html_path))
-                console.print("  [dim]브라우저에서 리포트를 열었습니다.[/dim]")
-            except Exception as exc:
-                console.print(f"  [yellow]리포트 자동 열기 실패: {exc}[/yellow]")
+            _open_report(html_path, console)
 
     console.rule("[bold white]분석 완료")
 
