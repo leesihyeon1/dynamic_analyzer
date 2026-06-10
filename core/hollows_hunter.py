@@ -169,6 +169,22 @@ class HollowsHunter:
                 return {"error": f"JSON 파싱 실패: {exc}",
                         "dump_dir": str(self.output_dir)}
 
+        # 3순위: stdout 평문 파싱 —————————————————————————————————————
+        # 의심 프로세스가 없을 때 일부 HH 버전이 JSON 대신 평문을 출력합니다.
+        #   예: "Total scanned: 150\nSuspicious: 0\n"
+        # 이 경우를 에러가 아닌 "정상 실행, 0건 탐지"로 처리합니다.
+        if stdout:
+            import re as _re
+            ts = _re.search(r"Total scanned[:\s]+(\d+)", stdout, _re.IGNORECASE)
+            ss = _re.search(r"Suspicious[:\s]+(\d+)",    stdout, _re.IGNORECASE)
+            if ts:
+                return {
+                    "total_scanned": int(ts.group(1)),
+                    "suspicious":    int(ss.group(1)) if ss else 0,
+                    "processes":     [],
+                    "dump_dir":      str(self.output_dir),
+                }
+
         return {
             "error": "hollows-hunter 출력 파싱 실패 — JSON을 찾을 수 없음",
             "stdout": stdout[:2000],

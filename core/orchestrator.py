@@ -98,6 +98,71 @@ def _kill_analysis_tool(
             pass
 
 
+# ── 의심 DLL 로드 경로 ────────────────────────────────────────────────────
+# 거의 항상 악성: Temp 계열 디렉터리에서 DLL을 로드하는 기존 프로세스
+# 주의: 백슬래시를 이중 이스케이프(\\)로 표기해야 path.lower() in 비교가 정확히 동작함
+_INJECT_SUSP: tuple[str, ...] = (
+    "\\appdata\\local\\temp\\",
+    "\\windows\\temp\\",
+    "\\users\\public\\",
+    "\\recycle",              # 휴지통 경유 은닉
+)
+
+# 시스템 정상 경로 — 여기서 로드되면 무시
+_INJECT_SAFE: tuple[str, ...] = (
+    "\\windows\\system32\\",
+    "\\windows\\syswow64\\",
+    "\\windows\\winsxs\\",
+    "\\program files\\",
+    "\\program files (x86)\\",
+    "\\windows\\microsoft.net\\",
+    "\\windows\\assembly\\",
+    "\\windows\\fonts\\",
+)
+
+
+def _find_injection_targets(
+    events:          list,
+    already_scanned: set[int],
+    sample_pids:     set[int],
+) -> set[int]:
+    """
+    ProcMon 전체 이벤트에서 의심 경로 DLL을 로드한 **기존** 프로세스 PID를 반환합니다.
+
+    탐지 원리
+    ---------
+    악성코드가 기존 프로세스(svchost.exe, explorer.exe 등)에
+    DLL을 인젝션하면, 피해 프로세스의 "Load Image" 이벤트에
+    AppData\\Temp, Windows\\Temp 등 의심 경로가 기록됩니다.
+
+    현재 스캔 대상(already_scanned)과 샘플·자식 PID(sample_pids)는 제외합니다.
+    """
+    from parsers.procmon_csv import EventCategory
+
+    target_pids: set[int] = set()
+    for ev in events:
+        if ev.category != EventCategory.PROCESS:
+            continue
+        if ev.operation != "Load Image":
+            continue
+        if ev.pid == 0:
+            continue
+        if ev.pid in already_scanned or ev.pid in sample_pids:
+            continue
+
+        path_lower = ev.path.lower()
+
+        # 시스템 정상 경로면 무시
+        if any(safe in path_lower for safe in _INJECT_SAFE):
+            continue
+
+        # 의심 경로에서 DLL/EXE 로드
+        if any(susp in path_lower for susp in _INJECT_SUSP):
+            target_pids.add(ev.pid)
+
+    return target_pids
+
+
 def _merge_external_techniques(report, new_techs: list) -> None:
     """
     외부 도구(CAPA, VT) 기법을 BehaviorReport 에 병합합니다.
@@ -569,6 +634,45 @@ def run_analysis(
         result.pcap_result = _PR()
         if not config.no_tshark:
             status("      PCAP 파일 없음 (tshark 미실행 또는 캡처 실패)")
+
+    # ── 7.5 의심 DLL 로드 기존 프로세스 pe-sieve 추가 스캔 ──────────────
+    # ProcMon "Load Image" 이벤트를 분석해 Temp/Windows\Temp 등 의심 경로에서
+    # DLL을 로드한 기존 프로세스를 찾아 pe-sieve로 스캔합니다.
+    # (ProcessWatcher는 신규 PID만 감시하므로 기존 프로세스 인젝션은 여기서 보완)
+    if ps_scanner.available and result.procmon_events:
+        _already = {r.pid for r in result.pe_sieve_results}
+        _inject_pids = _find_injection_targets(
+            result.procmon_events,          # 전체 이벤트 (필터 전) — 기존 프로세스 포함
+            already_scanned=_already,
+            sample_pids=result.all_pids,
+        )
+        if _inject_pids:
+            _alive_inject  = [p for p in _inject_pids if _pid_alive(p)]
+            _dead_inject   = _inject_pids - set(_alive_inject)
+            status(
+                f"[분석] 의심 DLL 로드 감지 — 기존 프로세스 {len(_inject_pids)}개 "
+                f"(생존 {len(_alive_inject)}개, 종료 {len(_dead_inject)}개) pe-sieve 추가 스캔..."
+            )
+            for _pid in _alive_inject:
+                _raw = ps_scanner.scan_pid(_pid, dump_mode=3, shellcode=True, hooks=True)
+                _pr  = parse_pesieve(_raw)
+                _pr_src = "inject_target"   # 스캔 경위 구분용 (표시에 활용)
+                result.pe_sieve_results.append(_pr)
+                if _pr.error:
+                    status(f"      PID {_pid}: {_pr.error[:80]}")
+                elif _pr.suspicious > 0:
+                    _inj_parts = []
+                    if _pr.implanted_pe:
+                        _inj_parts.append(f"PE인젝션 {_pr.implanted_pe}개")
+                    if _pr.implanted_shc:
+                        _inj_parts.append(f"쉘코드 {_pr.implanted_shc}개")
+                    _inj_str = "  ".join(_inj_parts) if _inj_parts else f"의심모듈 {_pr.suspicious}개"
+                    status(f"      PID {_pid}: 의심 {_pr.suspicious}개  {_inj_str} 🚨")
+                else:
+                    status(f"      PID {_pid}: 이상 없음 ✅")
+            if _dead_inject:
+                status(f"      [알림] 종료된 PID (스캔 불가): {sorted(_dead_inject)}")
+        # else: 의심 DLL 로드 없음 — 상태 로그 불필요
 
     # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
     status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")

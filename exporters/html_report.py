@@ -1108,7 +1108,7 @@ def _shellcode_html(result) -> str:
             ppi = "#e3b341" if pe_pe_inj else "#8b949e"
             psc = "#ff7b72" if pe_shc    else "#8b949e"
             rows += (
-                f"<tr><td>pe-sieve (신규 프로세스)</td><td>"
+                f"<tr><td>pe-sieve (신규 + 의심 DLL 로드 프로세스)</td><td>"
                 f"{len(pe_valid)}개 스캔 &nbsp;"
                 f"<b style='color:{pss}'>의심 {len(pe_susp)}개</b> &nbsp;"
                 f"<b style='color:{ppi}'>PE인젝션 {pe_pe_inj}개</b> &nbsp;"
@@ -1131,11 +1131,11 @@ def _shellcode_html(result) -> str:
                 "<p class='alert alert-success'>✅ hollows-hunter: 인젝션 / 쉘코드 미탐지</p>"
             )
 
-    # ── pe-sieve 신규 프로세스 상세 ───────────────────────────────
+    # ── pe-sieve 프로세스 상세 ────────────────────────────────────
     if pe_list:
         parts.append(
             "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;padding-top:.75rem'>"
-            "pe-sieve — 신규 프로세스 스캔 결과</h3>"
+            "pe-sieve — 신규 프로세스 &amp; 의심 DLL 로드 프로세스 스캔 결과</h3>"
         )
         for r in pe_list:
             if r.error:
