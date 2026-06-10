@@ -3,6 +3,7 @@ HTML 동적 분석 보고서 생성 (다크 테마)
 """
 from __future__ import annotations
 
+import hashlib
 import html as _html
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +77,54 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .tbadge-green {background:#1f3d2a;color:#56d364;}
 .tbadge-blue  {background:#1f2d3d;color:#79c0ff;}
 .tbadge-gray  {background:#21262d;color:#8b949e;}
+/* ── Hunt Tab ── */
+.hunt-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.25rem;margin-bottom:1rem}
+.hunt-row{display:flex;gap:.6rem;align-items:center}
+.hunt-input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;
+            font-size:.9rem;padding:.46rem .85rem;outline:none;transition:border-color .15s}
+.hunt-input:focus{border-color:#58a6ff}
+.hunt-input::placeholder{color:#484f58}
+.hunt-btn{background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:.44rem 1.2rem;
+          font-size:.88rem;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s}
+.hunt-btn:hover{background:#388bfd}
+.hunt-btn:disabled{background:#1d2d40;color:#484f58;cursor:not-allowed}
+.hunt-hint{color:#8b949e;font-size:.76rem;margin-top:.4rem;min-height:1.2em}
+.hunt-type-tag{background:#21262d;color:#79c0ff;border-radius:4px;padding:.1rem .45rem;
+               font-size:.73rem;font-weight:600}
+.hunt-quick{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;
+            margin-top:.75rem;padding-top:.75rem;border-top:1px solid #21262d}
+.hunt-qlabel{color:#8b949e;font-size:.73rem;white-space:nowrap;margin-right:.15rem}
+.hunt-qchip{background:#21262d;border:1px solid #30363d;border-radius:9999px;color:#c9d1d9;
+            font-size:.71rem;padding:.12rem .6rem;cursor:pointer;transition:background .12s,color .12s;
+            font-family:'Cascadia Code','Consolas',monospace}
+.hunt-qchip:hover{background:#30363d;color:#e6edf3}
+.hunt-qchip.ip    {border-color:#3d2a1f;color:#ffa657}
+.hunt-qchip.domain{border-color:#1f2d3d;color:#79c0ff}
+.hunt-qchip.hash  {border-color:#2d1f3d;color:#d2a8ff}
+.hunt-svcs{display:flex;gap:.45rem;flex-wrap:wrap;margin-bottom:1rem}
+.svc-badge{display:inline-flex;align-items:center;gap:.3rem;padding:.22rem .75rem;border-radius:6px;
+           font-size:.76rem;font-weight:600;border:1px solid transparent;transition:all .2s}
+.svc-badge.idle   {background:#161b22;border-color:#30363d;color:#8b949e}
+.svc-badge.loading{background:#1f2d3d;border-color:#1f6feb;color:#79c0ff;animation:svcPulse .9s ease infinite}
+.svc-badge.found  {background:#3d1f1f;border-color:#ff7b72;color:#ff7b72}
+.svc-badge.clean  {background:#1f3d2a;border-color:#56d364;color:#56d364}
+.svc-badge.error  {background:#21262d;border-color:#484f58;color:#8b949e}
+@keyframes svcPulse{0%,100%{opacity:1}50%{opacity:.45}}
+.hunt-card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:.85rem;overflow:hidden}
+.hunt-card.found .hunt-card-head{border-left:3px solid #ff7b72}
+.hunt-card.clean .hunt-card-head{border-left:3px solid #56d364}
+.hunt-card.error .hunt-card-head{border-left:3px solid #484f58}
+.hunt-card-head{display:flex;align-items:center;justify-content:space-between;
+                padding:.62rem 1rem;border-bottom:1px solid #21262d}
+.hunt-card-title{font-weight:600;font-size:.88rem;display:flex;align-items:center;gap:.45rem}
+.hunt-card-body{padding:.85rem 1rem}
+.hunt-kv{font-size:.82rem;width:auto}
+.hunt-kv td:first-child{color:#8b949e;width:130px;padding:.28rem .5rem .28rem 0;white-space:nowrap}
+.hunt-kv td:last-child{padding:.28rem 0}
+.hunt-tags{display:flex;flex-wrap:wrap;gap:.3rem;margin-top:.1rem}
+.hunt-link{color:#58a6ff;font-size:.76rem;text-decoration:none}
+.hunt-link:hover{text-decoration:underline}
+.hunt-none{color:#8b949e;font-size:.83rem}
 """
 
 _JS = """
@@ -182,6 +231,271 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     });
 });
+
+// ════════════════════════════════════════════════
+//  Hunt Tab — abuse.ch 실시간 조회
+// ════════════════════════════════════════════════
+
+var _SVC_NAMES = {
+    mb:    '📦 MalwareBazaar',
+    tf:    '🎯 ThreatFox',
+    uh:    '🌐 URLhaus',
+    feodo: '👾 Feodo Tracker'
+};
+
+function huntDetect(val) {
+    val = (val || '').trim();
+    if (!val) return null;
+    if (/^[a-fA-F0-9]{64}$/.test(val)) return {type:'sha256', label:'SHA256',   svcs:['mb','tf']};
+    if (/^[a-fA-F0-9]{40}$/.test(val)) return {type:'sha1',   label:'SHA1',     svcs:['mb','tf']};
+    if (/^[a-fA-F0-9]{32}$/.test(val)) return {type:'md5',    label:'MD5',      svcs:['mb','tf']};
+    if (/^\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?$/.test(val))
+                                        return {type:'ip',     label:'IP 주소',   svcs:['tf','uh','feodo']};
+    if (/^https?:\\/\\//i.test(val))     return {type:'url',    label:'URL',      svcs:['uh','tf']};
+    if (val.indexOf('.') > 0 && !/\\s/.test(val))
+                                        return {type:'domain', label:'도메인',    svcs:['tf','uh']};
+    return null;
+}
+
+function huntInputChanged() {
+    var val = document.getElementById('hunt-q').value;
+    var hint = document.getElementById('hunt-hint');
+    if (!val.trim()) { hint.innerHTML = ''; return; }
+    var d = huntDetect(val);
+    hint.innerHTML = d
+        ? '감지: <span class="hunt-type-tag">' + d.label + '</span> &nbsp;→ '
+          + d.svcs.map(function(s){ return _SVC_NAMES[s]; }).join(' &nbsp; ')
+        : '<span style="color:#ffa657">인식 불가 — SHA256·MD5·IP·도메인·URL 형식으로 입력</span>';
+}
+
+function huntQuick(val) {
+    document.getElementById('hunt-q').value = val;
+    huntInputChanged();
+    huntSearch();
+}
+
+function huntSetSvc(id, state) {
+    var el = document.getElementById('svc-' + id);
+    if (el) el.className = 'svc-badge ' + state;
+}
+
+async function huntSearch() {
+    var val = (document.getElementById('hunt-q').value || '').trim();
+    if (!val) return;
+    var det = huntDetect(val);
+    if (!det) {
+        document.getElementById('hunt-results').innerHTML =
+            '<div class="alert alert-warning">인식할 수 없는 IOC 형식입니다.</div>';
+        return;
+    }
+    var btn = document.getElementById('hunt-go');
+    btn.disabled = true; btn.textContent = '조회 중…';
+
+    ['mb','tf','uh','feodo'].forEach(function(s) {
+        huntSetSvc(s, det.svcs.indexOf(s) >= 0 ? 'loading' : 'idle');
+    });
+    document.getElementById('hunt-results').innerHTML = '';
+
+    var tasks = [];
+    if (det.svcs.indexOf('mb')    >= 0) tasks.push(_huntMB(val, det.type));
+    if (det.svcs.indexOf('tf')    >= 0) tasks.push(_huntTF(val));
+    if (det.svcs.indexOf('uh')    >= 0) tasks.push(_huntUH(val, det.type));
+    if (det.svcs.indexOf('feodo') >= 0) tasks.push(_huntFeodo(val.split(':')[0]));
+
+    var settled = await Promise.allSettled(tasks);
+    var html = settled.map(function(r) {
+        return r.status === 'fulfilled' ? r.value : '';
+    }).join('');
+    document.getElementById('hunt-results').innerHTML = html ||
+        '<div class="hunt-none">모든 서비스에서 결과 없음</div>';
+    btn.disabled = false; btn.textContent = '🔍 Hunt';
+}
+
+// ── 카드 빌더 ──────────────────────────────────────────
+
+function _card(svcKey, cls, badgeHtml, bodyHtml, link) {
+    var linkHtml = link
+        ? '<a href="' + link + '" target="_blank" class="hunt-link">↗ 페이지</a>' : '';
+    return '<div class="hunt-card ' + cls + '">'
+        + '<div class="hunt-card-head">'
+        +   '<span class="hunt-card-title">' + _SVC_NAMES[svcKey] + '</span>'
+        +   '<span>' + badgeHtml + ' ' + linkHtml + '</span>'
+        + '</div>'
+        + '<div class="hunt-card-body">' + bodyHtml + '</div>'
+        + '</div>';
+}
+
+function _errCard(svcKey, err) {
+    var msg = (err && err.message) || '알 수 없는 오류';
+    if (/failed to fetch|networkerror|load failed/i.test(msg))
+        msg = 'API 연결 실패 — 인터넷 연결 또는 CORS 확인 필요';
+    return _card(svcKey, 'error',
+        '<span class="badge badge-gray">오류</span>',
+        '<span class="hunt-none">⚠ ' + msg + '</span>');
+}
+
+function _kv(rows) {
+    return '<table class="hunt-kv"><tbody>'
+        + rows.map(function(r) {
+            return '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>';
+          }).join('')
+        + '</tbody></table>';
+}
+
+function _badge(text, color) {
+    return '<span class="badge badge-' + color + '">' + text + '</span>';
+}
+
+// ── MalwareBazaar ──────────────────────────────────────
+
+async function _huntMB(hash, type) {
+    try {
+        var body = new URLSearchParams();
+        body.append('query', 'get_info');
+        if      (type === 'md5')  body.append('md5_hash',  hash);
+        else if (type === 'sha1') body.append('sha1_hash', hash);
+        else                      body.append('hash',      hash);
+        var r = await fetch('https://mb-api.abuse.ch/api/v1/', {method:'POST', body:body});
+        var d = await r.json();
+        if (d.query_status !== 'hash_found' || !d.data || !d.data.length) {
+            huntSetSvc('mb', 'clean');
+            return _card('mb', 'clean', _badge('미등록','green'),
+                '<span class="hunt-none">MalwareBazaar에 등록된 샘플 없음</span>');
+        }
+        huntSetSvc('mb', 'found');
+        var item = d.data[0];
+        var tags = (item.tags || []).map(function(t) {
+            return '<span class="badge badge-orange">' + t + '</span>';
+        }).join(' ');
+        var vtCount = item.vendor_intel ? Object.keys(item.vendor_intel).length : 0;
+        return _card('mb', 'found', _badge('등록됨','red'),
+            _kv([
+                ['파일명',   item.file_name  || '-'],
+                ['서명',     '<strong>' + (item.signature || '미분류') + '</strong>'],
+                ['파일 유형', item.file_type  || '-'],
+                ['크기',     item.file_size ? item.file_size.toLocaleString() + ' bytes' : '-'],
+                ['태그',     tags ? '<div class="hunt-tags">' + tags + '</div>' : '-'],
+                ['AV 탐지',  vtCount ? vtCount + '개 엔진' : '-'],
+                ['최초 발견', item.first_seen || '-'],
+                ['최종 발견', item.last_seen  || '-'],
+            ]),
+            'https://bazaar.abuse.ch/sample/' + hash + '/');
+    } catch(e) { huntSetSvc('mb', 'error'); return _errCard('mb', e); }
+}
+
+// ── ThreatFox ──────────────────────────────────────────
+
+async function _huntTF(ioc) {
+    try {
+        var r = await fetch('https://threatfox-api.abuse.ch/api/v1/', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({query: 'search_ioc', search_term: ioc})
+        });
+        var d = await r.json();
+        if (d.query_status !== 'ok' || !d.data || !d.data.length) {
+            huntSetSvc('tf', 'clean');
+            return _card('tf', 'clean', _badge('미등록','green'),
+                '<span class="hunt-none">ThreatFox에 등록된 IOC 없음</span>');
+        }
+        huntSetSvc('tf', 'found');
+        var rows = d.data.slice(0, 15).map(function(item) {
+            var conf = item.confidence_level || 0;
+            var cc = conf >= 75 ? 'red' : conf >= 50 ? 'orange' : 'yellow';
+            return '<tr>'
+                + '<td class="mono">' + (item.ioc || '-') + '</td>'
+                + '<td>' + (item.ioc_type || '-') + '</td>'
+                + '<td><strong>' + (item.malware || '-') + '</strong></td>'
+                + '<td>' + _badge(conf + '%', cc) + '</td>'
+                + '<td style="color:#8b949e;font-size:.75rem">' + (item.first_seen || '-') + '</td>'
+                + '</tr>';
+        }).join('');
+        return _card('tf', 'found', _badge(d.data.length + '건', 'red'),
+            '<table><tr><th>IOC</th><th>유형</th><th>악성코드</th><th>신뢰도</th><th>최초 발견</th></tr>'
+            + rows + '</table>',
+            'https://threatfox.abuse.ch/browse.php?search=ioc%3A' + encodeURIComponent(ioc));
+    } catch(e) { huntSetSvc('tf', 'error'); return _errCard('tf', e); }
+}
+
+// ── URLhaus ────────────────────────────────────────────
+
+async function _huntUH(ioc, type) {
+    try {
+        var isURL = (type === 'url');
+        var ep = isURL
+            ? 'https://urlhaus-api.abuse.ch/v1/url/'
+            : 'https://urlhaus-api.abuse.ch/v1/host/';
+        var body = new URLSearchParams();
+        body.append(isURL ? 'url' : 'host', ioc);
+        var r = await fetch(ep, {method:'POST', body:body});
+        var d = await r.json();
+        var notFound = (d.query_status === 'no_results' || d.query_status === 'invalid_url'
+                        || (!isURL && d.query_status !== 'is_host'));
+        if (notFound) {
+            huntSetSvc('uh', 'clean');
+            return _card('uh', 'clean', _badge('미등록','green'),
+                '<span class="hunt-none">URLhaus에 등록된 항목 없음</span>');
+        }
+        huntSetSvc('uh', 'found');
+        var body2 = '';
+        if (!isURL && d.urls && d.urls.length) {
+            var bl = d.blacklists || {};
+            body2 += _kv([
+                ['Spamhaus DBL', bl.spamhaus_dbl || '-'],
+                ['SURBL',        bl.surbl        || '-'],
+            ]);
+            var urows = d.urls.slice(0, 10).map(function(u) {
+                var sc = u.url_status === 'online' ? 'red' : 'gray';
+                return '<tr><td class="mono" style="font-size:.72rem">' + (u.url || '-') + '</td>'
+                    + '<td>' + _badge(u.url_status || '-', sc) + '</td>'
+                    + '<td style="color:#8b949e">' + (u.threat || '-') + '</td></tr>';
+            }).join('');
+            body2 += '<h3 style="margin-top:.7rem">연관 URL (' + d.urls.length + '건)</h3>'
+                + '<table><tr><th>URL</th><th>상태</th><th>위협</th></tr>' + urows + '</table>';
+        } else if (isURL) {
+            var sc2 = d.url_status === 'online' ? 'red' : 'gray';
+            body2 = _kv([
+                ['상태',     _badge(d.url_status || '-', sc2)],
+                ['위협',     d.threat    || '-'],
+                ['호스트',   d.host      || '-'],
+                ['등록일',   d.date_added|| '-'],
+                ['태그',     (d.tags||[]).join(', ') || '-'],
+            ]);
+        }
+        return _card('uh', 'found', _badge('등록됨','red'), body2,
+            'https://urlhaus.abuse.ch/browse.php?search=' + encodeURIComponent(ioc));
+    } catch(e) { huntSetSvc('uh', 'error'); return _errCard('uh', e); }
+}
+
+// ── Feodo Tracker ──────────────────────────────────────
+
+async function _huntFeodo(ip) {
+    try {
+        var r = await fetch('https://feodotracker.abuse.ch/api/v1/host_info/', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({host: ip})
+        });
+        var d = await r.json();
+        if (!d || d.result !== 'known_tracker') {
+            huntSetSvc('feodo', 'clean');
+            return _card('feodo', 'clean', _badge('미등록','green'),
+                '<span class="hunt-none">Feodo Tracker 봇넷 C2 목록에 없음</span>');
+        }
+        huntSetSvc('feodo', 'found');
+        var sc = d.status === 'online' ? 'red' : 'gray';
+        return _card('feodo', 'found', _badge('C2 등록됨','red'),
+            _kv([
+                ['악성코드',  '<strong>' + (d.malware || '-') + '</strong>'],
+                ['상태',      _badge(d.status || '-', sc)],
+                ['국가',      d.country || '-'],
+                ['ASN',       d.asn     || '-'],
+                ['최초 발견', d.first_seen || '-'],
+                ['최종 발견', d.last_seen  || '-'],
+            ]),
+            'https://feodotracker.abuse.ch/browse/host/' + ip + '/');
+    } catch(e) { huntSetSvc('feodo', 'error'); return _errCard('feodo', e); }
+}
 """
 
 _PG_INIT = """<script>
@@ -780,6 +1094,74 @@ def _ioc_html(result) -> str:
     return "\n".join(p for p in parts if p)
 
 
+def _hunt_html(sample_sha256: str, ioc) -> str:
+    """Hunt 탭 — abuse.ch 실시간 조회 UI"""
+    chips: list[str] = []
+
+    # 샘플 SHA256 칩
+    if sample_sha256:
+        short = sample_sha256[:20] + "…"
+        chips.append(
+            f"<span class='hunt-qchip hash' title='{_e(sample_sha256)}' "
+            f"onclick=\"huntQuick('{_e(sample_sha256)}')\">🔑 {_e(short)}</span>"
+        )
+
+    # IOC IP 칩 (최대 8개)
+    for ip in (ioc.ip_addresses[:8] if ioc else []):
+        chips.append(
+            f"<span class='hunt-qchip ip' onclick=\"huntQuick('{_e(ip)}')\">🌐 {_e(ip)}</span>"
+        )
+
+    # IOC 도메인 칩 (최대 6개)
+    for d in (ioc.domains[:6] if ioc else []):
+        chips.append(
+            f"<span class='hunt-qchip domain' onclick=\"huntQuick('{_e(d)}')\">🔗 {_e(d)}</span>"
+        )
+
+    quick_html = ""
+    if chips:
+        quick_html = (
+            "<div class='hunt-quick'>"
+            "<span class='hunt-qlabel'>이번 분석 IOC →</span>"
+            + "".join(chips)
+            + "</div>"
+        )
+
+    return f"""
+<h2>🕵️ Threat Hunt — abuse.ch</h2>
+
+<div class="alert alert-info" style="font-size:.82rem;margin-bottom:1rem">
+  <strong>MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker</strong>
+  를 브라우저에서 직접 조회합니다.
+  인터넷 연결이 필요하며, 격리 VM에서는 네트워크 정책을 확인하세요.
+</div>
+
+<!-- 검색 박스 -->
+<div class="hunt-box">
+  <div class="hunt-row">
+    <input id="hunt-q" class="hunt-input" type="text"
+           placeholder="SHA256 · MD5 · IP 주소 · 도메인 · URL …"
+           oninput="huntInputChanged()"
+           onkeydown="if(event.key==='Enter')huntSearch()">
+    <button id="hunt-go" class="hunt-btn" onclick="huntSearch()">🔍 Hunt</button>
+  </div>
+  <div id="hunt-hint" class="hunt-hint"></div>
+  {quick_html}
+</div>
+
+<!-- 서비스 상태 배지 -->
+<div class="hunt-svcs">
+  <span id="svc-mb"    class="svc-badge idle">📦 MalwareBazaar</span>
+  <span id="svc-tf"    class="svc-badge idle">🎯 ThreatFox</span>
+  <span id="svc-uh"    class="svc-badge idle">🌐 URLhaus</span>
+  <span id="svc-feodo" class="svc-badge idle">👾 Feodo Tracker</span>
+</div>
+
+<!-- 결과 영역 -->
+<div id="hunt-results"></div>
+"""
+
+
 def generate_html_report(result, output_path: str) -> None:
     """AnalysisResult → HTML 파일 저장"""
     generated   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -816,6 +1198,16 @@ def generate_html_report(result, output_path: str) -> None:
         f"{_b('✔ ' + k, 'green') if v else _b('✘ ' + k, 'gray')}"
         for k, v in result.tools_used.items()
     )
+
+    # ── 샘플 SHA256 (Hunt 탭 빠른 조회용) ───────────────────────────
+    sample_sha256 = ""
+    if result.config.sample_path:
+        try:
+            sample_sha256 = hashlib.sha256(
+                Path(result.config.sample_path).read_bytes()
+            ).hexdigest()
+        except Exception:
+            pass
 
     # ── 탭 배지 ──────────────────────────────────────────────────
     tab1_b = _tb(tech_count, "red"    if tech_count else "gray") if tech_count else ""
@@ -873,6 +1265,9 @@ def generate_html_report(result, output_path: str) -> None:
   </button>
   <button class="tab-btn" data-tab="tab-ioc">
     🔍 IOC{tab5_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-hunt">
+    🕵️ Hunt
   </button>
 </div>
 
@@ -946,6 +1341,11 @@ def generate_html_report(result, output_path: str) -> None:
   <h2>💀 IOC 목록</h2>
   {_ioc_html(result)}
 
+</div>
+
+<!-- ══════════ 탭 6: Hunt ══════════ -->
+<div id="tab-hunt" class="tab-panel">
+  {_hunt_html(sample_sha256, ioc)}
 </div>
 
 </div>
