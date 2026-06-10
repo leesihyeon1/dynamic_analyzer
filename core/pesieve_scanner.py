@@ -25,6 +25,7 @@ from pathlib import Path
 
 
 _SEARCH_DIRS: list[Path] = [
+    Path(r"C:\Users\BUILD_SVC\Desktop\Tools"),  # 분석 VM
     Path(r"C:\Tools\pe-sieve"),
     Path(r"C:\Tools"),
     Path(r"C:\Analysis"),

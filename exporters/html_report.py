@@ -54,6 +54,12 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .pg-btn:hover{background:#30363d}
 .pg-active{background:#1f6feb!important;color:#fff!important;border-color:#1f6feb!important}
 .pg-ellipsis{color:#8b949e;padding:0 .2rem;line-height:2;font-size:.78rem}
+.srch-wrap{margin:.5rem 0 .35rem}
+.srch-input{background:#0d1117;border:1px solid #30363d;border-radius:6px;
+            color:#e6edf3;font-size:.82rem;padding:.32rem .65rem;
+            width:min(100%,360px);outline:none;transition:border-color .15s}
+.srch-input:focus{border-color:#58a6ff}
+.srch-input::placeholder{color:#484f58}
 .tabs{display:flex;gap:0;border-bottom:1px solid #30363d;margin-bottom:1.5rem;overflow-x:auto;}
 .tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:#8b949e;
          padding:.6rem 1.1rem;cursor:pointer;font-size:.85rem;white-space:nowrap;transition:color .15s;}
@@ -73,60 +79,96 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 """
 
 _JS = """
-function setupPagination(tableId, rowsPerPage) {
+function setupTableControls(tableId, rowsPerPage) {
     var table = document.getElementById(tableId);
     if (!table) return;
-    var allRows = Array.prototype.slice.call(table.rows, 1); // skip header
-    var total = allRows.length;
-    if (total <= rowsPerPage) return;
-    var totalPages = Math.ceil(total / rowsPerPage);
+    var allRows = Array.prototype.slice.call(table.rows, 1);
+    if (allRows.length === 0) return;
+
+    // 검색바 삽입
+    var sw = document.createElement('div');
+    sw.className = 'srch-wrap';
+    var inp = document.createElement('input');
+    inp.type = 'text';
+    inp.className = 'srch-input';
+    inp.placeholder = '행 검색…';
+    sw.appendChild(inp);
+    table.parentNode.insertBefore(sw, table);
+
+    // 페이지네이션 컨테이너
+    var pgDiv = document.createElement('div');
+    pgDiv.className = 'pg-wrap';
+    table.parentNode.insertBefore(pgDiv, table.nextSibling);
+
     var cur = 1;
-    var wrapper = document.createElement('div');
-    wrapper.className = 'pg-wrap';
-    table.parentNode.insertBefore(wrapper, table.nextSibling);
-    function render(page) {
+    var filtered = allRows.slice();
+
+    function renderPage(page) {
         cur = page;
-        allRows.forEach(function(row, i) {
-            row.style.display = (i >= (page-1)*rowsPerPage && i < page*rowsPerPage) ? '' : 'none';
-        });
-        var start = (page-1)*rowsPerPage + 1;
-        var end = Math.min(page*rowsPerPage, total);
-        wrapper.innerHTML = '';
+        var total = filtered.length;
+        var rpp = rowsPerPage > 0 ? rowsPerPage : total;
+        var totalPages = Math.max(1, Math.ceil(total / rpp));
+        if (cur > totalPages) cur = totalPages;
+
+        allRows.forEach(function(r) { r.style.display = 'none'; });
+        var start = (cur - 1) * rpp;
+        filtered.slice(start, start + rpp).forEach(function(r) { r.style.display = ''; });
+
+        pgDiv.innerHTML = '';
         var info = document.createElement('span');
         info.className = 'pg-info';
-        info.textContent = start + '–' + end + ' / 중 ' + total + '행';
-        wrapper.appendChild(info);
-        var btns = document.createElement('span');
-        btns.className = 'pg-btns';
-        function mkBtn(p, label, active) {
-            var b = document.createElement('button');
-            b.textContent = label !== undefined ? label : p;
-            b.className = 'pg-btn' + (active ? ' pg-active' : '');
-            b.onclick = function(){ render(p); };
-            btns.appendChild(b);
+        var q = inp.value.trim();
+        if (q) {
+            info.textContent = total + '건 일치 (전체 ' + allRows.length + '행)';
+        } else if (total === 0) {
+            info.textContent = '0행';
+        } else if (total <= rpp) {
+            info.textContent = total + '행';
+        } else {
+            info.textContent = (start + 1) + '–' + Math.min(start + rpp, total) + ' / ' + total + '행';
         }
-        function mkEll() {
-            var s = document.createElement('span');
-            s.className = 'pg-ellipsis';
-            s.textContent = '…';
-            btns.appendChild(s);
+        pgDiv.appendChild(info);
+
+        if (total > rpp) {
+            var btns = document.createElement('span');
+            btns.className = 'pg-btns';
+            function mkBtn(p, label, active) {
+                var b = document.createElement('button');
+                b.textContent = label !== undefined ? label : p;
+                b.className = 'pg-btn' + (active ? ' pg-active' : '');
+                b.onclick = function() { renderPage(p); };
+                btns.appendChild(b);
+            }
+            function mkEll() {
+                var s = document.createElement('span');
+                s.className = 'pg-ellipsis'; s.textContent = '…';
+                btns.appendChild(s);
+            }
+            if (cur > 1) mkBtn(cur - 1, '‹');
+            var pages = [1];
+            for (var p = Math.max(2, cur - 2); p <= Math.min(totalPages - 1, cur + 2); p++) pages.push(p);
+            if (totalPages > 1) pages.push(totalPages);
+            pages = pages.filter(function(v, i, a) { return a.indexOf(v) === i; });
+            var last = 0;
+            pages.forEach(function(p) {
+                if (p - last > 1) mkEll();
+                mkBtn(p, p, p === cur);
+                last = p;
+            });
+            if (cur < totalPages) mkBtn(cur + 1, '›');
+            pgDiv.appendChild(btns);
         }
-        if (page > 1) mkBtn(page-1, '‹');
-        var pages = [1];
-        for (var p = Math.max(2, page-2); p <= Math.min(totalPages-1, page+2); p++) pages.push(p);
-        if (totalPages > 1) pages.push(totalPages);
-        // deduplicate
-        pages = pages.filter(function(v,i,a){ return a.indexOf(v) === i; });
-        var last = 0;
-        pages.forEach(function(p) {
-            if (p - last > 1) mkEll();
-            mkBtn(p, p, p === cur);
-            last = p;
-        });
-        if (page < totalPages) mkBtn(page+1, '›');
-        wrapper.appendChild(btns);
     }
-    render(1);
+
+    inp.addEventListener('input', function() {
+        var q = inp.value.toLowerCase();
+        filtered = q ? allRows.filter(function(r) {
+            return r.textContent.toLowerCase().indexOf(q) !== -1;
+        }) : allRows.slice();
+        renderPage(1);
+    });
+
+    renderPage(1);
 }
 document.addEventListener('DOMContentLoaded', function () {
     var btns   = document.querySelectorAll('.tab-btn');
@@ -144,19 +186,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
 _PG_INIT = """<script>
 window.addEventListener('load', function() {
-  setupPagination('tbl-file', 100);
-  setupPagination('tbl-reg-diff', 100);
-  setupPagination('tbl-reg-procmon', 100);
-  setupPagination('tbl-net-beacon', 100);
-  setupPagination('tbl-net-tls', 100);
-  setupPagination('tbl-net-conn', 100);
-  setupPagination('tbl-net-dns', 100);
-  setupPagination('tbl-net-http', 100);
-  setupPagination('tbl-ioc-ip', 100);
-  setupPagination('tbl-ioc-domain', 100);
-  setupPagination('tbl-ioc-file', 100);
-  setupPagination('tbl-ioc-reg', 100);
-  setupPagination('tbl-ioc-url', 100);
+  var tbls = [
+    'tbl-mitre','tbl-process',
+    'tbl-file',
+    'tbl-reg-diff','tbl-reg-procmon',
+    'tbl-net-beacon','tbl-net-tls','tbl-net-conn',
+    'tbl-net-dga','tbl-net-dns','tbl-net-http',
+    'tbl-net-smtp','tbl-net-ftp',
+    'tbl-ioc-ip','tbl-ioc-domain','tbl-ioc-file','tbl-ioc-reg','tbl-ioc-url'
+  ];
+  tbls.forEach(function(id) { setupTableControls(id, 100); });
 });
 </script>"""
 
@@ -205,7 +244,7 @@ def _section_html(result) -> str:
             f"</tr>"
         )
     return (
-        "<table><tr><th>ID</th><th>기법</th><th>전술</th><th>근거 (최대 5건)</th></tr>"
+        "<table id='tbl-mitre'><tr><th>ID</th><th>기법</th><th>전술</th><th>근거 (최대 5건)</th></tr>"
         f"{rows}</table>"
     )
 
@@ -366,7 +405,7 @@ def _network_html(result) -> str:
         )
         parts.append(
             "<h3>⚠ DGA / 고엔트로피 도메인</h3>"
-            f"<table><tr><th>도메인</th></tr>{rows}</table>"
+            f"<table id='tbl-net-dga'><tr><th>도메인</th></tr>{rows}</table>"
         )
 
     # ── 연결 목록 ──────────────────────────────────────────────
@@ -478,7 +517,7 @@ def _network_html(result) -> str:
             )
         parts.append(
             "<h3 style='color:#ff7b72'>🚨 SMTP C2 세션</h3>"
-            "<table><tr><th>C2 서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
+            "<table id='tbl-net-smtp'><tr><th>C2 서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
             "<th>발신자 (MAIL FROM)</th><th>수신자 (RCPT TO)</th>"
             "<th>AUTH 사용자명</th><th>플래그</th></tr>"
             f"{rows}</table>"
@@ -502,7 +541,7 @@ def _network_html(result) -> str:
             )
         parts.append(
             "<h3 style='color:#ff7b72'>🚨 FTP C2 세션</h3>"
-            "<table><tr><th>C2 서버 IP</th><th>포트</th><th>사용자명</th>"
+            "<table id='tbl-net-ftp'><tr><th>C2 서버 IP</th><th>포트</th><th>사용자명</th>"
             "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th></tr>"
             f"{rows}</table>"
         )
@@ -567,7 +606,7 @@ def _process_html(result) -> str:
             f"</tr>"
         )
     return (
-        "<table><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
+        "<table id='tbl-process'><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
         f"{rows}</table>"
     )
 

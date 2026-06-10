@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 _SEARCH_DIRS: list[Path] = [
+    Path(r"C:\Users\BUILD_SVC\Desktop\Tools"),  # 분석 VM
     Path(r"C:\Tools\hollows_hunter"),
     Path(r"C:\Tools"),
     Path(r"C:\Analysis"),

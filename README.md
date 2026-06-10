@@ -1,7 +1,7 @@
 # dynamic_analyzer
 
 Windows 악성코드 동적 분석 자동화 도구.  
-ProcMon · tshark · winreg · psutil 을 조합해 **Noriben.py** 스타일로 동작하며,  
+ProcMon · tshark · pe-sieve · psutil 을 조합해 **Noriben.py** 스타일로 동작하며,  
 실행 한 줄로 샘플 모니터링 → MITRE ATT&CK 매핑 → HTML/JSON 리포트까지 자동 생성합니다.
 
 ---
@@ -14,13 +14,16 @@ ProcMon · tshark · winreg · psutil 을 조합해 **Noriben.py** 스타일로 
 | **패킷 캡처** | tshark로 pcap 수집, scapy/tshark로 연결/DNS/TLS SNI/HTTP 분석 |
 | **외부 PCAP 분석** | `--pcap` 옵션으로 Wireshark 캡처 파일 직접 분석 |
 | **scapy 없이 PCAP 분석** | scapy 미설치 시 tshark fallback 파서로 자동 대체 |
+| **SMTP/FTP C2 분석** | AgentTesla 류 정보탈취 악성코드의 메일·FTP 탈취 통신 자동 파싱 |
 | **레지스트리 diff** | 실행 전·후 winreg 스냅샷 비교 (Regshot 대체) |
 | **프로세스 추적** | psutil로 자식 PID 추적, 신규/종료 프로세스 감지 |
+| **실시간 프로세스 감시** | 1초 폴링으로 신규 PID 즉시 pe-sieve 스캔 (타이밍 문제 해소) |
+| **pe-sieve / hollows-hunter** | 프로세스 인젝션·PE 할로잉·쉘코드 삽입 탐지, raw dump 자동 추출 |
 | **프로세스↔네트워크 매핑** | ProcMon TCP/UDP 이벤트 기반, 프로세스별 외부 연결 집계 |
 | **노이즈 필터** | 시스템 프로세스 + 분석 도구(ProcMon·tshark·SystemInformer 등) 이벤트 자동 제거 |
 | **MITRE ATT&CK** | 행동 패턴 → 기법 자동 매핑 (T1059, T1547, T1486 등) |
-| **IOC 추출** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL |
-| **리포트 생성** | 다크 테마 HTML(페이지네이션 지원) + 구조화된 JSON |
+| **IOC 추출** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL (SMTP/FTP C2 IP 포함) |
+| **리포트 생성** | 다크 테마 HTML(검색바 + 페이지네이션) + 구조화된 JSON, 분석 완료 후 자동 열기 |
 
 ---
 
@@ -48,6 +51,8 @@ rich>=13.7.0
 | **ProcMon** (`Procmon64.exe`) | `C:\Tools\SysinternalsSuite\` 또는 PATH | ProcMon 기능 스킵 |
 | **tshark** (Wireshark 포함) | `C:\Program Files\Wireshark\` 또는 PATH | 패킷 캡처 스킵 |
 | **Process Hacker** / **System Informer** | `C:\Tools\processhacker\` | psutil로 대체 |
+| **pe-sieve** (`pe-sieve64.exe`) | `C:\Tools\pe-sieve\` 또는 PATH | 인젝션/쉘코드 탐지 스킵 |
+| **hollows_hunter** (`hollows_hunter64.exe`) | `C:\Tools\hollows_hunter\` 또는 PATH | 전체 시스템 스캔 스킵 |
 
 ---
 
@@ -81,6 +86,9 @@ python analyzer.py malware.exe --no-ph
 
 # 파일 저장 없이 콘솔 출력만
 python analyzer.py malware.exe --no-export
+
+# 분석 완료 후 HTML 리포트 자동 열기 비활성화
+python analyzer.py malware.exe --no-open
 ```
 
 ### PCAP 분석
@@ -126,27 +134,31 @@ python analyzer.py malware.exe
         │
         ▼
 [4/6] 대기              5초 간격 폴링, 샘플 조기 종료 감지
+                        ProcessWatcher: 1초 폴링으로 신규 PID 즉시 pe-sieve 스캔
         │
         ▼
 [5/6] 종료              ProcMon /Terminate → PML → CSV 변환
                         tshark 종료 → pcap 저장
                         Process Hacker / SystemInformer 종료
+                        hollows_hunter 전체 시스템 스캔
+                        pe-sieve 신규 프로세스 스캔 (잔존 PID 대상)
         │
         ▼
 [6/6] 분석              사후 스냅샷 → 레지스트리·프로세스 diff
                         ProcMon CSV 파싱 + 노이즈 필터
-                        PCAP 파싱 (연결, DNS, TLS SNI, HTTP)
+                        PCAP 파싱 (연결, DNS, TLS SNI, HTTP, SMTP, FTP)
                         프로세스↔네트워크 연결 매핑
                         MITRE ATT&CK 매핑
-                        IOC 추출
+                        IOC 추출 (SMTP/FTP C2 IP 포함)
         │
         ▼
       리포트             results/<이름>_<timestamp>/
-                          ├── <name>_dynamic_report.html
+                          ├── <name>_dynamic_report.html   ← 완료 후 자동 열기
                           ├── <name>_dynamic_report.json
                           ├── procmon.pml
                           ├── procmon.csv
-                          └── capture.pcap
+                          ├── capture.pcap
+                          └── pe_dumps/                    ← pe-sieve raw dump
 ```
 
 ---
@@ -204,7 +216,7 @@ python analyzer.py malware.exe
 
 ```
 dynamic_analyzer/
-├── analyzer.py               # CLI 진입점
+├── analyzer.py               # CLI 진입점 (--no-open 옵션 포함)
 ├── requirements.txt
 ├── README.md
 │
@@ -213,20 +225,21 @@ dynamic_analyzer/
 │   ├── procmon.py            # ProcMon 제어 (시작/종료/CSV 변환)
 │   ├── tshark_capture.py     # tshark 패킷 캡처
 │   ├── registry_snapshot.py  # winreg 스냅샷 + diff
-│   └── process_tracker.py    # psutil 프로세스 추적 + 분석 도구 필터
+│   ├── process_tracker.py    # psutil 프로세스 추적 + 분석 도구 필터
+│   └── process_watcher.py    # 실시간 신규 PID 감지 + 즉시 pe-sieve 스캔 (신규)
 │
 ├── parsers/
 │   ├── procmon_csv.py        # ProcMon CSV → ProcMonEvent 파싱
-│   └── pcap_parser.py        # PCAP → 연결/DNS/TLS SNI/HTTP (scapy 또는 tshark fallback)
+│   └── pcap_parser.py        # PCAP → 연결/DNS/TLS SNI/HTTP/SMTP/FTP
 │
 ├── analysis/
 │   ├── noise_filter.py       # 시스템·분석 도구 노이즈 제거
 │   ├── behavior_classifier.py # MITRE ATT&CK 매핑
-│   ├── ioc_extractor.py      # IOC 추출
-│   └── process_network_map.py # 프로세스↔네트워크 연결 매핑 (신규)
+│   ├── ioc_extractor.py      # IOC 추출 (SMTP/FTP C2 IP 포함)
+│   └── process_network_map.py # 프로세스↔네트워크 연결 매핑
 │
 └── exporters/
-    ├── html_report.py        # 다크 테마 HTML 리포트 (페이지네이션)
+    ├── html_report.py        # 다크 테마 HTML 리포트 (검색바 + 페이지네이션)
     └── json_report.py        # 구조화 JSON 저장
 ```
 
@@ -251,13 +264,43 @@ dynamic_analyzer/
 | T1486 | Data Encrypted for Impact | Impact |
 | T1490 | Inhibit System Recovery | Impact |
 | T1071.001 | Web Protocols (HTTP/S) | Command and Control |
+| T1071.002 | File Transfer Protocols (FTP) | Command and Control |
+| T1071.003 | Mail Protocols (SMTP) | Command and Control |
 | T1071.004 | DNS | Command and Control |
 | T1095 | Non-Application Layer Protocol | Command and Control |
 | T1041 | Exfiltration Over C2 Channel | Exfiltration |
+| T1114 | Email Collection (SMTP 탈취) | Collection |
 
 ---
 
 ## 변경 이력
+
+### v1.4 — pe-sieve 통합 · SMTP/FTP C2 분석 · HTML 검색바
+
+- **pe-sieve / hollows-hunter 통합**
+  - 모니터링 중 `ProcessWatcher` (`core/process_watcher.py` 신규): 1초 폴링으로 신규 PID를 즉시 pe-sieve 스캔  
+    → 로더 프로세스처럼 수초 내 사라지는 단명 프로세스도 탐지 가능
+  - hollows_hunter 전체 시스템 스캔 (`/dmode 3`) + pe-sieve 신규 프로세스 개별 스캔 병행
+  - 분석 종료 후 살아있는 신규 PID 재스캔 (`proc_after pass`)
+  - HTML 리포트 **인젝션·쉘코드** 탭: PE 할로잉(`implanted_pe`) + 쉘코드(`implanted_shc`) + 훅 모두 포함한 올바른 의심 프로세스 수 집계 (이전에 `implanted_shc`만 계산하던 버그 수정)
+  - PE 인젝션 건수(`PE인젝션 N개`) 별도 표기
+
+- **SMTP/FTP C2 통신 분석** (`parsers/pcap_parser.py`)
+  - AgentTesla, FormBook 등 정보탈취 악성코드의 SMTP(25/465/587/2525) · FTP(21/2121) 세션 자동 파싱
+  - SMTP: EHLO 도메인, MAIL FROM, RCPT TO, AUTH LOGIN base64 사용자명 추출
+  - FTP: USER/PASS 인증 + STOR(업로드) / RETR(다운로드) 파일 목록 추출
+  - HTML 리포트 네트워크 탭에 **SMTP C2 세션**, **FTP C2 세션** 전용 테이블 추가
+  - `ioc_extractor.py`: SMTP/FTP C2 서버 IP 자동 IOC 등록
+
+- **분석 완료 후 HTML 자동 열기** (`analyzer.py`)
+  - 분석 종료 시 `os.startfile()`로 기본 브라우저에서 리포트 자동 오픈
+  - `--no-open` 플래그로 비활성화 가능
+
+- **HTML 리포트 전 탭 검색바 + 페이지네이션 개선** (`exporters/html_report.py`)
+  - 모든 테이블 위에 검색바(`.srch-input`) 자동 삽입 — 입력 즉시 행 실시간 필터링
+  - 페이지네이션은 검색 결과 기준으로 동작 (검색 없을 때: `X–Y / Z행`, 있을 때: `N건 일치 (전체 M행)`)
+  - 신규 테이블 ID 추가: `tbl-mitre`, `tbl-process`, `tbl-net-dga`, `tbl-net-smtp`, `tbl-net-ftp`
+  - `setupPagination` → `setupTableControls`로 통합 (하위 호환 포함)
 
 ### v1.3 — 프로세스↔네트워크 매핑 · 노이즈 필터 강화
 
