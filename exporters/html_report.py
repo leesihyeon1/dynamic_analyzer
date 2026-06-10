@@ -558,6 +558,19 @@ def _tb(val, color: str = "gray") -> str:
         return ""
     return f'<span class="tbadge tbadge-{color}">{_html.escape(str(val))}</span>'
 
+def _trunc_notice(total: int, shown: int) -> str:
+    """total > shown 일 때 잘림 안내 배너를 반환합니다."""
+    if total <= shown:
+        return ""
+    return (
+        f"<p class='alert alert-info' "
+        f"style='font-size:.8rem;padding:.45rem .85rem;margin-bottom:.55rem'>"
+        f"📋 총 <strong>{total:,}건</strong> 중 <strong>{shown:,}건</strong>만 표시됩니다"
+        f" &nbsp;—&nbsp; 전체 데이터는 <code>_dynamic_report.json</code>을 확인하세요."
+        f"</p>"
+    )
+
+
 def _section_html(result) -> str:
     """MITRE ATT&CK 기법 테이블"""
     techs = result.behavior_report.techniques if result.behavior_report else []
@@ -586,17 +599,22 @@ def _section_html(result) -> str:
     )
 
 
-def _file_events_html(result) -> str:
+_FILE_OPS = ("WriteFile", "DeleteFile", "RenameFile", "SetEndOfFile")
+_FILE_LIMIT = 2000
+
+def _file_events_html(result) -> tuple[str, int]:
+    """(HTML 문자열, 실제 이벤트 총 개수) 반환."""
     from parsers.procmon_csv import EventCategory
     # CreateFile 제외 — Windows에서 CreateFile은 파일 열기(읽기)도 포함하므로
     # 실제 쓰기/변경 작업(WriteFile, DeleteFile, RenameFile, SetEndOfFile)만 표시
     events = [e for e in result.filtered_events if e.category == EventCategory.FILE
-              and e.operation in ("WriteFile","DeleteFile","RenameFile","SetEndOfFile")]
+              and e.operation in _FILE_OPS]
+    total = len(events)
     if not events:
-        return "<p class='alert alert-success'>파일 시스템 이벤트 없음</p>"
+        return "<p class='alert alert-success'>파일 시스템 이벤트 없음</p>", 0
     rows = ""
     op_color = {"WriteFile":"blue","DeleteFile":"red","RenameFile":"yellow","SetEndOfFile":"gray"}
-    for e in events[:2000]:
+    for e in events[:_FILE_LIMIT]:
         rows += (
             f"<tr>"
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
@@ -606,10 +624,12 @@ def _file_events_html(result) -> str:
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
             f"</tr>"
         )
-    return (
-        "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
-        f"{rows}</table>"
+    html = (
+        _trunc_notice(total, _FILE_LIMIT)
+        + "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
+        + rows + "</table>"
     )
+    return html, total
 
 
 def _registry_events_html(result) -> str:
@@ -622,29 +642,34 @@ def _registry_events_html(result) -> str:
 
     parts = []
 
+    _REG_DIFF_LIMIT = 500
+    _REG_EV_LIMIT   = 1000
+
     # RegShot diff
     if added or modified:
+        total_diff = len(added) + len(modified)
         rows = ""
-        for k, n, v in added[:500]:
+        for k, n, v in added[:_REG_DIFF_LIMIT]:
             rows += (f"<tr><td>{_b('추가','green')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td></tr>")
-        for k, n, o, nw in modified[:500]:
+        for k, n, o, nw in modified[:_REG_DIFF_LIMIT]:
             rows += (f"<tr><td>{_b('변경','orange')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td></tr>")
         parts.append(
             "<h3>레지스트리 스냅샷 비교 (Regshot)</h3>"
-            "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th></tr>"
-            f"{rows}</table>"
+            + _trunc_notice(total_diff, _REG_DIFF_LIMIT)
+            + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th></tr>"
+            + f"{rows}</table>"
         )
 
     # ProcMon 이벤트
     if events:
         rows = ""
-        for e in events[:1000]:
+        for e in events[:_REG_EV_LIMIT]:
             rows += (
                 f"<tr>"
                 f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
@@ -656,8 +681,9 @@ def _registry_events_html(result) -> str:
             )
         parts.append(
             "<h3>ProcMon 레지스트리 이벤트</h3>"
-            "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th></tr>"
-            f"{rows}</table>"
+            + _trunc_notice(len(events), _REG_EV_LIMIT)
+            + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th></tr>"
+            + f"{rows}</table>"
         )
 
     return "\n".join(parts) if parts else "<p class='alert alert-success'>레지스트리 변경 없음</p>"
@@ -719,18 +745,21 @@ def _network_html(result) -> str:
         for t in tls_list:
             if t.sni not in seen:
                 seen[t.sni] = t
+        _TLS_LIMIT = 500
+        seen_vals  = list(seen.values())
         rows = "".join(
             f"<tr>"
             f"<td class='mono ev-network'>{_e(t.sni)}</td>"
             f"<td class='mono'>{_e(t.dst_ip)}</td>"
             f"<td class='mono'>{t.dst_port}</td>"
             f"</tr>"
-            for t in list(seen.values())[:500]
+            for t in seen_vals[:_TLS_LIMIT]
         )
         parts.append(
             "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
-            "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th></tr>"
-            f"{rows}</table>"
+            + _trunc_notice(len(seen_vals), _TLS_LIMIT)
+            + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th></tr>"
+            + f"{rows}</table>"
         )
 
     # ── DGA / 의심 도메인 ──────────────────────────────────────
@@ -747,6 +776,7 @@ def _network_html(result) -> str:
 
     # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
+        _CONN_LIMIT = 1000
         # 프로세스-네트워크 매핑 룩업 테이블: (proto, dst_ip, dst_port) → 프로세스 목록
         pnmap = getattr(result, "process_network_map", [])
         proc_lookup: dict[tuple, list[str]] = {}
@@ -758,8 +788,9 @@ def _network_html(result) -> str:
             if label not in proc_lookup[key]:
                 proc_lookup[key].append(label)
 
+        sorted_conns = sorted(pcap.connections, key=lambda x: -x.bytes_out)
         rows = ""
-        for c in sorted(pcap.connections, key=lambda x: -x.bytes_out)[:1000]:
+        for c in sorted_conns[:_CONN_LIMIT]:
             ext = not _is_private_ip_str(c.dst_ip)
             ip_color = "ev-network" if ext else ""
             susp_badge = _b("!", "red") if c.suspicious_port else ""
@@ -788,13 +819,16 @@ def _network_html(result) -> str:
             )
         parts.append(
             "<h3>네트워크 연결 (송신량 순)</h3>"
-            "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
+            + _trunc_notice(len(pcap.connections), _CONN_LIMIT)
+            + "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
             "<th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
-            f"{rows}</table>"
+            + f"{rows}</table>"
         )
 
     # ── DNS 쿼리 ───────────────────────────────────────────────
     if pcap.dns_queries:
+        _DNS_LIMIT   = 1000
+        sorted_dns   = sorted(pcap.dns_queries, key=lambda x: -x.entropy)
         rows = "".join(
             f"<tr>"
             f"<td class='mono {'ev-network' if not q.suspicious else ''}"
@@ -805,17 +839,19 @@ def _network_html(result) -> str:
             f"{_e(', '.join(q.response_ips[:3]))}</td>"
             f"{'<td>' + _b('DGA?','red') + '</td>' if q.suspicious else '<td></td>'}"
             f"</tr>"
-            for q in sorted(pcap.dns_queries, key=lambda x: -x.entropy)[:1000]
+            for q in sorted_dns[:_DNS_LIMIT]
         )
         parts.append(
             "<h3>DNS 쿼리 (엔트로피 순)</h3>"
-            "<table id='tbl-net-dns'><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
+            + _trunc_notice(len(pcap.dns_queries), _DNS_LIMIT)
+            + "<table id='tbl-net-dns'><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
             "<th>응답 IP</th><th>의심</th></tr>"
-            f"{rows}</table>"
+            + f"{rows}</table>"
         )
 
     # ── HTTP 요청 ──────────────────────────────────────────────
     if pcap.http_requests:
+        _HTTP_LIMIT = 500
         rows = "".join(
             f"<tr>"
             f"<td>{_b(r.method,'orange')}</td>"
@@ -825,13 +861,14 @@ def _network_html(result) -> str:
             f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
             f"<td>{'🍪' if r.has_cookie else ''}</td>"
             f"</tr>"
-            for r in pcap.http_requests[:500]
+            for r in pcap.http_requests[:_HTTP_LIMIT]
         )
         parts.append(
             "<h3>HTTP 요청</h3>"
-            "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
+            + _trunc_notice(len(pcap.http_requests), _HTTP_LIMIT)
+            + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
             "<th>User-Agent</th><th>Body</th><th>Cookie</th></tr>"
-            f"{rows}</table>"
+            + f"{rows}</table>"
         )
 
     # ── SMTP C2 세션 (AgentTesla 등 자격증명 탈취 악성코드) ─────────
@@ -1105,12 +1142,18 @@ def _ioc_html(result) -> str:
         return ""
     parts = []
 
+    _IOC_LIMIT = 1000
+
     def _list_table(title: str, items: list, label: str, table_id: str = "") -> str:
         if not items:
             return ""
         id_attr = f" id='{table_id}'" if table_id else ""
-        rows = "".join(f"<tr><td class='mono'>{_e(str(i))}</td></tr>" for i in items[:1000])
-        return f"<h3>{title}</h3><table{id_attr}><tr><th>{label}</th></tr>{rows}</table>"
+        rows = "".join(f"<tr><td class='mono'>{_e(str(i))}</td></tr>" for i in items[:_IOC_LIMIT])
+        return (
+            f"<h3>{title}</h3>"
+            + _trunc_notice(len(items), _IOC_LIMIT)
+            + f"<table{id_attr}><tr><th>{label}</th></tr>{rows}</table>"
+        )
 
     parts.append(_list_table("외부 IP", ioc.ip_addresses, "IP 주소", "tbl-ioc-ip"))
     parts.append(_list_table("도메인", ioc.domains, "도메인", "tbl-ioc-domain"))
@@ -1254,6 +1297,16 @@ def generate_html_report(result, output_path: str) -> None:
     file_count = len(ioc.dropped_files) if ioc else 0
     reg_added  = len(result.registry_diff.get("added",    []))
     reg_mod    = len(result.registry_diff.get("modified", []))
+
+    # 파일시스템 탭 배지: ioc.dropped_files 가 아닌 실제 ProcMon 파일 이벤트 수
+    try:
+        from parsers.procmon_csv import EventCategory as _EC
+        file_ev_count = sum(
+            1 for e in result.filtered_events
+            if e.category == _EC.FILE and e.operation in _FILE_OPS
+        )
+    except Exception:
+        file_ev_count = 0
     conn_count = len(result.pcap_result.connections)  if result.pcap_result else 0
     dns_count  = len(result.pcap_result.dns_queries)  if result.pcap_result else 0
     ioc_total  = (ip_count + (len(ioc.domains) if ioc else 0)
@@ -1285,7 +1338,7 @@ def generate_html_report(result, output_path: str) -> None:
     tab1_b    = ""   # 기본 분석: 개요만 (배지 없음)
     tab_att_b = _tb(tech_count,  "red"    if tech_count  else "gray") if tech_count  else ""
     tab_proc_b= _tb(proc_count,  "orange" if proc_count  else "gray") if proc_count  else ""
-    tab2_b    = _tb(file_count,  "blue"   if file_count  else "gray") if file_count  else ""
+    tab2_b    = _tb(file_ev_count, "blue" if file_ev_count else "gray") if file_ev_count else ""
     tab3_b    = _tb(reg_added + reg_mod,
                     "yellow" if (reg_added + reg_mod) else "gray") if (reg_added + reg_mod) else ""
     tab4_b    = _tb(conn_count,  "green"  if conn_count  else "gray") if conn_count  else ""
@@ -1401,7 +1454,7 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-filesystem" class="tab-panel">
 
   <h2>📂 파일 시스템 활동 (ProcMon)</h2>
-  {_file_events_html(result)}
+  {_file_events_html(result)[0]}
 
 </div>
 
