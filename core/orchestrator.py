@@ -22,6 +22,82 @@ from pathlib import Path
 from typing import Callable, Optional
 
 
+def _kill_analysis_tool(
+    proc,
+    exe_names: list,
+    status,
+    label: str = "분석 도구",
+) -> None:
+    """
+    GUI 분석 도구를 3단계로 확실하게 종료합니다.
+
+    1. Popen 핸들로 terminate → kill
+       (UAC self-elevate 케이스에서는 핸들이 이미 죽어있을 수 있음)
+    2. psutil 프로세스 이름 검색 → kill
+       (실제 실행 중인 프로세스를 이름으로 찾아 종료)
+    3. taskkill /F /IM 폴백
+       (psutil 도 없거나 권한 문제일 때)
+    """
+    import subprocess as _sp
+
+    killed_via_handle = False
+
+    # ── Step 1: Popen 핸들 ─────────────────────────────────────────
+    if proc is not None:
+        try:
+            if proc.poll() is None:          # 아직 살아있을 때만
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                    killed_via_handle = True
+                except Exception:
+                    try:
+                        proc.kill()
+                        killed_via_handle = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # ── Step 2: psutil 이름 검색 ───────────────────────────────────
+    names_lower = {n.lower() for n in exe_names}
+    psutil_killed: list[str] = []
+    try:
+        import psutil as _ps
+        for p in _ps.process_iter(["pid", "name"]):
+            try:
+                if (p.info["name"] or "").lower() in names_lower:
+                    p.kill()
+                    psutil_killed.append(p.info["name"])
+            except (_ps.NoSuchProcess, _ps.AccessDenied, _ps.ZombieProcess):
+                pass
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    if psutil_killed:
+        status(f"      {label} 종료됨 (psutil: {', '.join(set(psutil_killed))})")
+        return
+
+    if killed_via_handle:
+        status(f"      {label} 종료됨")
+        return
+
+    # ── Step 3: taskkill /F 폴백 ────────────────────────────────────
+    for name in exe_names:
+        try:
+            r = _sp.run(
+                ["taskkill", "/F", "/IM", name, "/T"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0:
+                status(f"      {label} 종료됨 (taskkill: {name})")
+                return
+        except Exception:
+            pass
+
+
 def _pid_alive(pid: int) -> bool:
     """프로세스가 현재 살아있는지 확인 (Windows 전용)."""
     try:
@@ -358,16 +434,15 @@ def run_analysis(
         ts.stop()
 
     # Process Hacker / System Informer 종료
-    if ph_proc is not None and ph_proc.poll() is None:
-        try:
-            ph_proc.terminate()
-            ph_proc.wait(timeout=5)
-            status("      Process Hacker 종료됨")
-        except Exception:
-            try:
-                ph_proc.kill()
-            except Exception:
-                pass
+    # ─ System Informer 는 UAC 자동 상승(self-elevate) 시 원래 Popen 핸들이
+    #   즉시 종료되고 실제 프로세스는 별도 PID 로 뜨므로 핸들만으로는 잡히지 않음.
+    #   1단계: Popen 핸들 시도, 2단계: psutil 이름 검색, 3단계: taskkill /F 폴백
+    _kill_analysis_tool(
+        ph_proc,
+        exe_names=["systeminformer.exe", "processhacker.exe"],
+        status=status,
+        label="System Informer / Process Hacker",
+    )
 
     # ── 6. 사후 스냅샷 ────────────────────────────────────────────────
     status("[6/6] 사후 스냅샷 수집 중...")
