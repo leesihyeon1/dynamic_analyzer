@@ -1210,13 +1210,16 @@ def generate_html_report(result, output_path: str) -> None:
             pass
 
     # ── 탭 배지 ──────────────────────────────────────────────────
-    tab1_b = _tb(tech_count, "red"    if tech_count else "gray") if tech_count else ""
-    tab2_b = _tb(file_count, "blue"   if file_count else "gray") if file_count else ""
-    tab3_b = _tb(reg_added + reg_mod,
-                 "yellow" if (reg_added + reg_mod) else "gray")  if (reg_added + reg_mod) else ""
-    tab4_b = _tb(conn_count, "green"  if conn_count else "gray") if conn_count else ""
-    tab5_b = (_tb(shc_total,  "red"    if shc_total  else "gray") if shc_total  else "") + \
-             (_tb(ioc_total,  "orange" if ioc_total  else "gray") if ioc_total  else "")
+    proc_count = len(result.process_diff.get("new_processes", []))
+    tab1_b    = ""   # 기본 분석: 개요만 (배지 없음)
+    tab_att_b = _tb(tech_count,  "red"    if tech_count  else "gray") if tech_count  else ""
+    tab_proc_b= _tb(proc_count,  "orange" if proc_count  else "gray") if proc_count  else ""
+    tab2_b    = _tb(file_count,  "blue"   if file_count  else "gray") if file_count  else ""
+    tab3_b    = _tb(reg_added + reg_mod,
+                    "yellow" if (reg_added + reg_mod) else "gray") if (reg_added + reg_mod) else ""
+    tab4_b    = _tb(conn_count,  "green"  if conn_count  else "gray") if conn_count  else ""
+    tab5_b    = (_tb(shc_total,  "red"    if shc_total   else "gray") if shc_total   else "") + \
+                (_tb(ioc_total,  "orange" if ioc_total   else "gray") if ioc_total   else "")
 
     body = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -1254,6 +1257,12 @@ def generate_html_report(result, output_path: str) -> None:
   <button class="tab-btn active" data-tab="tab-basic">
     📋 기본 분석{tab1_b}
   </button>
+  <button class="tab-btn" data-tab="tab-attack">
+    🎯 ATT&amp;CK{tab_att_b}
+  </button>
+  <button class="tab-btn" data-tab="tab-process">
+    ⚙️ 프로세스{tab_proc_b}
+  </button>
   <button class="tab-btn" data-tab="tab-filesystem">
     📂 파일시스템{tab2_b}
   </button>
@@ -1287,7 +1296,7 @@ def generate_html_report(result, output_path: str) -> None:
     </div>
     <div class="card">
       <table class="kv">
-        <tr><td>신규 프로세스</td><td>{len(result.process_diff.get('new_processes', []))}</td></tr>
+        <tr><td>신규 프로세스</td><td>{proc_count}</td></tr>
         <tr><td>레지스트리 추가</td><td>{reg_added}</td></tr>
         <tr><td>레지스트리 변경</td><td>{reg_mod}</td></tr>
         <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
@@ -1297,15 +1306,25 @@ def generate_html_report(result, output_path: str) -> None:
     </div>
   </div>
 
+</div>
+
+<!-- ══════════ 탭 2: ATT&CK ══════════ -->
+<div id="tab-attack" class="tab-panel">
+
   <h2>🎯 MITRE ATT&amp;CK 매핑</h2>
   {_section_html(result)}
 
-  <h2>🌲 신규 프로세스</h2>
+</div>
+
+<!-- ══════════ 탭 3: 프로세스 ══════════ -->
+<div id="tab-process" class="tab-panel">
+
+  <h2>⚙️ 신규 프로세스</h2>
   {_process_html(result)}
 
 </div>
 
-<!-- ══════════ 탭 2: 파일시스템 활동 ══════════ -->
+<!-- ══════════ 탭 4: 파일시스템 활동 ══════════ -->
 <div id="tab-filesystem" class="tab-panel">
 
   <h2>📂 파일 시스템 활동 (ProcMon)</h2>
