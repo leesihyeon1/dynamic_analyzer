@@ -24,6 +24,8 @@ ProcMon · tshark · pe-sieve · psutil 을 조합해 **Noriben.py** 스타일�
 | **MITRE ATT&CK** | 행동 패턴 → 기법 자동 매핑 (T1059, T1547, T1486 등) |
 | **IOC 추출** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL (SMTP/FTP C2 IP 포함) |
 | **리포트 생성** | 다크 테마 HTML(검색바 + 페이지네이션) + 구조화된 JSON, 분석 완료 후 자동 열기 |
+| **Hunt 탭** | abuse.ch 실시간 IOC 조회 — MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker를 HTML 내에서 직접 검색 |
+| **VM 자동 세팅** | 스냅샷 복원 후 매 실행 시 캡처 최적화 레지스트리 정책 자동 적용 (Chrome/Edge DoH·QUIC·Firefox DoH·LLMNR·NetBIOS 비활성화) |
 
 ---
 
@@ -173,6 +175,7 @@ python analyzer.py malware.exe
   출력   : results\malware_20260526_120000
   timeout: 60초
 
+  [캡처 최적화] Chrome DoH  Chrome QUIC  Edge DoH  Edge QUIC  Firefox DoH  LLMNR  NetBIOS-NS
   [도구 확인] ProcMon=✔  tshark=✔  RegSnap=✔  ProcHacker=✔
   [1/6] 사전 스냅샷 수집 중...
   [2/6] 모니터링 시작...
@@ -226,7 +229,8 @@ dynamic_analyzer/
 │   ├── tshark_capture.py     # tshark 패킷 캡처
 │   ├── registry_snapshot.py  # winreg 스냅샷 + diff
 │   ├── process_tracker.py    # psutil 프로세스 추적 + 분석 도구 필터
-│   └── process_watcher.py    # 실시간 신규 PID 감지 + 즉시 pe-sieve 스캔 (신규)
+│   ├── process_watcher.py    # 실시간 신규 PID 감지 + 즉시 pe-sieve 스캔
+│   └── vm_setup.py           # 스냅샷 복원 후 캡처 최적화 레지스트리 정책 자동 적용 (신규)
 │
 ├── parsers/
 │   ├── procmon_csv.py        # ProcMon CSV → ProcMonEvent 파싱
@@ -274,6 +278,42 @@ dynamic_analyzer/
 ---
 
 ## 변경 이력
+
+### v1.5 — Hunt 탭 · 탭 분리 · VM 자동 세팅
+
+- **Hunt 탭 추가** (`exporters/html_report.py`)
+  - HTML 리포트 내 `🕵️ Hunt` 탭 신규 추가
+  - 검색 입력창에 해시(MD5/SHA1/SHA256) · IP · URL · 도메인을 입력하면 **브라우저에서 직접 abuse.ch API 조회** (서버 불필요, CORS 허용)
+  - 지원 서비스:
+    - **MalwareBazaar** — 해시(MD5/SHA1/SHA256) 악성코드 데이터베이스
+    - **ThreatFox** — 해시/IP/URL/도메인 IOC 조회
+    - **URLhaus** — IP/URL/도메인 악성 URL 조회
+    - **Feodo Tracker** — IP 봇넷 C2 서버 조회
+  - IOC 타입 자동 감지(정규식) → 적합한 서비스만 활성화
+  - 현재 분석 결과에서 추출된 IOC(외부IP·도메인·드롭파일 SHA256)를 **Quick 버튼**으로 원클릭 검색
+  - 각 서비스별 상태 배지(대기/조회중/탐지됨/클린/오류) 실시간 업데이트
+
+- **HTML 리포트 탭 구조 재편** (`exporters/html_report.py`)
+  - `🔍 기본 분석` 탭: 개요 카드만 표시 (요약 중심)
+  - `🎯 ATT&CK` 탭 분리: MITRE ATT&CK 기법 테이블 독립 탭으로 이동
+  - `⚙️ 프로세스` 탭 분리: 신규 프로세스·pe-sieve 탐지 테이블 독립 탭으로 이동
+  - `🕵️ Hunt` 탭 신규 추가 (우측 끝)
+
+- **VM 자동 세팅** (`core/vm_setup.py` 신규, `analyzer.py`)
+  - 스냅샷 복원 후 매 실행 시 `apply_capture_policies()` 자동 호출
+  - 적용 항목 7가지 (관리자 권한 필요):
+    | 정책 | 효과 |
+    |------|------|
+    | Chrome DoH 비활성화 | A 쿼리 평문 UDP 53으로 노출 |
+    | Chrome QUIC 비활성화 | HTTP/3 → TLS(TCP) 강제, SNI 캡처 가능 |
+    | Edge DoH 비활성화 | 동일 |
+    | Edge QUIC 비활성화 | 동일 |
+    | Firefox DoH 비활성화 | 동일 |
+    | LLMNR 비활성화 | `.in-addr.arpa` PTR 노이즈 제거 |
+    | NetBIOS-NS 비활성화 | UDP 137 브로드캐스트 노이즈 제거 |
+  - 이미 적용된 경우 멱등(덮어쓰기) — 중복 실행 안전
+  - 권한 부족 시 경고 표시 후 분석 계속 진행
+  - 비-Windows 환경에서는 조용히 스킵
 
 ### v1.4 — pe-sieve 통합 · SMTP/FTP C2 분석 · HTML 검색바
 
