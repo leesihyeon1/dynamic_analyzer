@@ -200,6 +200,20 @@ def main() -> None:
         out_dir = Path("results") / f"{stem}_{ts_str}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── 캡처 최적화 자동 적용 (스냅샷 복원 후 매번) ────────────────
+    from core.vm_setup import apply_capture_policies
+    _ok, _fail = apply_capture_policies()
+    if _ok:
+        console.print(
+            f"  [dim][캡처 최적화][/dim] "
+            + "  ".join(f"[green]{x}[/green]" for x in _ok)
+        )
+    if _fail:
+        console.print(
+            f"  [dim][캡처 최적화 일부 실패 — 관리자 권한 필요][/dim] "
+            + "  ".join(f"[yellow]{x}[/yellow]" for x in _fail)
+        )
+
     # ── 분석 시작 ───────────────────────────────────────────────
     label = sample_path.name if sample_path else "전체 시스템 모니터링"
     console.rule(f"[bold white]🧪 dynamic_analyzer — {label}")
