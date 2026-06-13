@@ -692,21 +692,31 @@ def _section_html(result) -> str:
     )
 
 
-_FILE_OPS = ("WriteFile", "DeleteFile", "RenameFile", "SetEndOfFile")
+_FILE_OPS       = frozenset({"WriteFile", "DeleteFile", "RenameFile", "SetEndOfFile"})
+_FILE_OPS_CHAIN = frozenset({"WriteFile", "DeleteFile", "RenameFile", "SetEndOfFile", "CreateFile"})
 _FILE_LIMIT = 2000
 
 def _file_events_html(result) -> tuple[str, int]:
     """(HTML 문자열, 실제 이벤트 총 개수) 반환."""
     from parsers.procmon_csv import EventCategory
-    # CreateFile 제외 — Windows에서 CreateFile은 파일 열기(읽기)도 포함하므로
-    # 실제 쓰기/변경 작업(WriteFile, DeleteFile, RenameFile, SetEndOfFile)만 표시
-    events = [e for e in result.filtered_events if e.category == EventCategory.FILE
-              and e.operation in _FILE_OPS]
+
+    # 악성 체인 PID — 해당 프로세스는 CreateFile(열기/생성)까지 전부 표시
+    chain_pids: set[int] = {p.pid for p in _compute_display_procs(result)[0]}
+
+    events = [
+        e for e in result.filtered_events
+        if e.category == EventCategory.FILE
+        and e.operation in (_FILE_OPS_CHAIN if e.pid in chain_pids else _FILE_OPS)
+    ]
     total = len(events)
     if not events:
         return "<p class='alert alert-success'>파일 시스템 이벤트 없음</p>", 0
+
     rows = ""
-    op_color = {"WriteFile":"blue","DeleteFile":"red","RenameFile":"yellow","SetEndOfFile":"gray"}
+    op_color = {
+        "WriteFile": "blue", "DeleteFile": "red",
+        "RenameFile": "yellow", "SetEndOfFile": "gray", "CreateFile": "purple",
+    }
     for e in events[:_FILE_LIMIT]:
         rows += (
             f"<tr>"
