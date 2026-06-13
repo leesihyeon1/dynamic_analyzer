@@ -1914,11 +1914,23 @@ def _shellcode_html(result) -> str:
             size_str  = _fmt_bytes(sa.size_bytes) if sa.size_bytes else "?"
 
             # 프로세스 셀
+            _sa_exe = getattr(sa, "proc_exe", "") or ""
+            _sa_cmd = getattr(sa, "proc_cmdline", "") or ""
             proc_cell = (
                 f"<span class='ev-process mono' style='font-size:.8rem'>"
                 f"{_e(sa.proc_name)}</span>"
                 f"<span style='color:#8b949e;font-size:.75rem'> ({sa.pid})</span>"
             )
+            if _sa_exe:
+                proc_cell += (
+                    f"<div style='font-size:.7rem;color:#6e7681;margin-top:.15rem;"
+                    f"word-break:break-all'>{_e(_sa_exe)}</div>"
+                )
+            if _sa_cmd and _sa_cmd.lower() not in (_sa_exe.lower(), sa.proc_name.lower()):
+                proc_cell += (
+                    f"<div style='font-size:.68rem;color:#484f58;margin-top:.1rem;"
+                    f"word-break:break-all' title='명령줄'>{_e(_sa_cmd[:200])}</div>"
+                )
 
             # 결과 셀
             if sa.error and not sa.has_findings:

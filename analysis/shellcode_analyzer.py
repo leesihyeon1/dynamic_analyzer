@@ -104,6 +104,8 @@ class ShellcodeAnalysis:
     dump_file:    str
     pid:          int
     proc_name:    str
+    proc_exe:     str       = ""    # 프로세스 실행 파일 경로
+    proc_cmdline: str       = ""    # 프로세스 명령줄
     size_bytes:   int       = 0
     md5:          str       = ""    # 덤프 파일 MD5
     sha256:       str       = ""    # 덤프 파일 SHA256
@@ -184,21 +186,34 @@ def run_yara_on_dump(dump_path: Path, rules_dir: Path | None = None) -> list[str
 # 덤프 파일 수집 헬퍼
 # ---------------------------------------------------------------------------
 
-def _collect_shellcode_files(dump_dir_str: str) -> list[Path]:
-    """dump_dir 내 쉘코드 파일(.shc / .bin 등 non-PE) 목록을 반환합니다."""
-    from parsers.pesieve_result import classify_dump_files
+def _is_pe_file(path: Path) -> bool:
+    """MZ 헤더 확인으로 PE 파일 여부를 반환합니다."""
+    try:
+        return path.read_bytes()[:2] == b"MZ"
+    except Exception:
+        return False
 
+
+def _collect_all_dump_files(dump_dir_str: str) -> list[Path]:
+    """dump_dir 내 모든 파일(.json 제외) 목록을 반환합니다."""
     if not dump_dir_str:
         return []
     dump_dir = Path(dump_dir_str)
     if not dump_dir.exists():
         return []
+    return [p for p in dump_dir.iterdir() if p.is_file() and p.suffix != ".json"]
 
-    all_files = [p for p in dump_dir.iterdir() if p.is_file() and p.suffix != ".json"]
-    if not all_files:
-        return []
 
-    return classify_dump_files(all_files)["shellcode"]
+def _lookup_proc_info(pid: int, proc_snapshots: dict | None) -> tuple[str, str, str]:
+    """proc_snapshots 에서 (proc_name, proc_exe, proc_cmdline) 를 반환합니다."""
+    if proc_snapshots and pid in proc_snapshots:
+        snap = proc_snapshots[pid]
+        name = getattr(snap, "name", "") or ""
+        exe  = getattr(snap, "exe", "") or ""
+        cmdline_list = getattr(snap, "cmdline", []) or []
+        cmdline = " ".join(cmdline_list) if isinstance(cmdline_list, list) else str(cmdline_list or "")
+        return name or f"pid_{pid}", exe, cmdline
+    return f"pid_{pid}", "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -208,96 +223,118 @@ def _collect_shellcode_files(dump_dir_str: str) -> list[Path]:
 def analyze_shellcode_dumps(
     pe_sieve_results: list,
     hh_result,
-    new_pids:   set[int],
-    capa_exe:   str | None = None,
-    rules_dir:  Path | None = None,
-    timeout:    int = 60,
+    new_pids:       set[int],
+    dumps_root:     "Path | str | None" = None,
+    proc_snapshots: dict | None = None,
+    capa_exe:       str | None = None,
+    rules_dir:      Path | None = None,
+    timeout:        int = 60,
 ) -> list[ShellcodeAnalysis]:
-    """필터링된 PeSieveResult 의 쉘코드 덤프에 YARA + CAPA 를 수행합니다.
+    """pe-sieve / HH 덤프 디렉터리 전체에 YARA + CAPA 를 수행합니다.
 
-    오탐 필터링(화이트리스트 + 점수 기준 + 신규 PID)을 적용한 뒤
-    실제 쉘코드 파일이 있는 경우에만 YARA + CAPA 로 분석합니다.
+    두 경로로 파일을 수집합니다:
+    1. pe-sieve / HH 결과 중 오탐 필터(화이트리스트 + 점수 + 신규PID)를 통과한 프로세스
+    2. dumps_root 하위 모든 폴더의 모든 파일 (화이트리스트만 제외)
 
     Parameters
     ----------
-    pe_sieve_results : list[PeSieveResult]  pe-sieve 스캔 결과
+    pe_sieve_results : list[PeSieveResult]
     hh_result        : HollowsHunterResult | None
-    new_pids         : 분석 중 새로 생성된 PID 집합 (오탐 필터용)
+    new_pids         : 분석 중 새로 생성된 PID 집합
+    dumps_root       : dumps 최상위 디렉터리 (None 이면 추가 스캔 없음)
+    proc_snapshots   : dict[int, ProcessSnapshot] — 프로세스 정보 조회용
     capa_exe         : capa 실행 파일 경로 (None = 자동 탐색)
-    rules_dir        : YARA 룰 디렉터리 (None = 기본 rules/yaraify/)
+    rules_dir        : YARA 룰 디렉터리 (None = 기본)
     timeout          : CAPA 타임아웃(초), 파일당 적용
-
-    Returns
-    -------
-    list[ShellcodeAnalysis]
-        분석 결과 목록. 필터에 걸려 제외된 경우 포함되지 않음.
     """
+    import re as _re
+    from analysis.capa_analyzer import run_capa as _run_capa_pe
+
     results: list[ShellcodeAnalysis] = []
-    seen_files: set[str] = set()   # 동일 파일 중복 분석 방지
+    seen_files: set[str] = set()
 
-    # ── 분석 대상 PeSieveResult 수집 ──────────────────────────────────
+    def _analyze_file(dump_path: Path, pid: int, proc_name: str,
+                      proc_exe: str, proc_cmdline: str) -> "ShellcodeAnalysis":
+        sa = ShellcodeAnalysis(
+            dump_file    = str(dump_path.resolve()),
+            pid          = pid,
+            proc_name    = proc_name,
+            proc_exe     = proc_exe,
+            proc_cmdline = proc_cmdline,
+        )
+        try:
+            sa.size_bytes = dump_path.stat().st_size
+        except Exception:
+            pass
+        try:
+            import hashlib as _hl
+            _md5    = _hl.md5()
+            _sha256 = _hl.sha256()
+            with open(dump_path, "rb") as _fh:
+                for _chunk in iter(lambda: _fh.read(65536), b""):
+                    _md5.update(_chunk)
+                    _sha256.update(_chunk)
+            sa.md5    = _md5.hexdigest()
+            sa.sha256 = _sha256.hexdigest()
+        except Exception:
+            pass
+        try:
+            sa.yara_matches = run_yara_on_dump(dump_path, rules_dir)
+        except Exception as exc:
+            sa.error += f"YARA: {exc}  "
+        try:
+            if _is_pe_file(dump_path):
+                sa.capa_techs = _run_capa_pe(dump_path, capa_exe, timeout)
+            else:
+                sa.capa_techs = run_capa_shellcode(dump_path, capa_exe, timeout)
+        except Exception as exc:
+            sa.error += f"CAPA: {exc}"
+        return sa
+
+    # ── 1. pe-sieve / HH 오탐 필터 통과 프로세스 ──────────────────────
     candidates: list = []
-
     for pr in pe_sieve_results or []:
         if should_reanalyze(pr, new_pids):
             candidates.append(pr)
-
-    # hollows-hunter 의심 프로세스도 포함 (pe-sieve 와 dump_dir 이 겹칠 수 있으므로 seen_files 로 중복 방지)
     if hh_result and not getattr(hh_result, "error", ""):
         for pr in getattr(hh_result, "process_results", []) or []:
             if getattr(pr, "suspicious", 0) > 0 and should_reanalyze(pr, new_pids):
                 candidates.append(pr)
 
-    if not candidates:
-        return results
-
-    # ── 파일별 YARA + CAPA 수행 ────────────────────────────────────────
     for pr in candidates:
-        shc_files = _collect_shellcode_files(getattr(pr, "dump_dir", ""))
+        _snap_name, _snap_exe, _snap_cmdline = _lookup_proc_info(pr.pid, proc_snapshots)
+        proc_name = getattr(pr, "name", "") or _snap_name
+        proc_exe  = _snap_exe
+        proc_cmdline = _snap_cmdline
 
-        for dump_path in shc_files:
+        for dump_path in _collect_all_dump_files(getattr(pr, "dump_dir", "")):
             abs_path = str(dump_path.resolve())
             if abs_path in seen_files:
                 continue
             seen_files.add(abs_path)
+            results.append(_analyze_file(dump_path, pr.pid, proc_name, proc_exe, proc_cmdline))
 
-            sa = ShellcodeAnalysis(
-                dump_file = abs_path,
-                pid       = pr.pid,
-                proc_name = getattr(pr, "name", "") or f"pid_{pr.pid}",
-            )
+    # ── 2. dumps_root 전체 폴더 순회 (화이트리스트만 제외) ───────────────
+    if dumps_root is not None:
+        _dr = Path(dumps_root)
+        if _dr.exists():
+            for subdir in sorted(_dr.iterdir()):
+                if not subdir.is_dir():
+                    continue
+                _m = _re.search(r'(\d+)', subdir.name)
+                if not _m:
+                    continue
+                _pid = int(_m.group(1))
 
-            try:
-                sa.size_bytes = dump_path.stat().st_size
-            except Exception:
-                pass
+                _snap_name, _snap_exe, _snap_cmdline = _lookup_proc_info(_pid, proc_snapshots)
+                if _snap_name.lower() in _SYSTEM_PROC_WHITELIST:
+                    continue
 
-            # 해시 계산 (MD5 + SHA256)
-            try:
-                import hashlib as _hl
-                _md5    = _hl.md5()
-                _sha256 = _hl.sha256()
-                with open(dump_path, "rb") as _fh:
-                    for _chunk in iter(lambda: _fh.read(65536), b""):
-                        _md5.update(_chunk)
-                        _sha256.update(_chunk)
-                sa.md5    = _md5.hexdigest()
-                sa.sha256 = _sha256.hexdigest()
-            except Exception:
-                pass
-
-            # YARA 스캔
-            try:
-                sa.yara_matches = run_yara_on_dump(dump_path, rules_dir)
-            except Exception as exc:
-                sa.error += f"YARA: {exc}  "
-
-            # CAPA --shellcode
-            try:
-                sa.capa_techs = run_capa_shellcode(dump_path, capa_exe, timeout)
-            except Exception as exc:
-                sa.error += f"CAPA: {exc}"
-
-            results.append(sa)
+                for dump_path in [p for p in subdir.iterdir() if p.is_file() and p.suffix != ".json"]:
+                    abs_path = str(dump_path.resolve())
+                    if abs_path in seen_files:
+                        continue
+                    seen_files.add(abs_path)
+                    results.append(_analyze_file(dump_path, _pid, _snap_name, _snap_exe, _snap_cmdline))
 
     return results

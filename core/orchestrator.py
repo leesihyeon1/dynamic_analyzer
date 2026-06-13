@@ -900,8 +900,9 @@ def run_analysis(
             result.tools_used["capa"] = f"오류: {_e}"
             status(f"      CAPA 오류: {_e}")
 
-    # ── 쉘코드 덤프 재분석 (pe-sieve / HH 덤프 → YARA + CAPA --shellcode) ──
-    if result.pe_sieve_results or result.hh_result:
+    # ── 쉘코드 덤프 재분석 (pe-sieve / HH 덤프 → YARA + CAPA) ──────────
+    _dumps_root = config.output_dir / "dumps"
+    if result.pe_sieve_results or result.hh_result or _dumps_root.exists():
         try:
             from analysis.shellcode_analyzer import analyze_shellcode_dumps
             _sc_capa_cfg = _cfg.get("capa", {})
@@ -914,13 +915,15 @@ def run_analysis(
                 {p.pid for p in result.process_diff.get("new_processes", [])}
                 | result.all_pids
             )
-            status("[분석] 쉘코드 덤프 재분석 중 (YARA + CAPA --shellcode)...")
+            status("[분석] 쉘코드 덤프 재분석 중 (YARA + CAPA)...")
             result.shellcode_analyses = analyze_shellcode_dumps(
                 result.pe_sieve_results,
                 result.hh_result,
-                new_pids = _new_pids,
-                capa_exe = _sc_capa_exe,
-                timeout  = 60,
+                new_pids       = _new_pids,
+                dumps_root     = _dumps_root,
+                proc_snapshots = result.proc_after_snapshot,
+                capa_exe       = _sc_capa_exe,
+                timeout        = 60,
             )
             _sc_total = len(result.shellcode_analyses)
             _sc_hits  = sum(1 for s in result.shellcode_analyses if s.has_findings)
