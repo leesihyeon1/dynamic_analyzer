@@ -767,36 +767,69 @@ def _file_events_html(result) -> tuple[str, int]:
     return html, total
 
 
+def _reg_parse_detail(detail: str) -> str:
+    """ProcMon RegSetValue detail 에서 '[TYPE] DATA' 문자열 추출."""
+    import re
+    m_type = re.search(r'\bType:\s*(\w+)', detail, re.IGNORECASE)
+    m_data = re.search(r'\bData:\s*(.+?)(?:,\s*\w+:|$)', detail, re.IGNORECASE)
+    type_s = m_type.group(1) if m_type else ""
+    data_s = m_data.group(1).strip() if m_data else detail.strip()
+    return f"[{type_s}] {data_s}" if type_s else data_s
+
+
+def _derive_reg_diff_from_procmon(events) -> list:
+    """filtered_events RegSetValue/RegCreateKey 이벤트 → 스냅샷 비교 형식 목록.
+
+    반환: [(key_path, value_name, value_data), ...] 중복 제거 (마지막 쓰기 기준)
+    """
+    from parsers.procmon_csv import EventCategory
+    seen: dict[tuple, tuple] = {}   # (key_path, val_name) → (key_path, val_name, val_data)
+    for ev in events:
+        if ev.category != EventCategory.REGISTRY:
+            continue
+        if ev.result != "SUCCESS":
+            continue
+        if ev.operation == "RegSetValue":
+            path = ev.path or ""
+            idx  = path.rfind("\\")
+            key_path  = path[:idx]  if idx > 0 else path
+            val_name  = path[idx+1:] if idx > 0 else ""
+            val_data  = _reg_parse_detail(ev.detail or "")
+            seen[(key_path, val_name)] = (key_path, val_name, val_data)
+        elif ev.operation == "RegCreateKey":
+            path = ev.path or ""
+            seen[(path, "")] = (path, "(키 생성)", "")
+    return list(seen.values())
+
+
 def _registry_events_html(result) -> str:
     from parsers.procmon_csv import EventCategory
     _REG_OPS = ("RegSetValue", "RegCreateKey", "RegDeleteValue", "RegDeleteKey")
     events = [e for e in result.filtered_events if e.category == EventCategory.REGISTRY
               and e.operation in _REG_OPS]
     reg_diff = result.registry_diff
-    added    = reg_diff.get("added", [])
-    modified = reg_diff.get("modified", [])
+    added    = list(reg_diff.get("added",    []))
+    modified = list(reg_diff.get("modified", []))
+
+    # winreg 스냅샷이 비어있으면 ProcMon 이벤트에서 변화 도출
+    _from_procmon = False
+    if not (added or modified) and events:
+        _derived = _derive_reg_diff_from_procmon(events)
+        if _derived:
+            added = _derived
+            _from_procmon = True
 
     parts = []
-
     _REG_DIFF_LIMIT = 500
     _REG_EV_LIMIT   = 3000
 
-    # Regshot 0건이지만 ProcMon 이벤트가 존재할 때 불일치 경고
-    if not (added or modified) and events:
-        parts.append(
-            "<p class='alert alert-warning'>"
-            "<b>⚠ Regshot 비교: 변경 없음</b>"
-            f" &nbsp;·&nbsp; ProcMon 레지스트리 이벤트: <b>{len(events):,}건</b><br>"
-            "<span style='font-size:.82rem'>가능한 원인: "
-            "① 악성코드가 분석 종료 전 레지스트리를 원상복구 &nbsp;"
-            "② 일시적 쓰기(쓰기 즉시 삭제) &nbsp;"
-            "③ Regshot 캡처 범위 밖 하이브(예: HKCU 와 별개의 ntuser.dat)"
-            "</span></p>"
-        )
-
-    # RegShot diff
+    # 스냅샷 비교 섹션
     if added or modified:
         total_diff = len(added) + len(modified)
+        _src_note = (
+            "<span style='font-size:.75rem;color:#6e7681'> (winreg 감시 범위 밖 — ProcMon 기반 도출)</span>"
+            if _from_procmon else ""
+        )
         rows = ""
         for k, n, v in added[:_REG_DIFF_LIMIT]:
             rows += (f"<tr><td>{_b('추가','green')}</td>"
@@ -809,7 +842,7 @@ def _registry_events_html(result) -> str:
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td></tr>")
         parts.append(
-            "<h3>레지스트리 스냅샷 비교 (Regshot)</h3>"
+            f"<h3>레지스트리 스냅샷 비교{_src_note}</h3>"
             + _trunc_notice(total_diff, _REG_DIFF_LIMIT)
             + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th></tr>"
             + f"{rows}</table>"
