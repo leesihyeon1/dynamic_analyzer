@@ -1385,16 +1385,26 @@ def _process_html(result) -> str:
     return tree_html + excl_note + table_html
 
 
-def _render_proc_result(proc) -> str:
-    """PeSieveResult → HTML 블록 (헤더 + 모듈 테이블)"""
+def _render_proc_result(proc, exe: str = "") -> str:
+    """PeSieveResult → HTML 블록 (헤더 + 모듈 테이블)
+
+    Parameters
+    ----------
+    proc : PeSieveResult
+    exe  : 프로세스 전체 경로 (psutil 스냅샷에서 보완, 없으면 빈 문자열)
+    """
     arch      = "64bit" if proc.is_64bit else "32bit"
     shc_badge = _b(f"쉘코드 {proc.implanted_shc}개", "red") if proc.implanted_shc else ""
     pe_badge  = _b(f"PE 인젝션 {proc.implanted_pe}개", "orange") if proc.implanted_pe else ""
-    # 프로세스 이름 표시 (hollows-hunter summary 에는 name 포함)
     proc_name = _e(proc.name) if getattr(proc, "name", "") else ""
     name_tag  = (
         f" <span style='color:#e3b341;font-weight:600'>{proc_name}</span>"
         if proc_name else ""
+    )
+    exe_tag = (
+        f"<div style='font-size:0.72rem;color:#8b949e;margin:.1rem 0 .5rem 0'>"
+        f"{_e(exe)}</div>"
+        if exe else ""
     )
 
     if not proc.modules:
@@ -1403,6 +1413,7 @@ def _render_proc_result(proc) -> str:
             f"{name_tag} "
             f"<span style='color:#8b949e'>({_e(arch)})</span> "
             f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}</p>"
+            f"{exe_tag}"
         )
     rows = ""
     for mod in proc.modules:
@@ -1429,6 +1440,7 @@ def _render_proc_result(proc) -> str:
         f"({_e(arch)}) &nbsp;"
         f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}"
         f"</span></h3>"
+        f"{exe_tag}"
         f"<table>"
         f"<tr><th>모듈</th><th>유형</th><th>패치 수</th><th>이식 수</th><th>덤프 파일</th></tr>"
         f"{rows}</table>"
@@ -1526,13 +1538,22 @@ def _shellcode_html(result) -> str:
             f"</div>"
         )
 
+    # ── PID → ProcessSnapshot 교차 조회 (HH 포함, pe-sieve보다 앞에 정의)
+    _snap_map_hh: dict[int, object] = {}
+    for _snap in (result.process_diff or {}).get("new_processes", []):
+        _snap_map_hh[_snap.pid] = _snap
+
     # ── hollows-hunter 상세 (의심 프로세스만, 화이트리스트 noise 제외) ────
     if has_hh_data:
         hh_show    = [p for p in hh_r.suspicious_processes if not _mem_is_noise(p, _MEM_WL)]
         hh_noise_n = len(hh_r.suspicious_processes) - len(hh_show)
         if hh_show:
             for proc in hh_show:
-                parts.append(_render_proc_result(proc))
+                snap_hh = _snap_map_hh.get(proc.pid)
+                if snap_hh and not proc.name:
+                    proc.name = getattr(snap_hh, "name", "") or ""
+                snap_exe_hh = getattr(snap_hh, "exe", "") or "" if snap_hh else ""
+                parts.append(_render_proc_result(proc, exe=snap_exe_hh))
             if hh_noise_n:
                 parts.append(
                     f"<p style='font-size:.76rem;color:#6e7681;margin:.25rem 0'>"
@@ -1557,25 +1578,47 @@ def _shellcode_html(result) -> str:
             "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;padding-top:.75rem'>"
             "pe-sieve — 신규 프로세스 &amp; 의심 DLL 로드 프로세스 스캔 결과</h3>"
         )
+
         pe_noise_n = 0
         for r in pe_list:
+            # pe-sieve JSON에는 name이 없으므로 psutil 스냅샷에서 보완
+            snap = _snap_map_hh.get(r.pid)
+            if snap and not r.name:
+                r.name = getattr(snap, "name", "") or ""
+
             if r.error:
                 full_err  = _e(r.error)
                 short_err = _e(r.error[:160]) + ("…" if len(r.error) > 160 else "")
+                name_hint = f" [{_e(r.name)}]" if r.name else ""
                 parts.append(
                     f"<p style='color:#8b949e;font-size:0.82rem;margin:.25rem 0' title='{full_err}'>"
-                    f"PID {r.pid}: {short_err}</p>"
+                    f"PID {r.pid}{name_hint}: {short_err}</p>"
                 )
             elif r.suspicious > 0:
                 if _mem_is_noise(r, _MEM_WL):
                     pe_noise_n += 1
                 else:
-                    parts.append(_render_proc_result(r))
+                    snap_exe = getattr(snap, "exe", "") or "" if snap else ""
+                    parts.append(_render_proc_result(r, exe=snap_exe))
             else:
-                arch = "64bit" if r.is_64bit else "32bit"
+                arch      = "64bit" if r.is_64bit else "32bit"
+                name_part = (
+                    f"&nbsp;<span class='mono' style='color:#e3b341'>{_e(r.name)}</span>"
+                    if r.name else ""
+                )
+                exe_part = ""
+                if snap:
+                    exe_val = getattr(snap, "exe", "") or ""
+                    if exe_val:
+                        exe_part = (
+                            f"&nbsp;<span style='color:#8b949e;font-size:0.72rem'>"
+                            f"— {_e(exe_val)}</span>"
+                        )
                 parts.append(
                     f"<p style='color:#56d364;font-size:0.82rem;margin:.25rem 0'>"
-                    f"✅ PID {r.pid} ({_e(arch)}): 이상 없음</p>"
+                    f"✅ PID {r.pid}{name_part}"
+                    f"&nbsp;<span style='color:#6e7681'>({_e(arch)})</span>"
+                    f": 이상 없음{exe_part}</p>"
                 )
         if pe_noise_n:
             parts.append(
