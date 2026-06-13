@@ -883,6 +883,20 @@ def _network_html(result) -> str:
     # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
         _CONN_LIMIT = 1000
+
+        # DNS 응답 + TLS SNI를 합쳐 IP → 도메인 종합 매핑
+        combined_domains: dict[str, list[str]] = {}
+        for ip, doms in pcap.ip_to_domain.items():
+            lst = combined_domains.setdefault(ip, [])
+            for d in doms:
+                if d not in lst:
+                    lst.append(d)
+        for t in getattr(pcap, "tls_info", []):
+            if t.dst_ip and t.sni:
+                lst = combined_domains.setdefault(t.dst_ip, [])
+                if t.sni not in lst:
+                    lst.append(t.sni)
+
         # 프로세스-네트워크 매핑 룩업 테이블: (proto, dst_ip, dst_port) → 프로세스 목록
         pnmap = getattr(result, "process_network_map", [])
         proc_lookup: dict[tuple, list[str]] = {}
@@ -900,9 +914,20 @@ def _network_html(result) -> str:
             ext = not _is_private_ip_str(c.dst_ip)
             ip_color = "ev-network" if ext else ""
             susp_badge = _b("!", "red") if c.suspicious_port else ""
-            # IP → 도메인 역매핑
-            domains = pcap.ip_to_domain.get(c.dst_ip, [])
-            domain_str = f"<br><span style='color:#8b949e;font-size:0.72rem'>{_e(', '.join(domains[:2]))}</span>" if domains else ""
+
+            # 도메인 컬럼
+            conn_doms = combined_domains.get(c.dst_ip, [])
+            if conn_doms:
+                primary = conn_doms[0]
+                extra   = len(conn_doms) - 1
+                dom_td  = (
+                    f"<td class='mono ev-network' style='font-size:0.78rem'>{_e(primary)}"
+                    + (f"&nbsp;<span style='color:#8b949e'>+{extra}</span>" if extra else "")
+                    + "</td>"
+                )
+            else:
+                dom_td = "<td style='color:#484f58'>-</td>"
+
             # 프로세스 매핑
             procs = proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
             if procs:
@@ -916,7 +941,8 @@ def _network_html(result) -> str:
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
                 f"<td class='mono'>{_e(c.src_ip)}</td>"
-                f"<td class='mono {ip_color}'>{_e(c.dst_ip)}{domain_str}</td>"
+                f"<td class='mono {ip_color}'>{_e(c.dst_ip)}</td>"
+                f"{dom_td}"
                 f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
@@ -927,7 +953,7 @@ def _network_html(result) -> str:
             "<h3>네트워크 연결 (송신량 순)</h3>"
             + _trunc_notice(len(pcap.connections), _CONN_LIMIT)
             + "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
-            "<th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
+            "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
             + f"{rows}</table>"
         )
 
