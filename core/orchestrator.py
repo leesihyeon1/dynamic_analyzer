@@ -785,24 +785,41 @@ def run_analysis(
     _cfg = _load_cfg()
 
     _capa_cfg = _cfg.get("capa", {})
-    if config.sample_path and _capa_cfg.get("enabled", True):
+    _PE_EXTS  = frozenset({".exe", ".dll", ".sys", ".scr", ".drv", ".ocx", ".cpl"})
+    if not _capa_cfg.get("enabled", True):
+        result.tools_used["capa"] = "비활성 (config.json > capa.enabled: false)"
+    elif not config.sample_path:
+        result.tools_used["capa"] = "샘플 없음"
+    elif config.sample_path.suffix.lower() not in _PE_EXTS:
+        _ext = config.sample_path.suffix or "(확장자 없음)"
+        result.tools_used["capa"] = f"비PE 샘플 건너뜀 ({_ext})"
+        status(f"[분석] CAPA: 비PE 샘플({_ext}) — 정적 분석 건너뜀")
+    else:
         _capa_exe     = _capa_cfg.get("path", "capa.exe")
         _capa_timeout = int(_capa_cfg.get("timeout", 120))
         status(f"[분석] CAPA 정적 분석 중... (최대 {_capa_timeout}초, Ctrl+C로 건너뜀)")
         try:
-            from analysis.capa_analyzer import run_capa
-            _capa_techs = run_capa(config.sample_path, _capa_exe, _capa_timeout)
-            if _capa_techs:
-                _merge_external_techniques(result.behavior_report, _capa_techs)
-                _capa_new = sum(1 for t in result.behavior_report.techniques
-                                if "CAPA" in (t.sources or []))
-                status(f"      CAPA 완료: 기법 {len(_capa_techs)}개 탐지  "
-                       f"(누적 {_capa_new}개)")
+            from analysis.capa_analyzer import run_capa, find_capa as _find_capa
+            if not (_find_capa() or __import__("shutil").which(_capa_exe)):
+                result.tools_used["capa"] = f"미설치 (경로: {_capa_exe})"
+                status(f"      CAPA: 실행 파일 미발견 ({_capa_exe}) — config.json > capa.path 확인")
             else:
-                status("      CAPA: 탐지 없음 / 실행 불가 (config.json > capa.path 확인)")
+                _capa_techs = run_capa(config.sample_path, _capa_exe, _capa_timeout)
+                if _capa_techs:
+                    _merge_external_techniques(result.behavior_report, _capa_techs)
+                    _capa_new = sum(1 for t in result.behavior_report.techniques
+                                    if "CAPA" in (t.sources or []))
+                    result.tools_used["capa"] = f"{len(_capa_techs)}건 기여"
+                    status(f"      CAPA 완료: 기법 {len(_capa_techs)}개 탐지  "
+                           f"(누적 {_capa_new}개)")
+                else:
+                    result.tools_used["capa"] = "결과 없음"
+                    status("      CAPA: 탐지 없음 / 실행 불가 (config.json > capa.path 확인)")
         except KeyboardInterrupt:
+            result.tools_used["capa"] = "건너뜀 (Ctrl+C)"
             status("      CAPA 건너뜀 (Ctrl+C)")
         except Exception as _e:
+            result.tools_used["capa"] = f"오류: {_e}"
             status(f"      CAPA 오류: {_e}")
 
     # ── 쉘코드 덤프 재분석 (pe-sieve / HH 덤프 → YARA + CAPA --shellcode) ──
@@ -848,7 +865,11 @@ def run_analysis(
 
     # ── VirusTotal API 쿼리 (선택적) ─────────────────────────────────
     _vt_cfg = _cfg.get("virustotal", {})
-    if _vt_cfg.get("enabled") and _vt_cfg.get("api_key", ""):
+    if not _vt_cfg.get("enabled"):
+        result.tools_used["virustotal"] = "비활성 (config.json > virustotal.enabled: true 필요)"
+    elif not _vt_cfg.get("api_key", ""):
+        result.tools_used["virustotal"] = "API 키 없음 (config.json > virustotal.api_key 설정 필요)"
+    else:
         _vt_key     = _vt_cfg["api_key"]
         _vt_timeout = int(_vt_cfg.get("timeout", 20))
         _sha256 = ""
@@ -872,13 +893,17 @@ def run_analysis(
                     _merge_external_techniques(result.behavior_report, _vt_techs)
                     _vt_new = sum(1 for t in result.behavior_report.techniques
                                   if "VirusTotal" in (t.sources or []))
+                    result.tools_used["virustotal"] = f"{len(_vt_techs)}건 기여"
                     status(f"      VT 완료: 기법 {len(_vt_techs)}개 탐지  "
                            f"(누적 {_vt_new}개)")
                 else:
+                    result.tools_used["virustotal"] = "결과 없음 (미등록 샘플)"
                     status("      VT: 탐지 없음 (미등록 샘플이거나 API 오류)")
             except Exception as _e:
+                result.tools_used["virustotal"] = f"오류: {_e}"
                 status(f"      VT 오류: {_e}")
         else:
+            result.tools_used["virustotal"] = "SHA256 계산 실패"
             status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
 
     status("[분석] 프로세스↔네트워크 연결 매핑...")

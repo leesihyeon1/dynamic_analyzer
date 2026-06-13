@@ -626,11 +626,43 @@ def _trunc_notice(total: int, shown: int) -> str:
     )
 
 
+def _ext_integration_status_html(result) -> str:
+    """CAPA / VirusTotal 연동 상태 패널 HTML 반환."""
+    tu = getattr(result, "tools_used", {}) or {}
+    capa_status = tu.get("capa", "")
+    vt_status   = tu.get("virustotal", "")
+
+    if not capa_status and not vt_status:
+        return ""
+
+    def _chip(label: str, status_str: str) -> str:
+        if not status_str:
+            return ""
+        ok   = "건 기여" in status_str
+        warn = any(x in status_str for x in ("비활성", "API 키", "미설치", "비PE", "결과 없음", "오류", "건너뜀"))
+        color = "#56d364" if ok else ("#ffa657" if warn else "#8b949e")
+        icon  = "✅" if ok else ("⚠" if warn else "ℹ")
+        return (
+            f"<span style='display:inline-flex;align-items:center;gap:.35rem;"
+            f"background:#161b22;border:1px solid #30363d;border-radius:6px;"
+            f"padding:.25rem .7rem;font-size:.78rem;color:{color}'>"
+            f"{icon}&nbsp;<b>{label}</b>&nbsp;—&nbsp;{_e(status_str)}</span>"
+        )
+
+    chips = " ".join(filter(None, [_chip("CAPA", capa_status), _chip("VirusTotal", vt_status)]))
+    return (
+        f"<div style='display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.8rem;align-items:center'>"
+        f"<span style='font-size:.75rem;color:#6e7681'>외부 연동:</span> {chips}"
+        f"</div>"
+    )
+
+
 def _section_html(result) -> str:
     """MITRE ATT&CK 기법 테이블"""
     techs = result.behavior_report.techniques if result.behavior_report else []
+    status_html = _ext_integration_status_html(result)
     if not techs:
-        return "<p class='alert alert-success'>탐지된 MITRE 기법 없음</p>"
+        return status_html + "<p class='alert alert-success'>탐지된 MITRE 기법 없음</p>"
     rows = ""
     for t in techs:
         color = _TACTIC_COLOR.get(t.tactic, "gray")
@@ -652,7 +684,8 @@ def _section_html(result) -> str:
             f"</tr>"
         )
     return (
-        "<table id='tbl-mitre'>"
+        status_html
+        + "<table id='tbl-mitre'>"
         "<tr><th>ID</th><th>기법</th><th>전술</th><th>출처</th><th>근거 (최대 5건)</th></tr>"
         f"{rows}</table>"
     )
