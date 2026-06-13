@@ -780,25 +780,26 @@ def _reg_parse_detail(detail: str) -> str:
 def _derive_reg_diff_from_procmon(events) -> list:
     """filtered_events RegSetValue/RegCreateKey 이벤트 → 스냅샷 비교 형식 목록.
 
-    반환: [(key_path, value_name, value_data), ...] 중복 제거 (마지막 쓰기 기준)
+    반환: [(key_path, value_name, value_data, proc_label), ...] 중복 제거 (마지막 쓰기 기준)
     """
     from parsers.procmon_csv import EventCategory
-    seen: dict[tuple, tuple] = {}   # (key_path, val_name) → (key_path, val_name, val_data)
+    seen: dict[tuple, tuple] = {}
     for ev in events:
         if ev.category != EventCategory.REGISTRY:
             continue
         if ev.result != "SUCCESS":
             continue
+        proc_label = f"{ev.process} ({ev.pid})" if ev.process else ""
         if ev.operation == "RegSetValue":
             path = ev.path or ""
             idx  = path.rfind("\\")
-            key_path  = path[:idx]  if idx > 0 else path
-            val_name  = path[idx+1:] if idx > 0 else ""
-            val_data  = _reg_parse_detail(ev.detail or "")
-            seen[(key_path, val_name)] = (key_path, val_name, val_data)
+            key_path = path[:idx]  if idx > 0 else path
+            val_name = path[idx+1:] if idx > 0 else ""
+            val_data = _reg_parse_detail(ev.detail or "")
+            seen[(key_path, val_name)] = (key_path, val_name, val_data, proc_label)
         elif ev.operation == "RegCreateKey":
             path = ev.path or ""
-            seen[(path, "")] = (path, "(키 생성)", "")
+            seen[(path, "")] = (path, "(키 생성)", "", proc_label)
     return list(seen.values())
 
 
@@ -831,20 +832,30 @@ def _registry_events_html(result) -> str:
             if _from_procmon else ""
         )
         rows = ""
-        for k, n, v in added[:_REG_DIFF_LIMIT]:
+        for entry in added[:_REG_DIFF_LIMIT]:
+            k, n, v = entry[0], entry[1], entry[2]
+            proc = entry[3] if len(entry) > 3 else ""
+            proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
+                       if proc else "<td style='color:#8b949e'>-</td>")
             rows += (f"<tr><td>{_b('추가','green')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
-                     f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td></tr>")
-        for k, n, o, nw in modified[:_REG_DIFF_LIMIT]:
+                     f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td>"
+                     f"{proc_td}</tr>")
+        for entry in modified[:_REG_DIFF_LIMIT]:
+            k, n, nw = entry[0], entry[1], entry[3]
+            proc = entry[4] if len(entry) > 4 else ""
+            proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
+                       if proc else "<td style='color:#8b949e'>-</td>")
             rows += (f"<tr><td>{_b('변경','orange')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
-                     f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td></tr>")
+                     f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td>"
+                     f"{proc_td}</tr>")
         parts.append(
             f"<h3>레지스트리 스냅샷 비교{_src_note}</h3>"
             + _trunc_notice(total_diff, _REG_DIFF_LIMIT)
-            + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th></tr>"
+            + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th><th>프로세스</th></tr>"
             + f"{rows}</table>"
         )
 
