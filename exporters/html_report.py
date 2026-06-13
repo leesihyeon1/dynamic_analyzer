@@ -1741,8 +1741,9 @@ def _shellcode_html(result) -> str:
         # hits → no_hits → err_items 순으로 출력
         rows = ""
         for sa in hits + no_hits + err_items:
-            fname    = Path(sa.dump_file).name
-            size_str = _fmt_bytes(sa.size_bytes) if sa.size_bytes else "?"
+            fname     = Path(sa.dump_file).name
+            folder    = Path(sa.dump_file).parent.name   # e.g. "process_3812"
+            size_str  = _fmt_bytes(sa.size_bytes) if sa.size_bytes else "?"
 
             # 프로세스 셀
             proc_cell = (
@@ -1802,8 +1803,10 @@ def _shellcode_html(result) -> str:
             )
             rows += (
                 f"<tr style='{row_style}'>"
-                # 파일명 + 전체 경로 토글
+                # 파일명 + 폴더명 + 전체 경로 토글
                 f"<td class='mono' style='font-size:.8rem'>"
+                f"<div style='color:#6e7681;font-size:.72rem;margin-bottom:.1rem'>"
+                f"📁 {_e(folder)}</div>"
                 f"<details><summary style='cursor:pointer;list-style:none'>"
                 f"{_e(fname)}</summary>"
                 f"<span style='color:#8b949e;font-size:.7rem;word-break:break-all'>"
