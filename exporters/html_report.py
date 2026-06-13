@@ -1113,24 +1113,45 @@ def _is_private_ip_str(ip: str) -> bool:
 
 
 
+# 확장자 → 예상 호스트 앱 이름 매핑 (ShellExecute 모드 루트 씨드 탐색용)
+_SHELL_HOST_MAP: dict[str, frozenset[str]] = {
+    ".doc":  frozenset({"winword.exe"}), ".docx": frozenset({"winword.exe"}),
+    ".docm": frozenset({"winword.exe"}), ".dot":  frozenset({"winword.exe"}),
+    ".dotm": frozenset({"winword.exe"}), ".rtf":  frozenset({"winword.exe"}),
+    ".xls":  frozenset({"excel.exe"}),  ".xlsx": frozenset({"excel.exe"}),
+    ".xlsm": frozenset({"excel.exe"}),  ".xlt":  frozenset({"excel.exe"}),
+    ".xltm": frozenset({"excel.exe"}),
+    ".ppt":  frozenset({"powerpnt.exe"}), ".pptx": frozenset({"powerpnt.exe"}),
+    ".pptm": frozenset({"powerpnt.exe"}),
+    ".js":   frozenset({"wscript.exe", "cscript.exe"}),
+    ".vbs":  frozenset({"wscript.exe", "cscript.exe"}),
+    ".vbe":  frozenset({"wscript.exe", "cscript.exe"}),
+    ".hta":  frozenset({"mshta.exe"}),
+    ".ps1":  frozenset({"powershell.exe", "pwsh.exe"}),
+    ".bat":  frozenset({"cmd.exe"}), ".cmd": frozenset({"cmd.exe"}),
+    ".pdf":  frozenset({"acrord32.exe", "acrobat.exe",
+                        "foxitpdfeditor.exe", "foxitreader.exe"}),
+}
+
+
 def _compute_display_procs(result):
     """정상·무관 프로세스를 제외한 신규 프로세스 목록과 제외 건수를 반환합니다.
 
-    제외 조건 (모두 충족해야 제외):
-      1. 화이트리스트 이름 OR filtered_events에 이벤트 없음
-         (ReadFile·RegQueryKey 등은 noise_filter 에서 이미 제거됨)
-      2. pe-sieve/HH 의심 탐지 없음
-      3. 악성 실행 체인(malware_chain) 외부
-      4. 의심 자손 없음
+    malware_chain 씨드 결정 전략 (우선순위 순):
 
-    malware_chain 씨드:
-      1) sample_pid
-      2) pe-sieve/HH 탐지 PID
-      3) filtered_events에 실제 이벤트가 있는 비화이트리스트 신규 프로세스
-         → WriteFile·TCP·레지스트리 변경 등 실질적 활동이 있는 프로세스만 포함
-         → SearchFilterHost·splwow64 등 ReadFile 전용 백그라운드 프로세스 자동 제외
+    [EXE 모드] sample_pid를 루트로 자손 확장.
+    [ShellExecute 모드] 샘플 확장자 → _SHELL_HOST_MAP으로 호스트 앱 PID를 루트로 자손 확장.
+      예) .doc → winword.exe PID, .vbs → wscript.exe PID
+    [폴백-1] 위 두 방법으로 씨드를 못 구한 경우:
+      filtered_events에 이벤트가 있는 비WL 신규 프로세스를 씨드로 사용.
+      (noise_filter를 통과한 WriteFile·TCP 등 실질 활동 프로세스)
+    [폴백-2] ProcMon 미사용 등: 비WL 전체.
 
-    씨드가 하나도 없으면(ProcMon 미사용 등) 비화이트리스트 전체로 폴백.
+    ※ pe-sieve/HH 탐지 PID는 전략과 무관하게 항상 씨드에 포함.
+
+    제외 조건: 악성 실행 체인 외부 AND 의심 탐지 없음 AND sample_pid 아님.
+      EXE 모드에서는 pids_with_events를 추가 조건으로 적용해
+      ReadFile 전용 백그라운드 프로세스(SearchFilterHost 등)를 제거.
     """
     try:
         from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
@@ -1151,29 +1172,44 @@ def _compute_display_procs(result):
             if getattr(pr, "suspicious", 0) > 0:
                 suspicious_pids.add(pr.pid)
 
-    # ── filtered_events 에 실제 이벤트가 있는 PID 집합 ─────────────
-    # noise_filter 를 통과한 이벤트(WriteFile·TCP·RegSetValue 등)를 하나라도
-    # 발생시킨 프로세스 = 분석 대상 활동과 실제로 연관된 프로세스
+    # ── filtered_events에 이벤트가 있는 PID (WriteFile·TCP·RegSetValue 등) ──
     pids_with_events: set[int] = {
         ev.pid for ev in (getattr(result, "filtered_events", None) or [])
     }
 
-    # ── 악성 실행 체인 계산 ─────────────────────────────────────────
+    # ── 악성 실행 체인 루트 씨드 결정 ────────────────────────────────
     malware_chain: set[int] = set()
+
     if sample_pid is not None:
+        # EXE 모드: 직접 실행 PID를 루트로 사용
         malware_chain.add(sample_pid)
+    else:
+        # ShellExecute 모드: 확장자 → 호스트 앱 PID 탐색
+        cfg = getattr(result, "config", None)
+        sp  = getattr(cfg, "sample_path", None)
+        if sp is not None:
+            ext        = getattr(sp, "suffix", "").lower()
+            host_names = _SHELL_HOST_MAP.get(ext, frozenset())
+            for p in all_procs:
+                if p.name.lower() in host_names:
+                    malware_chain.add(p.pid)
+
+    # pe-sieve/HH 탐지 PID는 항상 포함
     malware_chain.update(suspicious_pids)
-    # ProcMon 이벤트가 있는 비WL 신규 프로세스만 씨드로 추가
-    for p in all_procs:
-        if p.pid in pids_with_events and p.name.lower() not in _WL:
-            malware_chain.add(p.pid)
-    # 씨드가 전혀 없으면 비WL 전체로 폴백 (ProcMon 미사용 케이스)
+
+    # 폴백-1: 호스트 앱 미발견 → ProcMon 이벤트 있는 비WL 프로세스
+    if not malware_chain:
+        for p in all_procs:
+            if p.pid in pids_with_events and p.name.lower() not in _WL:
+                malware_chain.add(p.pid)
+
+    # 폴백-2: ProcMon 미사용 등 완전 실패 → 비WL 전체
     if not malware_chain:
         for p in all_procs:
             if p.name.lower() not in _WL:
                 malware_chain.add(p.pid)
 
-    # 씨드 자손 반복 확장 (WL 이름이더라도 악성 프로세스의 자식은 포함)
+    # 루트 씨드 자손 반복 확장 (WL 이름이더라도 체인 내 자식은 포함)
     changed = True
     while changed:
         changed = False
@@ -1197,15 +1233,19 @@ def _compute_display_procs(result):
 
     display, excluded = [], 0
     for p in all_procs:
-        # 화이트리스트이거나 ProcMon 이벤트가 없는(= 실질 활동 없는) 프로세스를 제외
-        no_activity = (p.name.lower() in _WL or p.pid not in pids_with_events)
-        if (no_activity
-                and p.pid not in suspicious_pids
-                and p.pid != sample_pid
-                and p.pid not in malware_chain
-                and not _has_suspicious_desc(p.pid)):
+        # 체인 외부 프로세스는 추가로 pids_with_events 여부 확인
+        # (EXE 모드: ReadFile 전용 백그라운드 프로세스 추가 제거)
+        if p.pid in malware_chain or p.pid in suspicious_pids or p.pid == sample_pid:
+            display.append(p)
+            continue
+        if _has_suspicious_desc(p.pid):
+            display.append(p)
+            continue
+        # 체인 외부 + 비의심: WL이거나 ProcMon 이벤트 없으면 제외
+        if p.name.lower() in _WL or p.pid not in pids_with_events:
             excluded += 1
         else:
+            # 체인 외부지만 실질 활동 있는 비WL: 분석가에게 보여줌
             display.append(p)
     return display, excluded
 
