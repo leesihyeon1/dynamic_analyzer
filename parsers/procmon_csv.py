@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import os as _os
 import re
+import shlex as _shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -173,6 +175,85 @@ def parse_csv(
 
 
 _CHILD_PID_RE = re.compile(r"\bPID:\s*(\d+)", re.IGNORECASE)
+
+# Detail 필드의 "Command line: <값>" 추출 — Environment:/Current directory: 직전에서 종료
+_CMD_LINE_RE = re.compile(
+    r"Command\s+line:\s*(.*?)(?=,\s*(?:Environment|Current\s+directory)|$)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class ChildProcInfo:
+    """Process Create 이벤트에서 추출한 자식 프로세스 정보."""
+
+    child_pid:  int
+    parent_pid: int
+    name:       str        # Path 필드의 basename
+    exe:        str        # Path 필드 원본 (full path)
+    cmdline:    list[str]  # Detail 의 Command line 파싱 결과
+
+
+def get_child_proc_infos(
+    events:      list[ProcMonEvent],
+    parent_pids: set[int] | None = None,
+) -> list[ChildProcInfo]:
+    """Process Create 이벤트에서 자식 프로세스 전체 정보를 추출합니다.
+
+    Parameters
+    ----------
+    events:
+        parse_csv() 가 반환한 이벤트 목록.
+    parent_pids:
+        대상 부모 PID 집합. None 이면 전체 이벤트를 검색합니다.
+
+    Returns
+    -------
+    list[ChildProcInfo]
+        자식 PID 기준 중복 제거된 목록.  child_pid 오름차순 정렬.
+    """
+    seen:    set[int]            = set()
+    results: list[ChildProcInfo] = []
+
+    for ev in events:
+        if ev.operation != "Process Create":
+            continue
+        if parent_pids is not None and ev.pid not in parent_pids:
+            continue
+
+        m_pid = _CHILD_PID_RE.search(ev.detail or "")
+        if not m_pid:
+            continue
+        try:
+            child_pid = int(m_pid.group(1))
+        except ValueError:
+            continue
+        if child_pid in seen:
+            continue
+        seen.add(child_pid)
+
+        exe  = ev.path or ""
+        name = _os.path.basename(exe) if exe else f"pid{child_pid}"
+
+        cmdline: list[str] = []
+        m_cmd = _CMD_LINE_RE.search(ev.detail or "")
+        if m_cmd:
+            raw = m_cmd.group(1).strip().strip('"')
+            try:
+                cmdline = _shlex.split(raw)
+            except ValueError:
+                cmdline = [raw] if raw else []
+
+        results.append(ChildProcInfo(
+            child_pid  = child_pid,
+            parent_pid = ev.pid,
+            name       = name,
+            exe        = exe,
+            cmdline    = cmdline,
+        ))
+
+    results.sort(key=lambda c: c.child_pid)
+    return results
 
 
 def get_child_pids(events: list[ProcMonEvent], parent_pid: int) -> set[int]:

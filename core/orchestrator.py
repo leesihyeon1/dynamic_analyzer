@@ -667,7 +667,52 @@ def run_analysis(
             if _new_proc_pids:
                 result.all_pids.update(_new_proc_pids)
                 status(f"      [ShellExecute] 신규 프로세스 {len(_new_proc_pids)}개 PID 추적 추가")
-        # 포커스 PID 기반 필터
+        # ── 단명 프로세스 보완 ────────────────────────────────────────
+        # all_pids 확정 후 BFS로 ProcMon Process Create 체인을 순회해
+        # 스냅샷 종료 전에 이미 종료된 프로세스(단발성 PowerShell, cmd 로더 등)를
+        # process_diff["new_processes"] 에 추가하고 all_pids 에도 반영합니다.
+        # → filter_events 호출 전에 실행해야 단명 프로세스의 이벤트도 포함됩니다.
+        from parsers.procmon_csv import get_child_proc_infos, ChildProcInfo
+        from core.process_tracker import ProcessSnapshot as _ProcSnap
+
+        _child_infos: list[ChildProcInfo] = get_child_proc_infos(result.procmon_events)
+        # 부모 PID → 자식 목록 인덱스 (BFS용)
+        _parent_idx: dict[int, list[ChildProcInfo]] = {}
+        for _ci in _child_infos:
+            _parent_idx.setdefault(_ci.parent_pid, []).append(_ci)
+
+        _new_proc_pids: set[int] = {
+            p.pid for p in result.process_diff.get("new_processes", [])
+        }
+        _visited: set[int] = set(result.all_pids) | _new_proc_pids
+        _queue: list[int]  = list(result.all_pids)
+        _added: int        = 0
+
+        while _queue:
+            _pid = _queue.pop()
+            for _ci in _parent_idx.get(_pid, []):
+                if _ci.child_pid in _visited:
+                    continue
+                _visited.add(_ci.child_pid)
+                _queue.append(_ci.child_pid)
+                if _ci.child_pid not in _new_proc_pids:
+                    result.process_diff["new_processes"].append(_ProcSnap(
+                        pid         = _ci.child_pid,
+                        ppid        = _ci.parent_pid,
+                        name        = _ci.name,
+                        exe         = _ci.exe,
+                        cmdline     = _ci.cmdline,
+                        create_time = 0.0,
+                        note        = "단명 프로세스 (ProcMon Process Create 보완)",
+                    ))
+                    result.all_pids.add(_ci.child_pid)
+                    _new_proc_pids.add(_ci.child_pid)
+                    _added += 1
+
+        if _added:
+            status(f"      [ProcMon] 단명 프로세스 {_added}개 보완 (스냅샷 누락)")
+
+        # 포커스 PID 기반 필터 (단명 프로세스 보완 후 실행)
         result.filtered_events = filter_events(
             result.procmon_events,
             focus_pids=result.all_pids if result.all_pids else None,
