@@ -84,6 +84,37 @@ DNS_TUNNEL_LABEL_LEN = 30
 BEACON_MIN_COUNT = 5
 BEACON_MAX_JITTER = 0.30   # 30% 이내 편차면 비콘으로 판단
 
+# ---------------------------------------------------------------------------
+# 분석 도구 / 위협인텔 서비스 도메인 화이트리스트
+# tshark 캡처 중 분석 도구 자체가 만드는 네트워크 트래픽을 제거합니다.
+# ---------------------------------------------------------------------------
+
+_ANALYSIS_SERVICE_SUFFIXES: tuple[str, ...] = (
+    "abuse.ch",             # URLhaus, MalwareBazaar, ThreatFox, Feodo, YARAify
+    "virustotal.com",       # VirusTotal API
+    "alienvault.com",       # OTX AlienVault
+    "shodan.io",            # Shodan
+    "system-informer.com",  # System Informer (분석 VM 업데이트)
+    "github.com",           # GitHub (도구 업데이트)
+    "githubusercontent.com",
+    "phantom.app",          # 브라우저 Web3 확장
+    "metamask.io",
+    "xdefi.services",
+)
+
+
+def _is_analysis_service_domain(domain: str) -> bool:
+    """분석 도구·위협인텔 서비스 도메인이면 True를 반환합니다.
+
+    tshark 캡처 중 분석 도구 자체가 이 도메인들에 접속할 수 있으므로
+    DNS / TLS SNI 레코드에서 제외하여 오탐을 방지합니다.
+    """
+    d = domain.lower().rstrip(".")
+    for suffix in _ANALYSIS_SERVICE_SUFFIXES:
+        if d == suffix or d.endswith("." + suffix):
+            return True
+    return False
+
 _QTYPE_MAP: dict[int, str] = {
     1: "A", 2: "NS", 5: "CNAME", 6: "SOA",
     12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA",
@@ -840,11 +871,18 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         dns_base_cnt[_base_domain(name)] += 1
 
                         if name not in dns_seen:
-                            ent = _subdomain_entropy(name)
-                            dns_seen[name] = DNSQuery(
-                                name=name, qtype=qtype_str,
-                                entropy=round(ent, 3),
-                            )
+                            # PTR 레코드(.in-addr.arpa / .ip6.arpa)와
+                            # 분석 서비스 도메인은 DGA/C2 판정 대상에서 제외
+                            if (name.endswith(".in-addr.arpa")
+                                    or name.endswith(".ip6.arpa")
+                                    or _is_analysis_service_domain(name)):
+                                raw_domains.discard(name)
+                            else:
+                                ent = _subdomain_entropy(name)
+                                dns_seen[name] = DNSQuery(
+                                    name=name, qtype=qtype_str,
+                                    entropy=round(ent, 3),
+                                )
                     except Exception:
                         pass
 
@@ -872,7 +910,9 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                 sni = _extract_tls_sni(raw_bytes)
                 if sni:
                     raw_domains.add(sni)
-                    tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
+                    # 분석 서비스 도메인은 TLS SNI 목록에서 제외
+                    if not _is_analysis_service_domain(sni):
+                        tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
 
             # --- HTTP 파싱 ---
             if proto == "TCP" and Raw in pkt:

@@ -354,17 +354,41 @@ def run_analysis(
             result.tools_used["process_hacker"] = False
 
     # ── 3. 샘플 실행 (파일 지정 시에만) ─────────────────────────────
+    # 확장자별 실행 방법 분기:
+    #   Office 문서 / 스크립트 / PDF → os.startfile (ShellExecute, 연관 앱으로 열기)
+    #   실행 파일 (.exe / .dll 등)   → subprocess.Popen (직접 실행, PID 추적 가능)
+    _SHELL_EXEC_SUFFIXES: frozenset[str] = frozenset({
+        # Office 문서
+        ".doc", ".docx", ".docm", ".dot", ".dotm",
+        ".xls", ".xlsx", ".xlsm", ".xlt", ".xltm",
+        ".ppt", ".pptx", ".pptm", ".pot", ".potm",
+        ".rtf", ".pdf", ".odt", ".ods", ".odp",
+        # 스크립트 / 웹 기반 실행 파일
+        ".js", ".jse", ".vbs", ".vbe", ".wsf", ".wsh",
+        ".hta", ".ps1", ".psm1", ".psd1",
+        # 링크 / URL
+        ".url", ".lnk",
+    })
+
     sample_proc = None
     if config.sample_path:
         status(f"[3/6] 샘플 실행: {config.sample_path.name}")
+        ext = config.sample_path.suffix.lower()
         try:
-            sample_proc = subprocess.Popen(
-                [str(config.sample_path)],
-                cwd=str(config.sample_path.parent),
-            )
-            result.sample_pid = sample_proc.pid
-            result.all_pids.add(sample_proc.pid)
-            status(f"      PID: {sample_proc.pid}")
+            if ext in _SHELL_EXEC_SUFFIXES:
+                # Office/스크립트/PDF 등 — 연관 앱(Word, wscript 등)으로 ShellExecute
+                import os as _os
+                _os.startfile(str(config.sample_path))
+                result.sample_pid = None   # 호스트 앱 PID는 procmon/process_diff 로 추적
+                status(f"      ShellExecute 실행 ({ext}) — 호스트 앱 PID는 procmon이 추적")
+            else:
+                sample_proc = subprocess.Popen(
+                    [str(config.sample_path)],
+                    cwd=str(config.sample_path.parent),
+                )
+                result.sample_pid = sample_proc.pid
+                result.all_pids.add(sample_proc.pid)
+                status(f"      PID: {sample_proc.pid}")
         except Exception as e:
             result.errors.append(f"샘플 실행 실패: {e}")
             status(f"[오류] 샘플 실행 실패: {e}")

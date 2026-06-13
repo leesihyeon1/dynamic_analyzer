@@ -348,6 +348,45 @@ def _classify_process_events(
 # Pattern matchers – network (pcap)
 # ---------------------------------------------------------------------------
 
+# mDNS / LLMNR / SSDP 멀티캐스트 주소 — C2 오탐 방지
+_MULTICAST_IPS: frozenset[str] = frozenset({
+    "224.0.0.252",      # LLMNR (T1095 오탐 원인)
+    "224.0.0.251",      # mDNS
+    "239.255.255.250",  # SSDP
+    "ff02::fb",         # mDNS IPv6
+    "ff02::1:3",        # LLMNR IPv6
+    "ff02::2",          # All-routers
+    "ff02::16",         # MLDv2
+})
+
+# 분석 도구 / 위협인텔 서비스 — MITRE 귀속에서 제외
+# (pcap_parser.py 의 _is_analysis_service_domain 과 동기화 유지)
+_ANALYSIS_SERVICE_SUFFIXES_BC: tuple[str, ...] = (
+    "abuse.ch",
+    "virustotal.com",
+    "alienvault.com",
+    "shodan.io",
+    "system-informer.com",
+    "github.com",
+    "githubusercontent.com",
+    "phantom.app",
+    "metamask.io",
+    "xdefi.services",
+)
+
+
+def _is_analysis_domain_bc(domain: str) -> bool:
+    """분석 도구·위협인텔 서비스 도메인이면 True.
+
+    T1071.001 / T1071.004 귀속 전에 호출해 오탐을 방지합니다.
+    """
+    d = domain.lower().rstrip(".")
+    for suffix in _ANALYSIS_SERVICE_SUFFIXES_BC:
+        if d == suffix or d.endswith("." + suffix):
+            return True
+    return False
+
+
 def _is_private_ip(ip: str) -> bool:
     """Return True for RFC1918 / loopback / link-local addresses."""
     try:
@@ -381,6 +420,14 @@ def _classify_network(
     for conn in pcap.connections:
         if _is_private_ip(conn.dst_ip):
             continue
+        # mDNS / LLMNR 멀티캐스트 — 정상 OS 동작, C2 아님
+        if conn.dst_ip in _MULTICAST_IPS:
+            continue
+        # 분석 서비스 IP 체크 — DNS A 레코드 역참조로 판별
+        if any(_is_analysis_domain_bc(d)
+               for d in pcap.ip_to_domain.get(conn.dst_ip, [])):
+            continue
+
         evidence = f"{conn.dst_ip}:{conn.dst_port}"
 
         if conn.dst_port in (80, 8080):
@@ -407,10 +454,12 @@ def _classify_network(
 
         report.suspicious_network.append(evidence)
 
-    # TLS SNI → HTTPS C2 도메인 탐지
+    # TLS SNI → HTTPS C2 도메인 탐지 (분석 서비스 도메인 제외)
     seen_sni: set[str] = set()
     for tls in pcap.tls_info:
         if tls.sni and tls.sni not in seen_sni:
+            if _is_analysis_domain_bc(tls.sni):
+                continue  # 분석 도구 통신 — 제외
             seen_sni.add(tls.sni)
             _add_evidence(technique_map, "T1071.001",
                           "Web Protocols (TLS SNI)",
@@ -419,8 +468,10 @@ def _classify_network(
                           reference="https://attack.mitre.org/techniques/T1071/001/")
             report.suspicious_network.append(f"TLS SNI: {tls.sni}")
 
-    # DNS 쿼리
+    # DNS 쿼리 (분석 서비스 도메인 제외 — PTR 레코드는 pcap_parser에서 이미 제거)
     for q in pcap.dns_queries:
+        if _is_analysis_domain_bc(q.name):
+            continue  # 분석 도구 DNS 조회 — 제외
         _add_evidence(technique_map, "T1071.004", "DNS",
                       "Command and Control", evidence=q.name,
                       reference="https://attack.mitre.org/techniques/T1071/004/")
