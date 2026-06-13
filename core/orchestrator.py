@@ -432,7 +432,12 @@ def run_analysis(
     )
     watcher.start()
     if watcher.available:
-        status("      [실시간] 신규 프로세스 감시 시작 (1초 폴링)")
+        _mode_label = (
+            "WMI ETW (즉시 감지)"
+            if watcher.detection_mode == "wmi_etw"
+            else "psutil 폴링 (1초 간격)"
+        )
+        status(f"      [실시간] 신규 프로세스 감시 시작 — {_mode_label}")
 
     elapsed = 0
     interval = 5

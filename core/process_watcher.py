@@ -1,30 +1,30 @@
 """
 process_watcher.py — 모니터링 중 실시간 신규 프로세스 감지 및 pe-sieve 즉시 스캔
 
-동작 원리
----------
-백그라운드 스레드가 1초 간격으로 psutil 프로세스 목록을 폴링해서
-새로 나타난 PID를 즉시 pe-sieve로 스캔합니다.
+감지 전략 (우선순위 순)
+-----------------------
+1. WMI Win32_ProcessStartTrace (ETW 기반)
+   - Windows 커널이 프로세스 생성 즉시 이벤트를 전달 → 폴링 지연 없음
+   - 수십 ms 만에 종료하는 단명 프로세스(PowerShell 로더, 인젝터 등)도 캡처
+   - 요구사항: wmi 패키지 (pip install wmi) + 관리자 권한
 
-일반적인 프로세스 타임라인:
-  [모니터링 시작]  --->  [신규 PID 출현]  --->  [1초 이내 스캔 시작]
-                                                      ↕
-                                              [PID 아직 살아있음]
+2. psutil 폴링 (폴백)
+   - wmi 패키지 없거나 WMI 초기화 실패 시 자동 사용
+   - 1초 간격 폴링 — 1초 이내 종료 프로세스는 놓칠 수 있음
 
 기존 방식(모니터링 종료 후 스캔)의 문제:
   [모니터링 시작] → [HH 스캔 30-60초] → [pe-sieve 시도] → [PID 이미 종료됨]
 
 주요 특성
 ---------
-- psutil 미설치 시 자동으로 비활성화(예외 없음)
-- pe-sieve 스캔은 별도 스레드로 실행 — 모니터링 루프를 차단하지 않음
+- psutil / wmi 미설치 시 자동으로 비활성화 (예외 없음)
+- pe-sieve 스캔은 별도 스레드로 실행 — 감지 루프를 차단하지 않음
 - 분석 도구(ProcMon, tshark 등)는 자동 제외
 - dump_mode=3 (raw dump) 으로 쉘코드 바이트도 디스크에 추출
 """
 from __future__ import annotations
 
 import threading
-import time
 from typing import Callable
 
 try:
@@ -59,7 +59,7 @@ class ProcessWatcher:
         pe-sieve /dmode 값.
         3 = raw dump (PE + shellcode 모두 추출, 기본값).
     poll_interval:
-        프로세스 목록 폴링 간격 (초).
+        psutil 폴백 모드의 폴링 간격 (초). WMI ETW 모드에서는 사용되지 않음.
     """
 
     def __init__(
@@ -82,6 +82,12 @@ class ProcessWatcher:
         )
         self._scan_threads: list[threading.Thread] = []
         self._lock     = threading.Lock()
+        # 감지 방식 미리 판단 (import 가능 여부만 확인, 실제 연결은 _run에서)
+        try:
+            import wmi as _w  # noqa: F401
+            self._mode = "wmi_etw"
+        except ImportError:
+            self._mode = "psutil_poll"
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -90,13 +96,18 @@ class ProcessWatcher:
         """psutil 설치 여부 + scanner 사용 가능 여부."""
         return _PSUTIL_OK and self._scanner.available
 
+    @property
+    def detection_mode(self) -> str:
+        """실제 사용된 감지 방식 ('wmi_etw' 또는 'psutil_poll')."""
+        return self._mode
+
     def start(self) -> None:
-        """백그라운드 폴링 스레드 시작."""
+        """백그라운드 감지 스레드 시작."""
         if self.available:
             self._thread.start()
 
     def stop(self) -> set[int]:
-        """폴링을 중지하고, 진행 중인 스캔이 모두 끝날 때까지 대기.
+        """감지를 중지하고, 진행 중인 스캔이 모두 끝날 때까지 대기.
 
         Returns
         -------
@@ -118,6 +129,58 @@ class ProcessWatcher:
     # ── internal ──────────────────────────────────────────────────────
 
     def _run(self) -> None:
+        """감지 루프 진입점. WMI ETW 우선, 실패 시 psutil 폴링으로 폴백."""
+        if not self._run_wmi_etw():
+            self._run_polling()
+
+    def _run_wmi_etw(self) -> bool:
+        """Win32_ProcessStartTrace (ETW 기반) 즉시 알림으로 신규 프로세스 감지.
+
+        Windows 커널이 프로세스 생성 즉시 이벤트를 전달하므로
+        psutil 폴링(1초 간격)과 달리 단명 프로세스를 놓치지 않습니다.
+
+        Returns
+        -------
+        bool
+            WMI 초기화 성공 여부. False 면 폴링 폴백으로 전환.
+        """
+        try:
+            import wmi as _wmi_mod
+        except ImportError:
+            return False
+
+        try:
+            _c  = _wmi_mod.WMI()
+            _wt = _c.Win32_ProcessStartTrace.watch_for()
+        except Exception:
+            self._mode = "psutil_poll"   # WMI 연결 실패 → 폴링 폴백
+            return False
+
+        while not self._stop.is_set():
+            try:
+                ev  = _wt(timeout_ms=200)   # 200ms 대기 — stop 신호 감지 주기
+                pid = int(ev.ProcessID)
+                with self._lock:
+                    is_new = pid not in self._known and pid not in self._scanned
+                    if is_new:
+                        self._known.add(pid)
+                if is_new:
+                    self._launch_scan(pid)
+            except _wmi_mod.x_wmi_timed_out:
+                pass   # 정상 타임아웃 — stop 플래그 재확인 후 계속 대기
+            except Exception:
+                break  # WMI 런타임 오류 — ETW 루프 종료 (폴링으로 재시작 안함)
+
+        return True
+
+    def _run_polling(self) -> None:
+        """psutil 폴링 감지 (WMI ETW 불가 시 폴백).
+
+        poll_interval 간격으로 프로세스 목록을 조회합니다.
+        단명 프로세스(< poll_interval)는 누락될 수 있으며,
+        ProcMon BFS가 이를 보완합니다.
+        """
+        self._mode = "psutil_poll"
         while not self._stop.is_set():
             try:
                 current: set[int] = {
