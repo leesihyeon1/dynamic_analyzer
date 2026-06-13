@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import html as _html
+import json as _json
 from datetime import datetime
 from pathlib import Path
 
@@ -1729,13 +1730,117 @@ def _shellcode_html(result) -> str:
 
 
 def _ioc_html(result) -> str:
-    ioc = result.ioc_report
+    ioc  = result.ioc_report
+    pcap = result.pcap_result
     if not ioc:
         return ""
     parts = []
 
     _IOC_LIMIT = 1000
 
+    # ── IP→도메인 종합 매핑 (DNS 응답 + TLS SNI) ──────────────────
+    combined_dom: dict[str, list[str]] = {}
+    if pcap:
+        for ip, doms in (pcap.ip_to_domain or {}).items():
+            lst = combined_dom.setdefault(ip, [])
+            for d in doms:
+                if d not in lst:
+                    lst.append(d)
+        for t in getattr(pcap, "tls_info", []):
+            if t.dst_ip and t.sni:
+                lst = combined_dom.setdefault(t.dst_ip, [])
+                if t.sni not in lst:
+                    lst.append(t.sni)
+
+    # ── IP→포트 집계 (pcap 연결 목록) ────────────────────────────
+    ip_ports: dict[str, list[str]] = {}
+    if pcap:
+        for c in getattr(pcap, "connections", []):
+            if _is_private_ip_str(c.dst_ip):
+                continue
+            entry = ip_ports.setdefault(c.dst_ip, [])
+            label = f"{c.dst_port}/{c.proto.upper()}"
+            if label not in entry:
+                entry.append(label)
+
+    # ── 외부 IP 테이블 (풍부한 컬럼) ─────────────────────────────
+    if ioc.ip_addresses:
+        pub_ips = ioc.ip_addresses[:_IOC_LIMIT]
+        rows = ""
+        for ip in pub_ips:
+            doms  = combined_dom.get(ip, [])
+            ports = sorted(ip_ports.get(ip, []),
+                           key=lambda x: int(x.split("/")[0]) if x.split("/")[0].isdigit() else 0)
+            dom_html = (
+                "<span class='mono ev-network' style='font-size:.78rem'>"
+                + _e(doms[0]) + "</span>"
+                + (f"<span style='color:#8b949e'>&nbsp;+{len(doms)-1}</span>" if len(doms) > 1 else "")
+                if doms else "<span style='color:#484f58'>-</span>"
+            )
+            port_html = (
+                "&nbsp;".join(
+                    f"<span style='background:#21262d;border-radius:4px;padding:.1rem .4rem;"
+                    f"font-size:.72rem;font-family:monospace'>{_e(p)}</span>"
+                    for p in ports[:5]
+                ) + (f"<span style='color:#8b949e'>&nbsp;+{len(ports)-5}</span>" if len(ports) > 5 else "")
+                if ports else "<span style='color:#484f58'>-</span>"
+            )
+            rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(ip)}</td>"
+                f"<td>{dom_html}</td>"
+                f"<td style='white-space:nowrap'>{port_html}</td>"
+                f"<td data-geo-ip='{_e(ip)}' style='color:#8b949e;font-size:.78rem'>"
+                f"<span style='color:#484f58'>…</span></td>"
+                f"</tr>"
+            )
+        geo_ips_js = _json.dumps(pub_ips[:100])
+        parts.append(
+            "<h3>외부 IP</h3>"
+            + _trunc_notice(len(ioc.ip_addresses), _IOC_LIMIT)
+            + "<table id='tbl-ioc-ip'>"
+            + "<tr><th>IP 주소</th><th>연관 도메인</th><th>포트</th><th>국가 / 기관</th></tr>"
+            + rows + "</table>"
+            + f"""<script>
+(function(){{
+  var ips={geo_ips_js};
+  if(!ips.length) return;
+  var cells={{}};
+  document.querySelectorAll('[data-geo-ip]').forEach(function(el){{
+    cells[el.getAttribute('data-geo-ip')]=el;
+  }});
+  function flag(cc){{
+    if(!cc||cc.length!==2) return '';
+    try{{return String.fromCodePoint(...[...cc.toUpperCase()].map(function(c){{return 0x1F1E0+c.charCodeAt(0)-65;}}));}}
+    catch(e){{return '';}}
+  }}
+  var batches=[];
+  for(var i=0;i<ips.length;i+=100) batches.push(ips.slice(i,i+100));
+  Promise.all(batches.map(function(batch){{
+    return fetch('http://ip-api.com/batch?fields=status,country,countryCode,org,as,query',{{
+      method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify(batch.map(function(ip){{return {{query:ip}}; }}))
+    }}).then(function(r){{return r.ok?r.json():[];}}).catch(function(){{return [];}});
+  }})).then(function(results){{
+    (results||[]).flat().forEach(function(item){{
+      if(!item||item.status!=='success') return;
+      var cell=cells[item.query];
+      if(!cell) return;
+      var f=flag(item.countryCode);
+      var asn=(item.as||'').split(' ')[0];
+      var org=(item.org||item.as||'').replace(/^AS\\d+\\s*/,'').split(' ').slice(0,4).join(' ');
+      cell.innerHTML=(f?f+' ':'')+_e2(item.country||'-')
+        +'<br><span style="color:#8b949e;font-size:.7rem">'+_e2(asn)
+        +(org?' · '+_e2(org):'')+'</span>';
+    }});
+  }});
+  function _e2(s){{return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
+}})();
+</script>"""
+        )
+
+    # ── 나머지 IOC 목록 ───────────────────────────────────────────
     def _list_table(title: str, items: list, label: str, table_id: str = "") -> str:
         if not items:
             return ""
@@ -1747,7 +1852,6 @@ def _ioc_html(result) -> str:
             + f"<table{id_attr}><tr><th>{label}</th></tr>{rows}</table>"
         )
 
-    parts.append(_list_table("외부 IP", ioc.ip_addresses, "IP 주소", "tbl-ioc-ip"))
     parts.append(_list_table("도메인", ioc.domains, "도메인", "tbl-ioc-domain"))
     parts.append(_list_table("드롭된 파일", ioc.dropped_files, "파일 경로", "tbl-ioc-file"))
     parts.append(_list_table("레지스트리 키", ioc.registry_keys, "키 경로", "tbl-ioc-reg"))
