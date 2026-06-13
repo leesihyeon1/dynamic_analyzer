@@ -987,6 +987,27 @@ def run_analysis(
             result.tools_used["virustotal"] = "SHA256 계산 실패"
             status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
 
+        # ── 쉘코드 덤프 파일별 VT 조회 ────────────────────────────────
+        _sc_with_hash = [sa for sa in result.shellcode_analyses if sa.sha256]
+        if _sc_with_hash:
+            from analysis.vt_analyzer import query_vt_file_info as _qvt_fi
+            status(f"[분석] 쉘코드 덤프 VT 조회 중... ({len(_sc_with_hash)}개 파일)")
+            _sc_vt_hits = 0
+            for _sa in _sc_with_hash:
+                try:
+                    _fi = _qvt_fi(_sa.sha256, _vt_key, _vt_timeout)
+                    _sa.vt_detections = _fi["detections"]
+                    _sa.vt_total      = _fi["total"]
+                    _sa.vt_label      = _fi["label"]
+                    if _fi["detections"] > 0:
+                        _sc_vt_hits += 1
+                except Exception:
+                    pass
+            status(
+                f"      덤프 VT: {_sc_vt_hits}개 탐지됨"
+                + (f" / {len(_sc_with_hash) - _sc_vt_hits}개 미등록" if _sc_with_hash else "")
+            )
+
     status("[분석] 프로세스↔네트워크 연결 매핑...")
     # procmon_events 전체 사용 — PID 필터 없이 모든 프로세스의 통신을 기록.
     # NOISY_PROCESSES 는 noise_filter 에서 제거되지만 여기서는 raw 이벤트를 써서

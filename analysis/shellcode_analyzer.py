@@ -111,6 +111,9 @@ class ShellcodeAnalysis:
     sha256:       str       = ""    # 덤프 파일 SHA256
     yara_matches: list[str] = field(default_factory=list)  # 매칭된 YARA 룰 이름
     capa_techs:   list      = field(default_factory=list)  # list[MitreTechnique]
+    vt_detections: int      = -1   # -1 = 미조회/미등록, 0+ = 탐지 수
+    vt_total:      int      = 0    # 전체 VT 스캔 엔진 수
+    vt_label:      str      = ""   # VT 위협 레이블
     error:        str       = ""
 
     @property

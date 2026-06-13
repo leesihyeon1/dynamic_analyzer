@@ -1976,9 +1976,26 @@ def _shellcode_html(result) -> str:
                     f"{hash_inner}</table></details>"
                 )
 
+            # VT 셀
+            _vt_det = getattr(sa, "vt_detections", -1)
+            _vt_tot = getattr(sa, "vt_total", 0)
+            _vt_lbl = getattr(sa, "vt_label", "") or ""
+            if _vt_det == -1:
+                vt_cell = "<span style='color:#484f58;font-size:.75rem'>-</span>"
+            elif _vt_det == 0:
+                vt_cell = "<span style='color:#6e7681;font-size:.75rem'>미등록</span>"
+            else:
+                _vt_ratio = f"{_vt_det}/{_vt_tot}" if _vt_tot else str(_vt_det)
+                vt_cell = f"<span class='badge badge-red'>{_vt_ratio}</span>"
+                if _vt_lbl:
+                    vt_cell += (
+                        f"<div style='font-size:.7rem;color:#ff7b72;margin-top:.2rem;"
+                        f"word-break:break-all'>{_e(_vt_lbl)}</div>"
+                    )
+
             row_style = (
                 "background:rgba(255,123,114,.06)"
-                if sa.has_findings
+                if sa.has_findings or _vt_det > 0
                 else ("background:rgba(255,123,114,.03)" if sa.error else "")
             )
             rows += (
@@ -1997,6 +2014,8 @@ def _shellcode_html(result) -> str:
                 # 크기
                 f"<td class='mono' style='color:#8b949e;text-align:right;font-size:.8rem'>"
                 f"{size_str}</td>"
+                # VT
+                f"<td>{vt_cell}</td>"
                 # 결과
                 f"<td>{result_cell}</td>"
                 f"</tr>"
@@ -2004,7 +2023,7 @@ def _shellcode_html(result) -> str:
 
         parts.append(
             "<table id='tbl-shc-files' style='width:100%'>"
-            "<tr><th>파일명</th><th>프로세스</th><th>크기</th><th>결과 (YARA / CAPA)</th></tr>"
+            "<tr><th>파일명</th><th>프로세스</th><th>크기</th><th>VT</th><th>결과 (YARA / CAPA)</th></tr>"
             f"{rows}</table>"
         )
 
