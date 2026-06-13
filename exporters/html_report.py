@@ -1651,86 +1651,97 @@ def _shellcode_html(result) -> str:
             f"분석 파일 {len(analyses)}개 &nbsp;·&nbsp; "
             f"<b style='color:{hit_color}'>시그니처 히트 {len(hits)}개</b>"
             + (f" &nbsp;·&nbsp; 이상 없음 {len(no_hits)}개" if no_hits else "")
+            + (f" &nbsp;·&nbsp; <span style='color:#ff7b72'>오류 {len(err_items)}개</span>" if err_items else "")
             + f"</p>"
         )
 
-        if not hits and not err_items:
-            parts.append(
-                "<p class='alert alert-success'>"
-                "✅ 필터 통과 쉘코드 덤프에서 알려진 패턴 미탐지</p>"
+        # ── 전체 스캔 파일 목록 테이블 ────────────────────────────────
+        # hits → no_hits → err_items 순으로 출력
+        rows = ""
+        for sa in hits + no_hits + err_items:
+            fname    = Path(sa.dump_file).name
+            size_str = _fmt_bytes(sa.size_bytes) if sa.size_bytes else "?"
+
+            # 프로세스 셀
+            proc_cell = (
+                f"<span class='ev-process mono' style='font-size:.8rem'>"
+                f"{_e(sa.proc_name)}</span>"
+                f"<span style='color:#8b949e;font-size:.75rem'> ({sa.pid})</span>"
             )
-        else:
-            for sa in hits:
-                yara_html = " ".join(_b(m, "red") for m in sa.yara_matches)
-                capa_html = " ".join(
+
+            # 결과 셀
+            if sa.error and not sa.has_findings:
+                result_cell = (
+                    f"<span style='color:#ff7b72;font-size:.75rem'>"
+                    f"오류: {_e(sa.error[:120])}</span>"
+                )
+            elif sa.has_findings:
+                yara_badges = " ".join(_b(m, "red") for m in sa.yara_matches)
+                capa_badges = " ".join(
                     "<span class='badge badge-purple' title='"
                     + _e((t.tactic or "") + " / " + (t.technique_name or ""))
                     + "'>" + _e(t.technique_id) + "</span>"
                     for t in sa.capa_techs
                 )
-                fname     = Path(sa.dump_file).name
-                size_str  = f"{sa.size_bytes:,} B" if sa.size_bytes else "?"
-                # 해시 행 (있는 경우만)
-                hash_rows = ""
-                if sa.md5 or sa.sha256:
-                    hash_rows = "<table style='border-collapse:collapse;margin-top:.45rem;width:100%'>"
-                    if sa.md5:
-                        hash_rows += (
-                            "<tr>"
-                            "<td style='color:#8b949e;font-size:.72rem;white-space:nowrap;"
-                            "padding-right:.6rem;vertical-align:top'>MD5</td>"
-                            "<td class='mono' style='font-size:.72rem;word-break:break-all;"
-                            "color:#adbac7'>"
-                            + _e(sa.md5) + "</td></tr>"
-                        )
-                    if sa.sha256:
-                        hash_rows += (
-                            "<tr>"
-                            "<td style='color:#8b949e;font-size:.72rem;white-space:nowrap;"
-                            "padding-right:.6rem;vertical-align:top'>SHA256</td>"
-                            "<td class='mono' style='font-size:.72rem;word-break:break-all;"
-                            "color:#adbac7'>"
-                            + _e(sa.sha256) + "</td></tr>"
-                        )
-                    hash_rows += "</table>"
-                parts.append(
-                    f"<div class='card' style='margin:.35rem 0;padding:.6rem 1rem'>"
-                    # 헤더 행: 프로세스명 + PID / 파일명 + 크기
-                    f"<div style='display:flex;justify-content:space-between;"
-                    f"align-items:baseline;flex-wrap:wrap;gap:.3rem'>"
-                    f"<span><b style='color:#ffa657'>{_e(sa.proc_name)}</b> "
-                    f"<span style='color:#8b949e;font-size:.8rem'>PID {sa.pid}</span></span>"
-                    f"<span class='mono' style='color:#484f58;font-size:.72rem'>"
-                    f"{_e(fname)}&nbsp;&nbsp;{size_str}</span>"
-                    f"</div>"
-                    # 전체 경로 (접힌 상태)
-                    f"<details style='margin-top:.25rem'>"
-                    f"<summary style='color:#484f58;font-size:.72rem;cursor:pointer'>"
-                    f"전체 경로</summary>"
-                    f"<p class='mono' style='font-size:.7rem;color:#8b949e;"
-                    f"margin:.15rem 0 0;word-break:break-all'>{_e(sa.dump_file)}</p>"
-                    f"</details>"
-                    # 해시
-                    + hash_rows +
-                    # 시그니처 배지
-                    f"<div style='margin-top:.4rem'>{yara_html} {capa_html}</div>"
-                    f"</div>"
+                result_cell = (yara_badges + " " + capa_badges).strip()
+            else:
+                result_cell = "<span style='color:#56d364;font-size:.8rem'>이상없음</span>"
+
+            # 해시 (있으면 details 토글)
+            hash_detail = ""
+            if sa.md5 or sa.sha256:
+                hash_inner = ""
+                if sa.md5:
+                    hash_inner += (
+                        f"<tr><td style='color:#8b949e;font-size:.7rem;"
+                        f"padding-right:.5rem;white-space:nowrap'>MD5</td>"
+                        f"<td class='mono' style='font-size:.7rem;word-break:break-all;"
+                        f"color:#adbac7'>{_e(sa.md5)}</td></tr>"
+                    )
+                if sa.sha256:
+                    hash_inner += (
+                        f"<tr><td style='color:#8b949e;font-size:.7rem;"
+                        f"padding-right:.5rem;white-space:nowrap'>SHA256</td>"
+                        f"<td class='mono' style='font-size:.7rem;word-break:break-all;"
+                        f"color:#adbac7'>{_e(sa.sha256)}</td></tr>"
+                    )
+                hash_detail = (
+                    f"<details style='margin-top:.2rem'>"
+                    f"<summary style='color:#484f58;font-size:.7rem;cursor:pointer'>"
+                    f"해시</summary>"
+                    f"<table style='border-collapse:collapse;margin-top:.2rem'>"
+                    f"{hash_inner}</table></details>"
                 )
 
-            # 오류 항목 (YARA/CAPA 실패한 덤프)
-            if err_items:
-                parts.append(
-                    f"<details style='margin-top:.5rem'>"
-                    f"<summary style='color:#484f58;font-size:.78rem;cursor:pointer'>"
-                    f"분석 오류 {len(err_items)}개</summary>"
-                )
-                for sa in err_items:
-                    fname = Path(sa.dump_file).name
-                    parts.append(
-                        f"<p style='color:#484f58;font-size:.77rem;margin:.2rem .5rem'>"
-                        f"PID {sa.pid} / {_e(fname)}: {_e(sa.error[:160])}</p>"
-                    )
-                parts.append("</details>")
+            row_style = (
+                "background:rgba(255,123,114,.06)"
+                if sa.has_findings
+                else ("background:rgba(255,123,114,.03)" if sa.error else "")
+            )
+            rows += (
+                f"<tr style='{row_style}'>"
+                # 파일명 + 전체 경로 토글
+                f"<td class='mono' style='font-size:.8rem'>"
+                f"<details><summary style='cursor:pointer;list-style:none'>"
+                f"{_e(fname)}</summary>"
+                f"<span style='color:#8b949e;font-size:.7rem;word-break:break-all'>"
+                f"{_e(sa.dump_file)}</span></details>"
+                f"{hash_detail}</td>"
+                # 프로세스
+                f"<td>{proc_cell}</td>"
+                # 크기
+                f"<td class='mono' style='color:#8b949e;text-align:right;font-size:.8rem'>"
+                f"{size_str}</td>"
+                # 결과
+                f"<td>{result_cell}</td>"
+                f"</tr>"
+            )
+
+        parts.append(
+            "<table id='tbl-shc-files' style='width:100%'>"
+            "<tr><th>파일명</th><th>프로세스</th><th>크기</th><th>결과 (YARA / CAPA)</th></tr>"
+            f"{rows}</table>"
+        )
 
     return "\n".join(parts)
 
