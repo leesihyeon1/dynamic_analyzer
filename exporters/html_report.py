@@ -809,6 +809,57 @@ def _network_html(result) -> str:
     if not pcap:
         return "<p class='alert alert-info'>tshark 캡처 없음</p>"
 
+    # ── 공통 조회 테이블 (모든 섹션에서 공유) ─────────────────────
+    # DNS 응답 + TLS SNI → IP-to-domain 종합 매핑
+    combined_domains: dict[str, list[str]] = {}
+    for _ip, _doms in pcap.ip_to_domain.items():
+        _lst = combined_domains.setdefault(_ip, [])
+        for _d in _doms:
+            if _d not in _lst:
+                _lst.append(_d)
+    for _t in getattr(pcap, "tls_info", []):
+        if _t.dst_ip and _t.sni:
+            _lst = combined_domains.setdefault(_t.dst_ip, [])
+            if _t.sni not in _lst:
+                _lst.append(_t.sni)
+
+    # 호스트명 → IP 역매핑
+    hostname_to_ips: dict[str, list[str]] = {}
+    for _ip, _doms in combined_domains.items():
+        for _d in _doms:
+            hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
+
+    # 프로세스 매핑 룩업: (proto, dst_ip, dst_port) → 프로세스 목록
+    # ip_proc_lookup: ip → 프로세스 목록 (포트 무관 — HTTP 호스트명 매핑용)
+    pnmap = getattr(result, "process_network_map", [])
+    proc_lookup: dict[tuple, list[str]] = {}
+    ip_proc_lookup: dict[str, list[str]] = {}
+    for _pn in pnmap:
+        _label = f"{_pn.process} ({_pn.pid})"
+        _key   = (_pn.proto.upper(), _pn.remote_ip, _pn.remote_port)
+        proc_lookup.setdefault(_key, [])
+        if _label not in proc_lookup[_key]:
+            proc_lookup[_key].append(_label)
+        _ip_lst = ip_proc_lookup.setdefault(_pn.remote_ip, [])
+        if _label not in _ip_lst:
+            _ip_lst.append(_label)
+        for _mapped_ip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
+            _ip_key = (_pn.proto.upper(), _mapped_ip, _pn.remote_port)
+            proc_lookup.setdefault(_ip_key, [])
+            if _label not in proc_lookup[_ip_key]:
+                proc_lookup[_ip_key].append(_label)
+            _ip2_lst = ip_proc_lookup.setdefault(_mapped_ip, [])
+            if _label not in _ip2_lst:
+                _ip2_lst.append(_label)
+
+    def _proc_cell(procs: list[str]) -> str:
+        if procs:
+            return "<td>" + "<br>".join(
+                f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
+                for p in procs[:3]
+            ) + "</td>"
+        return "<td style='color:#8b949e'>-</td>"
+
     parts = []
 
     # ── 캡처 요약 ──────────────────────────────────────────────
@@ -828,20 +879,24 @@ def _network_html(result) -> str:
     # ── 비콘 탐지 ──────────────────────────────────────────────
     beacons = getattr(pcap, "beacon_candidates", [])
     if beacons:
-        rows = "".join(
-            f"<tr>"
-            f"<td class='mono ev-network'>{_e(b.dst_ip)}</td>"
-            f"<td class='mono'>{b.dst_port}</td>"
-            f"<td>{b.count}회</td>"
-            f"<td class='mono'>{b.interval_avg}s</td>"
-            f"<td>{_b(f'지터 {b.jitter_ratio:.1%}', 'red' if b.jitter_ratio < 0.1 else 'orange')}</td>"
-            f"</tr>"
-            for b in beacons[:100]
-        )
+        rows = ""
+        for b in beacons[:100]:
+            b_procs = (proc_lookup.get(("TCP", b.dst_ip, b.dst_port), [])
+                       or proc_lookup.get(("UDP", b.dst_ip, b.dst_port), []))
+            rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(b.dst_ip)}</td>"
+                f"<td class='mono'>{b.dst_port}</td>"
+                f"<td>{b.count}회</td>"
+                f"<td class='mono'>{b.interval_avg}s</td>"
+                f"<td>{_b(f'지터 {b.jitter_ratio:.1%}', 'red' if b.jitter_ratio < 0.1 else 'orange')}</td>"
+                + _proc_cell(b_procs) +
+                f"</tr>"
+            )
         parts.append(
             "<h3>🚨 비콘(Beaconing) 탐지</h3>"
             "<table id='tbl-net-beacon'><tr><th>목적지 IP</th><th>포트</th><th>횟수</th>"
-            "<th>평균 간격</th><th>규칙성</th></tr>"
+            "<th>평균 간격</th><th>규칙성</th><th>프로세스</th></tr>"
             f"{rows}</table>"
         )
 
@@ -854,18 +909,21 @@ def _network_html(result) -> str:
                 seen[t.sni] = t
         _TLS_LIMIT = 500
         seen_vals  = list(seen.values())
-        rows = "".join(
-            f"<tr>"
-            f"<td class='mono ev-network'>{_e(t.sni)}</td>"
-            f"<td class='mono'>{_e(t.dst_ip)}</td>"
-            f"<td class='mono'>{t.dst_port}</td>"
-            f"</tr>"
-            for t in seen_vals[:_TLS_LIMIT]
-        )
+        rows = ""
+        for t in seen_vals[:_TLS_LIMIT]:
+            t_procs = proc_lookup.get(("TCP", t.dst_ip, t.dst_port), [])
+            rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(t.sni)}</td>"
+                f"<td class='mono'>{_e(t.dst_ip)}</td>"
+                f"<td class='mono'>{t.dst_port}</td>"
+                + _proc_cell(t_procs) +
+                f"</tr>"
+            )
         parts.append(
             "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
             + _trunc_notice(len(seen_vals), _TLS_LIMIT)
-            + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th></tr>"
+            + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th><th>프로세스</th></tr>"
             + f"{rows}</table>"
         )
 
@@ -884,46 +942,6 @@ def _network_html(result) -> str:
     # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
         _CONN_LIMIT = 1000
-
-        # DNS 응답 + TLS SNI를 합쳐 IP → 도메인 종합 매핑
-        combined_domains: dict[str, list[str]] = {}
-        for ip, doms in pcap.ip_to_domain.items():
-            lst = combined_domains.setdefault(ip, [])
-            for d in doms:
-                if d not in lst:
-                    lst.append(d)
-        for t in getattr(pcap, "tls_info", []):
-            if t.dst_ip and t.sni:
-                lst = combined_domains.setdefault(t.dst_ip, [])
-                if t.sni not in lst:
-                    lst.append(t.sni)
-
-        # 호스트명 → IP 역매핑 (ProcMon이 "네트워크 주소 해석" ON 상태에서
-        # 호스트명을 로그하는 경우 pcap IP와 교차 매핑하기 위해 사용)
-        hostname_to_ips: dict[str, list[str]] = {}
-        for _ip, _doms in combined_domains.items():
-            for _d in _doms:
-                hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
-
-        # 프로세스-네트워크 매핑 룩업 테이블: (proto, dst_ip, dst_port) → 프로세스 목록
-        pnmap = getattr(result, "process_network_map", [])
-        proc_lookup: dict[tuple, list[str]] = {}
-        for pn in pnmap:
-            label = f"{pn.process} ({pn.pid})"
-            key = (pn.proto.upper(), pn.remote_ip, pn.remote_port)
-            if key not in proc_lookup:
-                proc_lookup[key] = []
-            if label not in proc_lookup[key]:
-                proc_lookup[key].append(label)
-            # ProcMon이 호스트명으로 로그한 경우:
-            # combined_domains 역매핑을 통해 해당 호스트명의 IP에도 동일 레이블 추가
-            for _mapped_ip in hostname_to_ips.get(pn.remote_ip.lower(), []):
-                _ip_key = (pn.proto.upper(), _mapped_ip, pn.remote_port)
-                if _ip_key not in proc_lookup:
-                    proc_lookup[_ip_key] = []
-                if label not in proc_lookup[_ip_key]:
-                    proc_lookup[_ip_key].append(label)
-
         sorted_conns = sorted(pcap.connections, key=lambda x: -x.bytes_out)
         rows = ""
         for c in sorted_conns[:_CONN_LIMIT]:
@@ -944,15 +962,6 @@ def _network_html(result) -> str:
             else:
                 dom_td = "<td style='color:#484f58'>-</td>"
 
-            # 프로세스 매핑
-            procs = proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
-            if procs:
-                proc_html = "<br>".join(
-                    f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
-                    for p in procs[:3]
-                )
-            else:
-                proc_html = "<span style='color:#8b949e'>-</span>"
             rows += (
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
@@ -962,7 +971,7 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
-                f"<td>{proc_html}</td>"
+                + _proc_cell(proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])) +
                 f"</tr>"
             )
         parts.append(
@@ -977,45 +986,59 @@ def _network_html(result) -> str:
     if pcap.dns_queries:
         _DNS_LIMIT   = 1000
         sorted_dns   = sorted(pcap.dns_queries, key=lambda x: -x.entropy)
-        rows = "".join(
-            f"<tr>"
-            f"<td class='mono {'ev-network' if not q.suspicious else ''}"
-            f"' style='{'color:#ff7b72' if q.suspicious else ''}'>{_e(q.name)}</td>"
-            f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
-            f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
-            f"<td class='mono' style='color:#56d364;font-size:0.72rem'>"
-            f"{_e(', '.join(q.response_ips[:3]))}</td>"
-            f"{'<td>' + _b('DGA?','red') + '</td>' if q.suspicious else '<td></td>'}"
-            f"</tr>"
-            for q in sorted_dns[:_DNS_LIMIT]
-        )
+        rows = ""
+        for q in sorted_dns[:_DNS_LIMIT]:
+            dns_procs: list[str] = []
+            for rip in q.response_ips[:5]:
+                for p in ip_proc_lookup.get(rip, []):
+                    if p not in dns_procs:
+                        dns_procs.append(p)
+            rows += (
+                f"<tr>"
+                f"<td class='mono {'ev-network' if not q.suspicious else ''}"
+                f"' style='{'color:#ff7b72' if q.suspicious else ''}'>{_e(q.name)}</td>"
+                f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
+                f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
+                f"<td class='mono' style='color:#56d364;font-size:0.72rem'>"
+                f"{_e(', '.join(q.response_ips[:3]))}</td>"
+                f"{'<td>' + _b('DGA?','red') + '</td>' if q.suspicious else '<td></td>'}"
+                + _proc_cell(dns_procs) +
+                f"</tr>"
+            )
         parts.append(
             "<h3>DNS 쿼리 (엔트로피 순)</h3>"
             + _trunc_notice(len(pcap.dns_queries), _DNS_LIMIT)
             + "<table id='tbl-net-dns'><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
-            "<th>응답 IP</th><th>의심</th></tr>"
+            "<th>응답 IP</th><th>의심</th><th>프로세스</th></tr>"
             + f"{rows}</table>"
         )
 
     # ── HTTP 요청 ──────────────────────────────────────────────
     if pcap.http_requests:
         _HTTP_LIMIT = 500
-        rows = "".join(
-            f"<tr>"
-            f"<td>{_b(r.method,'orange')}</td>"
-            f"<td class='mono'>{_e(r.host)}</td>"
-            f"<td class='mono ev-network'>{_e(r.path[:80])}</td>"
-            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:60])}</td>"
-            f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
-            f"<td>{'🍪' if r.has_cookie else ''}</td>"
-            f"</tr>"
-            for r in pcap.http_requests[:_HTTP_LIMIT]
-        )
+        rows = ""
+        for r in pcap.http_requests[:_HTTP_LIMIT]:
+            h_procs: list[str] = []
+            for hname in hostname_to_ips.get(r.host.lower(), []):
+                for p in ip_proc_lookup.get(hname, []):
+                    if p not in h_procs:
+                        h_procs.append(p)
+            rows += (
+                f"<tr>"
+                f"<td>{_b(r.method,'orange')}</td>"
+                f"<td class='mono'>{_e(r.host)}</td>"
+                f"<td class='mono ev-network'>{_e(r.path[:80])}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:60])}</td>"
+                f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
+                f"<td>{'🍪' if r.has_cookie else ''}</td>"
+                + _proc_cell(h_procs) +
+                f"</tr>"
+            )
         parts.append(
             "<h3>HTTP 요청</h3>"
             + _trunc_notice(len(pcap.http_requests), _HTTP_LIMIT)
             + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
-            "<th>User-Agent</th><th>Body</th><th>Cookie</th></tr>"
+            "<th>User-Agent</th><th>Body</th><th>Cookie</th><th>프로세스</th></tr>"
             + f"{rows}</table>"
         )
 
@@ -1024,8 +1047,9 @@ def _network_html(result) -> str:
     if smtp_sessions:
         rows = ""
         for s in smtp_sessions:
-            auth_badge = _b("AUTH", "red")   if s.has_auth else ""
-            data_badge = _b("DATA", "orange") if s.has_data else ""
+            auth_badge  = _b("AUTH", "red")   if s.has_auth else ""
+            data_badge  = _b("DATA", "orange") if s.has_data else ""
+            smtp_procs  = proc_lookup.get(("TCP", s.dst_ip, s.dst_port), [])
             rows += (
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(s.dst_ip)}</td>"
@@ -1035,13 +1059,14 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{_e(', '.join(s.rcpt_to) or '-')}</td>"
                 f"<td class='mono'>{_e(s.auth_user or '-')}</td>"
                 f"<td>{auth_badge} {data_badge}</td>"
+                + _proc_cell(smtp_procs) +
                 f"</tr>"
             )
         parts.append(
             "<h3 style='color:#ff7b72'>🚨 SMTP C2 세션</h3>"
             "<table id='tbl-net-smtp'><tr><th>C2 서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
             "<th>발신자 (MAIL FROM)</th><th>수신자 (RCPT TO)</th>"
-            "<th>AUTH 사용자명</th><th>플래그</th></tr>"
+            "<th>AUTH 사용자명</th><th>플래그</th><th>프로세스</th></tr>"
             f"{rows}</table>"
         )
 
@@ -1051,6 +1076,7 @@ def _network_html(result) -> str:
         rows = ""
         for s in ftp_sessions:
             auth_badge = _b("AUTH", "red") if s.has_auth else ""
+            ftp_procs  = proc_lookup.get(("TCP", s.dst_ip, s.dst_port), [])
             rows += (
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(s.dst_ip)}</td>"
@@ -1059,12 +1085,13 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{_e(', '.join(s.uploaded)  or '-')}</td>"
                 f"<td class='mono'>{_e(', '.join(s.downloaded) or '-')}</td>"
                 f"<td>{auth_badge}</td>"
+                + _proc_cell(ftp_procs) +
                 f"</tr>"
             )
         parts.append(
             "<h3 style='color:#ff7b72'>🚨 FTP C2 세션</h3>"
             "<table id='tbl-net-ftp'><tr><th>C2 서버 IP</th><th>포트</th><th>사용자명</th>"
-            "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th></tr>"
+            "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th><th>프로세스</th></tr>"
             f"{rows}</table>"
         )
 
@@ -1082,42 +1109,6 @@ def _is_private_ip_str(ip: str) -> bool:
     except Exception:
         return False
 
-
-def _process_network_html(result) -> str:
-    """프로세스↔네트워크 연결 매핑 테이블"""
-    pnmap = getattr(result, "process_network_map", [])
-    if not pnmap:
-        procmon_ran = getattr(result, "tools_used", {}).get("procmon", False)
-        if not procmon_ran:
-            return "<p class='alert alert-info'>ProcMon 네트워크 이벤트 없음 — procmon이 실행되지 않았습니다.</p>"
-        return (
-            "<p class='alert alert-info'>"
-            "ProcMon 네트워크 이벤트 없음 — 추적 PID 범위 내 외부 TCP/UDP 연결이 없습니다. "
-            "tshark 기반 네트워크 탭 결과를 참조하세요."
-            "</p>"
-        )
-
-    rows = ""
-    for c in pnmap[:1000]:
-        dir_color = "blue" if c.direction == "outbound" else "orange"
-        dir_label = "→ 송신" if c.direction == "outbound" else "← 수신"
-        rows += (
-            f"<tr>"
-            f"<td class='mono ev-process'>{_e(c.process)}"
-            f" <span style='color:#8b949e'>({c.pid})</span></td>"
-            f"<td>{_b(c.proto, 'blue')}</td>"
-            f"<td>{_b(dir_label, dir_color)}</td>"
-            f"<td class='mono ev-network'>{_e(c.remote_ip)}</td>"
-            f"<td class='mono'>{c.remote_port}</td>"
-            f"<td style='color:#8b949e;text-align:right'>{c.event_count:,}</td>"
-            f"</tr>"
-        )
-    return (
-        "<table id='tbl-proc-net'>"
-        "<tr><th>프로세스</th><th>프로토콜</th><th>방향</th>"
-        "<th>외부 IP</th><th>포트</th><th>이벤트</th></tr>"
-        f"{rows}</table>"
-    )
 
 
 def _compute_display_procs(result):
@@ -2228,9 +2219,6 @@ def generate_html_report(result, output_path: str) -> None:
 
   <h2>🌐 네트워크 활동 (tshark)</h2>
   {_network_html(result)}
-
-  <h2>🔗 프로세스 ↔ 네트워크 매핑 (ProcMon)</h2>
-  {_process_network_html(result)}
 
 </div>
 
