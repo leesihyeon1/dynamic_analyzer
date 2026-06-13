@@ -1045,9 +1045,59 @@ def _process_network_html(result) -> str:
     )
 
 
+def _compute_display_procs(result):
+    """정상 시스템 프로세스를 제외한 신규 프로세스 목록과 제외 건수를 반환합니다.
+
+    제외 조건: 화이트리스트 이름 AND 의심 탐지 없음 AND 의심 자손 없음.
+    의심 자손이 있는 경우(예: svchost → 인젝션 대상 자식) 트리 구조 보존을 위해 유지.
+    """
+    try:
+        from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
+    except Exception:
+        _WL = frozenset()
+
+    all_procs = result.process_diff.get("new_processes", [])
+    sample_pid = getattr(result, "sample_pid", None)
+
+    # 의심 PID 집합
+    suspicious_pids: set[int] = set()
+    for r in (getattr(result, "pe_sieve_results", None) or []):
+        if not getattr(r, "error", False) and getattr(r, "suspicious", 0) > 0:
+            suspicious_pids.add(r.pid)
+    hh_r = getattr(result, "hh_result", None)
+    if hh_r and not getattr(hh_r, "error", None):
+        for pr in getattr(hh_r, "process_results", []):
+            if getattr(pr, "suspicious", 0) > 0:
+                suspicious_pids.add(pr.pid)
+
+    # 전체 parent→children 맵
+    children_map: dict[int, list] = {}
+    for p in all_procs:
+        children_map.setdefault(p.ppid, []).append(p)
+
+    def _has_suspicious_desc(pid: int) -> bool:
+        if pid in suspicious_pids:
+            return True
+        for child in children_map.get(pid, []):
+            if _has_suspicious_desc(child.pid):
+                return True
+        return False
+
+    display, excluded = [], 0
+    for p in all_procs:
+        if (p.name.lower() in _WL
+                and p.pid not in suspicious_pids
+                and p.pid != sample_pid
+                and not _has_suspicious_desc(p.pid)):
+            excluded += 1
+        else:
+            display.append(p)
+    return display, excluded
+
+
 def _process_tree_html(result) -> str:
     """신규 프로세스를 부모-자식 트리로 시각화합니다."""
-    new_procs  = result.process_diff.get("new_processes", [])
+    new_procs, _excl = _compute_display_procs(result)
     snapshot   = getattr(result, "proc_after_snapshot", {}) or {}
     sample_pid = getattr(result, "sample_pid", None)
 
@@ -1179,13 +1229,18 @@ def _process_tree_html(result) -> str:
         return html
 
     # ── 전체 트리 렌더링 ─────────────────────────────────────────────
+    _excl_note = (
+        f"&nbsp;·&nbsp;<span style='color:#6e7681'>정상 시스템 프로세스 {_excl}개 제외</span>"
+        if _excl else ""
+    )
     parts = [
-        "<div style='display:flex;gap:.6rem;align-items:center;margin-bottom:.6rem'>",
+        "<div style='display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem'>",
         "<span style='font-size:.78rem;color:#8b949e'>",
         "💻 기존 프로세스&nbsp;&nbsp;",
         "⚡ <span style='color:#ffa657'>신규 프로세스</span>&nbsp;&nbsp;",
         "🎯 <span style='color:#e3b341'>샘플</span>&nbsp;&nbsp;",
         "🚨 <span style='color:#ff7b72'>의심 (pe-sieve/HH)</span>",
+        _excl_note,
         "</span>",
         "<button onclick='expandAllPT()' style='background:#21262d;border:1px solid #30363d;"
         "color:#8b949e;border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 펼치기</button>",
@@ -1209,14 +1264,24 @@ def _process_tree_html(result) -> str:
 
 
 def _process_html(result) -> str:
-    new_procs = result.process_diff.get("new_processes", [])
-    if not new_procs:
+    all_new = result.process_diff.get("new_processes", [])
+    if not all_new:
         return "<p class='alert alert-success'>신규 프로세스 없음</p>"
+
+    new_procs, excl_count = _compute_display_procs(result)
 
     # ── 프로세스 트리 ────────────────────────────────────────────────
     tree_html = _process_tree_html(result)
 
     # ── 플랫 테이블 ──────────────────────────────────────────────────
+    excl_note = ""
+    if excl_count:
+        excl_note = (
+            f"<p style='font-size:.78rem;color:#6e7681;margin:.3rem 0 .5rem'>"
+            f"정상 시스템 프로세스 {excl_count}개 표시 제외 "
+            f"(svchost.exe·explorer.exe 등 화이트리스트 대상, 의심 탐지 없음)</p>"
+        )
+
     rows = ""
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
@@ -1233,7 +1298,7 @@ def _process_html(result) -> str:
         f"{rows}</table>"
     )
 
-    return tree_html + table_html
+    return tree_html + excl_note + table_html
 
 
 def _render_proc_result(proc) -> str:
@@ -1738,7 +1803,7 @@ def generate_html_report(result, output_path: str) -> None:
             pass
 
     # ── 탭 배지 ──────────────────────────────────────────────────
-    proc_count = len(result.process_diff.get("new_processes", []))
+    proc_count = len(_compute_display_procs(result)[0])
     tab1_b    = ""   # 기본 분석: 개요만 (배지 없음)
     tab_att_b = _tb(tech_count,  "red"    if tech_count  else "gray") if tech_count  else ""
     tab_proc_b= _tb(proc_count,  "orange" if proc_count  else "gray") if proc_count  else ""
