@@ -665,6 +665,16 @@ def run_analysis(
         for _psr in result.pe_sieve_results:
             if not _psr.error and (_psr.implanted_shc > 0 or _psr.implanted_pe > 0):
                 result.all_pids.add(_psr.pid)
+        # ShellExecute (doc/xls/js 등) 모드: sample_pid = None 이므로
+        # 분석 중 새로 생성된 모든 프로세스 PID 를 추적 대상에 포함합니다.
+        # → 호스트 앱(WINWORD.EXE, wscript.exe 등)의 네트워크·파일 이벤트 누락 방지
+        if result.sample_pid is None:
+            _new_proc_pids = {
+                p.pid for p in result.process_diff.get("new_processes", [])
+            }
+            if _new_proc_pids:
+                result.all_pids.update(_new_proc_pids)
+                status(f"      [ShellExecute] 신규 프로세스 {len(_new_proc_pids)}개 PID 추적 추가")
         # 포커스 PID 기반 필터
         result.filtered_events = filter_events(
             result.procmon_events,

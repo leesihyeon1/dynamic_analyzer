@@ -693,8 +693,9 @@ def _file_events_html(result) -> tuple[str, int]:
 
 def _registry_events_html(result) -> str:
     from parsers.procmon_csv import EventCategory
+    _REG_OPS = ("RegSetValue", "RegCreateKey", "RegDeleteValue", "RegDeleteKey")
     events = [e for e in result.filtered_events if e.category == EventCategory.REGISTRY
-              and e.operation in ("RegSetValue","RegCreateKey","RegDeleteValue","RegDeleteKey")]
+              and e.operation in _REG_OPS]
     reg_diff = result.registry_diff
     added    = reg_diff.get("added", [])
     modified = reg_diff.get("modified", [])
@@ -703,6 +704,19 @@ def _registry_events_html(result) -> str:
 
     _REG_DIFF_LIMIT = 500
     _REG_EV_LIMIT   = 1000
+
+    # Regshot 0건이지만 ProcMon 이벤트가 존재할 때 불일치 경고
+    if not (added or modified) and events:
+        parts.append(
+            "<p class='alert alert-warning'>"
+            "<b>⚠ Regshot 비교: 변경 없음</b>"
+            f" &nbsp;·&nbsp; ProcMon 레지스트리 이벤트: <b>{len(events):,}건</b><br>"
+            "<span style='font-size:.82rem'>가능한 원인: "
+            "① 악성코드가 분석 종료 전 레지스트리를 원상복구 &nbsp;"
+            "② 일시적 쓰기(쓰기 즉시 삭제) &nbsp;"
+            "③ Regshot 캡처 범위 밖 하이브(예: HKCU 와 별개의 ntuser.dat)"
+            "</span></p>"
+        )
 
     # RegShot diff
     if added or modified:
@@ -998,7 +1012,15 @@ def _process_network_html(result) -> str:
     """프로세스↔네트워크 연결 매핑 테이블"""
     pnmap = getattr(result, "process_network_map", [])
     if not pnmap:
-        return "<p class='alert alert-info'>ProcMon 네트워크 이벤트 없음 (procmon 필요)</p>"
+        procmon_ran = getattr(result, "tools_used", {}).get("procmon", False)
+        if not procmon_ran:
+            return "<p class='alert alert-info'>ProcMon 네트워크 이벤트 없음 — procmon이 실행되지 않았습니다.</p>"
+        return (
+            "<p class='alert alert-info'>"
+            "ProcMon 네트워크 이벤트 없음 — 추적 PID 범위 내 외부 TCP/UDP 연결이 없습니다. "
+            "tshark 기반 네트워크 탭 결과를 참조하세요."
+            "</p>"
+        )
 
     rows = ""
     for c in pnmap[:1000]:
@@ -1625,17 +1647,60 @@ def generate_html_report(result, output_path: str) -> None:
     # ── 요약 카운트 ──────────────────────────────────────────────
     _hh      = getattr(result, "hh_result",        None)
     _ps_list = getattr(result, "pe_sieve_results",  None) or []
-    # 의심 프로세스 수 집계 (쉘코드 + PE 인젝션 + 훅 포함)
-    shc_total = 0
+
+    # 의심 프로세스 수 집계 — shellcode_analyzer 와 동일한 오탐 필터 적용
+    # (화이트리스트 시스템 프로세스 + 점수 미달 JIT 쉘코드 제외)
+    try:
+        from analysis.shellcode_analyzer import (
+            suspicion_score  as _shc_score,
+            _SYSTEM_PROC_WHITELIST as _SHC_WL,
+            _SCORE_THRESHOLD as _SHC_THR,
+        )
+        _shc_filter_ok = True
+    except Exception:
+        _shc_filter_ok = False
+
+    _new_pids_for_shc = {p.pid for p in result.process_diff.get("new_processes", [])}
+
+    def _is_real_suspicious(r) -> bool:
+        if not _shc_filter_ok:
+            return True
+        if getattr(r, "name", "").lower() in _SHC_WL:
+            return False
+        return r.pid in _new_pids_for_shc or _shc_score(r) >= _SHC_THR
+
+    shc_total       = 0
+    shc_fp_excluded = 0   # 오탐 필터로 제외된 수
+
     if _hh and not _hh.error:
-        shc_total += len(_hh.suspicious_processes)
-    shc_total += sum(1 for r in _ps_list if not r.error and r.suspicious > 0)
+        for _proc in _hh.suspicious_processes:
+            if _is_real_suspicious(_proc):
+                shc_total += 1
+            else:
+                shc_fp_excluded += 1
+
+    for _r in _ps_list:
+        if not _r.error and _r.suspicious > 0:
+            if _is_real_suspicious(_r):
+                shc_total += 1
+            else:
+                shc_fp_excluded += 1
 
     tech_count = len(techs)
     ip_count   = len(ioc.ip_addresses)  if ioc else 0
     file_count = len(ioc.dropped_files) if ioc else 0
     reg_added  = len(result.registry_diff.get("added",    []))
     reg_mod    = len(result.registry_diff.get("modified", []))
+    # ProcMon 레지스트리 이벤트 수 (Regshot diff 와 독립적으로 집계)
+    try:
+        from parsers.procmon_csv import EventCategory as _EC
+        _REG_OPS = {"RegSetValue", "RegCreateKey", "RegDeleteValue", "RegDeleteKey"}
+        procmon_reg_count = sum(
+            1 for e in result.filtered_events
+            if e.category == _EC.REGISTRY and e.operation in _REG_OPS
+        )
+    except Exception:
+        procmon_reg_count = 0
 
     # 파일시스템 탭 배지: ioc.dropped_files 가 아닌 실제 ProcMon 파일 이벤트 수
     try:
@@ -1709,7 +1774,7 @@ def generate_html_report(result, output_path: str) -> None:
   {_b('위협 수준: ' + threat_label, threat_color)}
   &nbsp;
   {_b(f'MITRE {tech_count}건', 'red' if tech_count else 'gray')}
-  {_b(f'인젝션·쉘코드 {shc_total}건', 'red' if shc_total else 'gray')}
+  {_b(f'인젝션·쉘코드 {shc_total}건' + (f' (오탐 {shc_fp_excluded}개 제외)' if shc_fp_excluded else ''), 'red' if shc_total else 'gray')}
   {_b(f'외부 IP {ip_count}건', 'orange' if ip_count else 'gray')}
   {_b(f'드롭 파일 {file_count}건', 'orange' if file_count else 'gray')}
 </p>
@@ -1766,10 +1831,10 @@ def generate_html_report(result, output_path: str) -> None:
       <table class="kv">
         <tr><td>신규 프로세스</td><td>{proc_count}</td></tr>
         <tr><td>레지스트리 추가</td><td>{reg_added}</td></tr>
-        <tr><td>레지스트리 변경</td><td>{reg_mod}</td></tr>
+        <tr><td>레지스트리 변경</td><td>{reg_mod} <span style='color:#8b949e;font-size:.78rem'>(Regshot) / {procmon_reg_count:,} (ProcMon)</span></td></tr>
         <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
         <tr><td>DNS 쿼리</td><td>{dns_count}</td></tr>
-        <tr><td>인젝션·쉘코드 의심</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}개 프로세스</b></td></tr>
+        <tr><td>인젝션·쉘코드 의심</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}개 프로세스</b>{"<span style='color:#8b949e;font-size:.78rem'>&nbsp;(오탐 " + str(shc_fp_excluded) + "개 제외)</span>" if shc_fp_excluded else ""}</td></tr>
       </table>
     </div>
   </div>
