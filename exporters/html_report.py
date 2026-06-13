@@ -1114,27 +1114,33 @@ def _is_private_ip_str(ip: str) -> bool:
 
 
 def _compute_display_procs(result):
-    """정상 시스템 프로세스를 제외한 신규 프로세스 목록과 제외 건수를 반환합니다.
+    """정상·무관 프로세스를 제외한 신규 프로세스 목록과 제외 건수를 반환합니다.
 
     제외 조건 (모두 충족해야 제외):
-      1. 화이트리스트 이름 (svchost.exe, explorer.exe 등)
+      1. 화이트리스트 이름 OR filtered_events에 이벤트 없음
+         (ReadFile·RegQueryKey 등은 noise_filter 에서 이미 제거됨)
       2. pe-sieve/HH 의심 탐지 없음
-      3. 악성 실행 체인(malware_chain) 외부 — 악성 프로세스의 자손이 아님
+      3. 악성 실행 체인(malware_chain) 외부
       4. 의심 자손 없음
 
-    malware_chain 계산:
-      씨드 = sample_pid ∪ 비화이트리스트 신규 프로세스 (cmd.exe, powershell.exe 등)
-      씨드의 모든 자손(화이트리스트 여부 무관) → 실행 흐름 전체 포함
+    malware_chain 씨드:
+      1) sample_pid
+      2) pe-sieve/HH 탐지 PID
+      3) filtered_events에 실제 이벤트가 있는 비화이트리스트 신규 프로세스
+         → WriteFile·TCP·레지스트리 변경 등 실질적 활동이 있는 프로세스만 포함
+         → SearchFilterHost·splwow64 등 ReadFile 전용 백그라운드 프로세스 자동 제외
+
+    씨드가 하나도 없으면(ProcMon 미사용 등) 비화이트리스트 전체로 폴백.
     """
     try:
         from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
     except Exception:
         _WL = frozenset()
 
-    all_procs = result.process_diff.get("new_processes", [])
+    all_procs  = result.process_diff.get("new_processes", [])
     sample_pid = getattr(result, "sample_pid", None)
 
-    # 의심 PID 집합
+    # ── 의심 PID 집합 ────────────────────────────────────────────────
     suspicious_pids: set[int] = set()
     for r in (getattr(result, "pe_sieve_results", None) or []):
         if not getattr(r, "error", False) and getattr(r, "suspicious", 0) > 0:
@@ -1145,15 +1151,29 @@ def _compute_display_procs(result):
             if getattr(pr, "suspicious", 0) > 0:
                 suspicious_pids.add(pr.pid)
 
-    # ── 악성 실행 체인 계산 ───────────────────────────────────────────
-    # 씨드: sample_pid + 비화이트리스트 신규 프로세스 (악성 실행 흐름 진입점)
+    # ── filtered_events 에 실제 이벤트가 있는 PID 집합 ─────────────
+    # noise_filter 를 통과한 이벤트(WriteFile·TCP·RegSetValue 등)를 하나라도
+    # 발생시킨 프로세스 = 분석 대상 활동과 실제로 연관된 프로세스
+    pids_with_events: set[int] = {
+        ev.pid for ev in (getattr(result, "filtered_events", None) or [])
+    }
+
+    # ── 악성 실행 체인 계산 ─────────────────────────────────────────
     malware_chain: set[int] = set()
     if sample_pid is not None:
         malware_chain.add(sample_pid)
+    malware_chain.update(suspicious_pids)
+    # ProcMon 이벤트가 있는 비WL 신규 프로세스만 씨드로 추가
     for p in all_procs:
-        if p.name.lower() not in _WL:
+        if p.pid in pids_with_events and p.name.lower() not in _WL:
             malware_chain.add(p.pid)
-    # 씨드의 자손을 반복 확장 (whitelist 이름이더라도 악성 프로세스가 낳은 자식은 포함)
+    # 씨드가 전혀 없으면 비WL 전체로 폴백 (ProcMon 미사용 케이스)
+    if not malware_chain:
+        for p in all_procs:
+            if p.name.lower() not in _WL:
+                malware_chain.add(p.pid)
+
+    # 씨드 자손 반복 확장 (WL 이름이더라도 악성 프로세스의 자식은 포함)
     changed = True
     while changed:
         changed = False
@@ -1162,7 +1182,7 @@ def _compute_display_procs(result):
                 malware_chain.add(p.pid)
                 changed = True
 
-    # 전체 parent→children 맵
+    # ── 전체 parent→children 맵 ──────────────────────────────────────
     children_map: dict[int, list] = {}
     for p in all_procs:
         children_map.setdefault(p.ppid, []).append(p)
@@ -1177,10 +1197,12 @@ def _compute_display_procs(result):
 
     display, excluded = [], 0
     for p in all_procs:
-        if (p.name.lower() in _WL
+        # 화이트리스트이거나 ProcMon 이벤트가 없는(= 실질 활동 없는) 프로세스를 제외
+        no_activity = (p.name.lower() in _WL or p.pid not in pids_with_events)
+        if (no_activity
                 and p.pid not in suspicious_pids
                 and p.pid != sample_pid
-                and p.pid not in malware_chain       # 악성 실행 체인 내부는 항상 표시
+                and p.pid not in malware_chain
                 and not _has_suspicious_desc(p.pid)):
             excluded += 1
         else:
@@ -1371,8 +1393,8 @@ def _process_html(result) -> str:
     if excl_count:
         excl_note = (
             f"<p style='font-size:.78rem;color:#6e7681;margin:.3rem 0 .5rem'>"
-            f"정상 시스템 프로세스 {excl_count}개 표시 제외 "
-            f"(svchost.exe·explorer.exe 등 화이트리스트 대상, 의심 탐지 없음)</p>"
+            f"무관 프로세스 {excl_count}개 표시 제외 "
+            f"(화이트리스트 시스템 프로세스 또는 ProcMon 활동 없는 프로세스, 의심 탐지 없음)</p>"
         )
 
     rows = ""
