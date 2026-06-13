@@ -718,12 +718,17 @@ def _file_events_html(result) -> tuple[str, int]:
         "RenameFile": "yellow", "SetEndOfFile": "gray", "CreateFile": "purple",
     }
     for e in events[:_FILE_LIMIT]:
+        detail_str = (e.detail or "").strip()[:160]
+        detail_html = (
+            f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
+            if detail_str else ""
+        )
         rows += (
             f"<tr>"
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
             f"<td class='mono'>{_e(e.process)} <span style='color:#8b949e'>({e.pid})</span></td>"
             f"<td>{_b(e.operation, op_color.get(e.operation,'gray'))}</td>"
-            f"<td class='mono ev-file'>{_e(e.path[:120])}</td>"
+            f"<td class='mono ev-file'>{_e(e.path[:120])}{detail_html}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
             f"</tr>"
         )
