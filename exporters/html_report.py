@@ -1172,6 +1172,16 @@ def _compute_display_procs(result):
             if getattr(pr, "suspicious", 0) > 0:
                 suspicious_pids.add(pr.pid)
 
+    # ── pe-sieve 이상없음(정상 판정) PID 집합 ────────────────────────
+    # pe-sieve 가 명시적으로 스캔하고 이상없음으로 판정한 프로세스.
+    # ProcessWatcher 가 감지해 all_pids 에 포함됐더라도 악성 체인에 없는 한
+    # 트리에 추가하지 않음 (화이트리스트와 동일하게 취급).
+    pesieve_cleared_pids: set[int] = {
+        r.pid
+        for r in (getattr(result, "pe_sieve_results", None) or [])
+        if not getattr(r, "error", False) and getattr(r, "suspicious", 0) == 0
+    }
+
     # ── filtered_events에 이벤트가 있는 PID (WriteFile·TCP·RegSetValue 등) ──
     pids_with_events: set[int] = {
         ev.pid for ev in (getattr(result, "filtered_events", None) or [])
@@ -1233,19 +1243,24 @@ def _compute_display_procs(result):
 
     display, excluded = [], 0
     for p in all_procs:
-        # 체인 외부 프로세스는 추가로 pids_with_events 여부 확인
-        # (EXE 모드: ReadFile 전용 백그라운드 프로세스 추가 제거)
+        # 악성 체인 내부 / pe-sieve 의심 / sample_pid → 항상 표시
         if p.pid in malware_chain or p.pid in suspicious_pids or p.pid == sample_pid:
             display.append(p)
             continue
+        # 의심 자손이 있으면 표시 (부모 경로 보존)
         if _has_suspicious_desc(p.pid):
             display.append(p)
             continue
-        # 체인 외부 + 비의심: WL이거나 ProcMon 이벤트 없으면 제외
-        if p.name.lower() in _WL or p.pid not in pids_with_events:
+        # 제외 조건: 아래 중 하나라도 해당하면 제외
+        #   1. 화이트리스트 프로세스명
+        #   2. ProcMon 이벤트 없음 (ReadFile 전용 백그라운드 등)
+        #   3. pe-sieve 가 명시적으로 이상없음 판정한 프로세스
+        if (p.name.lower() in _WL
+                or p.pid not in pids_with_events
+                or p.pid in pesieve_cleared_pids):
             excluded += 1
         else:
-            # 체인 외부지만 실질 활동 있는 비WL: 분석가에게 보여줌
+            # 체인 외부지만 ProcMon 이벤트 있고 pe-sieve 미스캔 비WL: 보여줌
             display.append(p)
     return display, excluded
 
