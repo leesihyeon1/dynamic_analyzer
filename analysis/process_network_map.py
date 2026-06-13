@@ -33,12 +33,14 @@ class ProcNetConnection:
 # 내부 상수
 # ---------------------------------------------------------------------------
 
-# ProcMon 네트워크 경로: "src_ip:port -> dst_ip:port" 형태 파싱
+# ProcMon 네트워크 경로: "src:port -> dst:port" 형태 파싱.
+# dst는 순수 IP 주소 또는 ProcMon의 "네트워크 주소 해석" 옵션으로 변환된
+# 호스트명(예: dns.google) 모두 허용.  IPv6 주소는 [::1] 형태로 출력됨.
 _ARROW_RE = re.compile(
-    r'([\d\.a-fA-F:\[\]]+):(\d+)\s*->\s*([\d\.a-fA-F:\[\]]+):(\d+)'
+    r'([\w\.\-\:\[\]]+):(\d+)\s*->\s*([\w\.\-\:\[\]]+):(\d+)'
 )
-# 단독 "ip:port" 형태 파싱
-_SINGLE_RE = re.compile(r'([\d\.a-fA-F:\[\]]+):(\d+)')
+# 단독 "host:port" 형태 파싱
+_SINGLE_RE = re.compile(r'([\w\.\-\:\[\]]+):(\d+)')
 
 # 아웃바운드 판정 오퍼레이션
 _OUTBOUND_OPS: frozenset[str] = frozenset({
@@ -56,13 +58,17 @@ _INBOUND_OPS: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 
 def _parse_path(path: str) -> tuple[str | None, int | None, str | None, int | None]:
-    """경로 문자열 → (src_ip, src_port, dst_ip, dst_port). 파싱 실패 시 None 반환."""
+    """경로 문자열 → (src, src_port, dst, dst_port). 파싱 실패 시 None 반환.
+
+    IPv6 주소는 ProcMon에서 [fe80::1] 형태로 출력되므로 괄호를 제거해 반환.
+    dst는 IP 주소 또는 호스트명일 수 있음 (ProcMon 설정에 따라 상이).
+    """
     m = _ARROW_RE.search(path)
     if m:
-        return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+        return m.group(1).strip('[]'), int(m.group(2)), m.group(3).strip('[]'), int(m.group(4))
     m = _SINGLE_RE.search(path)
     if m:
-        return None, None, m.group(1), int(m.group(2))
+        return None, None, m.group(1).strip('[]'), int(m.group(2))
     return None, None, None, None
 
 

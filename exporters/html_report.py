@@ -898,16 +898,31 @@ def _network_html(result) -> str:
                 if t.sni not in lst:
                     lst.append(t.sni)
 
+        # 호스트명 → IP 역매핑 (ProcMon이 "네트워크 주소 해석" ON 상태에서
+        # 호스트명을 로그하는 경우 pcap IP와 교차 매핑하기 위해 사용)
+        hostname_to_ips: dict[str, list[str]] = {}
+        for _ip, _doms in combined_domains.items():
+            for _d in _doms:
+                hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
+
         # 프로세스-네트워크 매핑 룩업 테이블: (proto, dst_ip, dst_port) → 프로세스 목록
         pnmap = getattr(result, "process_network_map", [])
         proc_lookup: dict[tuple, list[str]] = {}
         for pn in pnmap:
-            key = (pn.proto.upper(), pn.remote_ip, pn.remote_port)
             label = f"{pn.process} ({pn.pid})"
+            key = (pn.proto.upper(), pn.remote_ip, pn.remote_port)
             if key not in proc_lookup:
                 proc_lookup[key] = []
             if label not in proc_lookup[key]:
                 proc_lookup[key].append(label)
+            # ProcMon이 호스트명으로 로그한 경우:
+            # combined_domains 역매핑을 통해 해당 호스트명의 IP에도 동일 레이블 추가
+            for _mapped_ip in hostname_to_ips.get(pn.remote_ip.lower(), []):
+                _ip_key = (pn.proto.upper(), _mapped_ip, pn.remote_port)
+                if _ip_key not in proc_lookup:
+                    proc_lookup[_ip_key] = []
+                if label not in proc_lookup[_ip_key]:
+                    proc_lookup[_ip_key].append(label)
 
         sorted_conns = sorted(pcap.connections, key=lambda x: -x.bytes_out)
         rows = ""
