@@ -170,7 +170,6 @@ python analyzer.py malware.exe
         │
         ▼
 [6/6] 분석              사후 스냅샷 → 레지스트리·프로세스 diff
-                        조기 종료 프로세스 pe-sieve 결과로 보완
                         ProcMon CSV 파싱 + 노이즈 필터
                         인젝션 대상 PID 이벤트 자동 포함
                         PCAP 파싱 (연결, DNS, TLS SNI, HTTP, SMTP, FTP)
@@ -330,6 +329,37 @@ dynamic_analyzer/
 ---
 
 ## 변경 이력
+
+### v1.7 — HTML 리포트 품질 개선 · 프로세스/메모리 탭 정확도 향상
+
+- **프로세스 탭 정상 프로세스 필터링** (`exporters/html_report.py`)
+  - `svchost.exe`, `explorer.exe`, `dwm.exe` 등 시스템 프로세스를 프로세스 트리·테이블에서 자동 제외
+  - **악성코드 실행 체인 보존**: 악성 프로세스가 생성한 자식은 이름이 시스템 프로세스명이어도 표시 (`malware_chain` 재귀 확장)
+  - 탭 배지 숫자 및 "N개 제외" 범례 표시
+
+- **프로세스 탭 데이터 소스 명확화** (`core/orchestrator.py`)
+  - pe-sieve 스캔 PID를 `new_processes`에 주입하던 "보완 블록" 완전 제거
+  - 프로세스 트리/탭은 OS 스냅샷(psutil 전·후 diff)만 사용, pe-sieve 결과는 메모리 탭 전용
+
+- **메모리 탭 시스템 프로세스 오탐 필터링** (`exporters/html_report.py`)
+  - hollows-hunter / pe-sieve가 탐지한 결과 중 화이트리스트 프로세스 + PE인젝션·교체 없음 → 자동 숨김
+  - `dwm.exe`, `explorer.exe`, `SearchApp.exe` 등 Windows 정상 프로세스의 쉘코드·훅 오탐 제거
+  - 실제 PE인젝션(`implanted_pe > 0`) 또는 교체(`replaced > 0`) 탐지 시 화이트리스트여도 표시
+  - 필터된 개수를 하단에 표기하여 분석가에게 투명하게 공개
+
+- **MITRE ATT&CK 탭 연동 상태 표시** (`core/orchestrator.py`, `exporters/html_report.py`)
+  - CAPA / VirusTotal 실행 결과를 상태 칩으로 표시 (미설치·PE 미지원·비활성·결과 N건 등)
+  - CAPA가 PE 파일만 지원함을 명시하여 .doc/.xls 분석 시 혼선 방지
+
+- **레지스트리 이벤트 표시 한도 3,000건으로 상향** (`exporters/html_report.py`)
+  - 기존 1,000건 → 3,000건 (JS 페이지네이션으로 브라우저 성능 영향 없음)
+
+- **네트워크 탭 도메인 컬럼 추가** (`exporters/html_report.py`)
+  - 연결 테이블에 "도메인" 독립 컬럼 추가 (기존: IP 셀 내 숨겨진 서브텍스트)
+  - DNS 응답(`ip_to_domain`) + TLS SNI(`tls_info`) 두 소스를 합산하여 가장 넓은 커버리지 제공
+  - 동일 IP에 복수 도메인 매핑 시 대표 도메인 + `+N` 배지
+
+---
 
 ### v1.6 — 쉘코드 재분석 · CAPA/VT 통합 · 이벤트 필터 개선
 
