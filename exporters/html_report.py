@@ -712,12 +712,31 @@ def _file_events_html(result) -> tuple[str, int]:
     if not events:
         return "<p class='alert alert-success'>파일 시스템 이벤트 없음</p>", 0
 
+    # ── 중복 제거: (pid, operation, path) 기준으로 그룹화 ────────────
+    from collections import OrderedDict
+    deduped: OrderedDict = OrderedDict()
+    for e in events:
+        key = (e.pid, e.operation, e.path)
+        if key in deduped:
+            deduped[key]["count"] += 1
+        else:
+            deduped[key] = {"event": e, "count": 1}
+    deduped_events = list(deduped.values())
+    total_deduped = len(deduped_events)
+
     rows = ""
     op_color = {
         "WriteFile": "blue", "DeleteFile": "red",
         "RenameFile": "yellow", "SetEndOfFile": "gray", "CreateFile": "purple",
     }
-    for e in events[:_FILE_LIMIT]:
+    for item in deduped_events[:_FILE_LIMIT]:
+        e     = item["event"]
+        count = item["count"]
+        count_html = (
+            f"&nbsp;<span style='background:#30363d;color:#8b949e;font-size:0.68rem;"
+            f"padding:1px 5px;border-radius:9px'>×{count}</span>"
+            if count > 1 else ""
+        )
         detail_str = (e.detail or "").strip()[:160]
         detail_html = (
             f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
@@ -727,13 +746,21 @@ def _file_events_html(result) -> tuple[str, int]:
             f"<tr>"
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
             f"<td class='mono'>{_e(e.process)} <span style='color:#8b949e'>({e.pid})</span></td>"
-            f"<td>{_b(e.operation, op_color.get(e.operation,'gray'))}</td>"
+            f"<td>{_b(e.operation, op_color.get(e.operation,'gray'))}{count_html}</td>"
             f"<td class='mono ev-file'>{_e(e.path[:120])}{detail_html}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
             f"</tr>"
         )
+    dedup_note = (
+        f"<p style='font-size:.78rem;color:#6e7681;margin:.2rem 0 .4rem'>"
+        f"총 {total}건 → 중복 제거 후 {total_deduped}건 표시"
+        f"&nbsp;·&nbsp;배지 <span style='background:#30363d;color:#8b949e;font-size:0.68rem;"
+        f"padding:1px 5px;border-radius:9px'>×N</span> = 동일 이벤트 반복 횟수</p>"
+        if total != total_deduped else ""
+    )
     html = (
         _trunc_notice(total, _FILE_LIMIT)
+        + dedup_note
         + "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
         + rows + "</table>"
     )
