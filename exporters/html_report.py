@@ -1214,14 +1214,12 @@ def _process_tree_html(result) -> str:
         name = f"PID {pid}"
         exe  = ""
         cmd  = ""
-        proc_note = ""
         if proc:
             name = getattr(proc, "name", "") or name
             exe  = getattr(proc, "exe",  "") or ""
             cl   = getattr(proc, "cmdline", []) or []
             if len(cl) > 1:
                 cmd = " ".join(cl[1:])[:160]
-            proc_note = getattr(proc, "note", "") or ""
 
         # 노드 스타일
         if is_suspicious:
@@ -1278,9 +1276,6 @@ def _process_tree_html(result) -> str:
             html += f"<div class='pt-meta'>{_e(exe)}</div>"
         if cmd:
             html += f"<div class='pt-meta' style='color:#484f58'>▸ {_e(cmd)}</div>"
-        if proc_note:
-            html += (f"<div class='pt-meta' style='color:#6e7681;font-size:.72rem'>"
-                     f"ℹ {_e(proc_note)}</div>")
 
         if has_children:
             html += f"<div class='pt-children' id='{uid}'>"
@@ -1347,23 +1342,17 @@ def _process_html(result) -> str:
 
     rows = ""
     for p in new_procs:
-        cmdline  = " ".join(p.cmdline) if p.cmdline else ""
-        p_note   = getattr(p, "note", "") or ""
-        note_td  = (
-            f"<td class='mono' style='color:#6e7681;font-size:0.7rem'>ℹ {_e(p_note)}</td>"
-            if p_note else "<td></td>"
-        )
+        cmdline = " ".join(p.cmdline) if p.cmdline else ""
         rows += (
             f"<tr>"
             f"<td class='mono'>{p.pid}</td>"
             f"<td class='mono ev-process'>{_e(p.name)}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
-            f"{note_td}"
             f"</tr>"
         )
     table_html = (
-        "<table id='tbl-process'><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th><th>비고</th></tr>"
+        "<table id='tbl-process'><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
         f"{rows}</table>"
     )
 

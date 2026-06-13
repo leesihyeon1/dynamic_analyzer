@@ -615,38 +615,9 @@ def run_analysis(
                     status(f"      PID {pid}: 이상 없음 ✅")
 
     # ── 조기 종료 프로세스 보완 ───────────────────────────────────────
-    # 드로퍼·로더처럼 쉘코드 주입 후 자가종료하는 샘플은 proc_after 에 없어
-    # new_processes 목록이 비고 프로세스 탭이 빈 화면이 됩니다.
-    # pe-sieve 가 스캔한 PID 중 proc_after 에 없는 신규 PID 를 보완합니다.
-    try:
-        from core.process_tracker import ProcessSnapshot as _PS
-        _after_pids         = set(proc_after.keys())
-        _before_pids        = set(proc_before.keys())
-        _existing_new_pids  = {p.pid for p in result.process_diff.get("new_processes", [])}
-        _supplemental: list = []
-        for _psr in result.pe_sieve_results:
-            if (not _psr.error
-                    and _psr.pid not in _after_pids      # 종료됨
-                    and _psr.pid not in _before_pids     # 분석 전부터 있던 프로세스 제외
-                    and _psr.pid not in _existing_new_pids):
-                _supplemental.append(_PS(
-                    pid         = _psr.pid,
-                    ppid        = 0,   # 부모 정보 없음 → ppid=0 = 루트로 표시
-                    name        = _psr.name or f"pid_{_psr.pid}",
-                    exe         = "",
-                    cmdline     = [],
-                    create_time = 0.0,
-                    note        = "pe-sieve 탐지 · 스냅샷 수집 전 종료 (부모·경로 정보 없음)",
-                ))
-        if _supplemental:
-            result.process_diff.setdefault("new_processes", []).extend(_supplemental)
-            status(
-                "      [보완] 조기 종료 프로세스 "
-                + str(len(_supplemental)) + "개 추가 ("
-                + ", ".join(p.name for p in _supplemental) + ")"
-            )
-    except Exception as _supp_err:
-        status(f"      [경고] 프로세스 보완 실패: {_supp_err}")
+    # pe-sieve 결과는 메모리 탭(result.pe_sieve_results)에서 표시합니다.
+    # 프로세스 트리는 OS 스냅샷(psutil) 기반으로만 구성하므로
+    # pe-sieve 스캔 PID를 new_processes에 보완하지 않습니다.
 
     # ── 7. 파싱 ─────────────────────────────────────────────────────
     status("[분석] ProcMon CSV 파싱...")
