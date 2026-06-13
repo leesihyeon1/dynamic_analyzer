@@ -1461,7 +1461,7 @@ def _process_html(result) -> str:
     # ── 프로세스 트리 ────────────────────────────────────────────────
     tree_html = _process_tree_html(result)
 
-    # ── 플랫 테이블 ──────────────────────────────────────────────────
+    # ── 플랫 테이블 (악성 체인 필터) ────────────────────────────────
     excl_note = ""
     if excl_count:
         excl_note = (
@@ -1486,7 +1486,50 @@ def _process_html(result) -> str:
         f"{rows}</table>"
     )
 
-    return tree_html + excl_note + table_html
+    # ── 전체 프로세스 기록 (화이트리스트 오탐만 제외) ────────────────
+    all_procs_html = _all_procs_html(result, chain_pids={p.pid for p in new_procs})
+
+    return tree_html + excl_note + table_html + all_procs_html
+
+
+def _all_procs_html(result, chain_pids: set) -> str:
+    """화이트리스트 오탐만 제외한 신규 프로세스 전체 기록 테이블."""
+    all_new = result.process_diff.get("new_processes", [])
+    try:
+        from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
+    except Exception:
+        _WL = frozenset()
+
+    table_procs = [p for p in all_new if p.name.lower() not in _WL]
+    wl_excl = len(all_new) - len(table_procs)
+
+    note = (
+        f"<p style='font-size:.78rem;color:#6e7681;margin:1.2rem 0 .4rem'>"
+        f"<strong style='color:#cdd9e5'>전체 프로세스 기록</strong>"
+        f"&nbsp;— 오탐(화이트리스트) {wl_excl}개 제외 · {len(table_procs)}개"
+        f"&nbsp;·&nbsp;<span style='opacity:.5'>흐린 행</span> = 악성 체인 외부</p>"
+    )
+
+    rows = ""
+    for p in table_procs:
+        cmdline = " ".join(p.cmdline) if p.cmdline else ""
+        tr_open = "<tr>" if p.pid in chain_pids else "<tr style='opacity:.45'>"
+        rows += (
+            f"{tr_open}"
+            f"<td class='mono'>{p.pid}</td>"
+            f"<td class='mono ev-process'>{_e(p.name)}</td>"
+            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
+            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
+            f"</tr>"
+        )
+
+    return (
+        note
+        + "<table id='tbl-process-all'>"
+        + "<tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
+        + rows
+        + "</table>"
+    )
 
 
 def _render_proc_result(proc, exe: str = "") -> str:
