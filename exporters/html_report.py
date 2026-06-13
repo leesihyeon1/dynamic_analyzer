@@ -1048,8 +1048,15 @@ def _process_network_html(result) -> str:
 def _compute_display_procs(result):
     """정상 시스템 프로세스를 제외한 신규 프로세스 목록과 제외 건수를 반환합니다.
 
-    제외 조건: 화이트리스트 이름 AND 의심 탐지 없음 AND 의심 자손 없음.
-    의심 자손이 있는 경우(예: svchost → 인젝션 대상 자식) 트리 구조 보존을 위해 유지.
+    제외 조건 (모두 충족해야 제외):
+      1. 화이트리스트 이름 (svchost.exe, explorer.exe 등)
+      2. pe-sieve/HH 의심 탐지 없음
+      3. 악성 실행 체인(malware_chain) 외부 — 악성 프로세스의 자손이 아님
+      4. 의심 자손 없음
+
+    malware_chain 계산:
+      씨드 = sample_pid ∪ 비화이트리스트 신규 프로세스 (cmd.exe, powershell.exe 등)
+      씨드의 모든 자손(화이트리스트 여부 무관) → 실행 흐름 전체 포함
     """
     try:
         from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
@@ -1070,6 +1077,23 @@ def _compute_display_procs(result):
             if getattr(pr, "suspicious", 0) > 0:
                 suspicious_pids.add(pr.pid)
 
+    # ── 악성 실행 체인 계산 ───────────────────────────────────────────
+    # 씨드: sample_pid + 비화이트리스트 신규 프로세스 (악성 실행 흐름 진입점)
+    malware_chain: set[int] = set()
+    if sample_pid is not None:
+        malware_chain.add(sample_pid)
+    for p in all_procs:
+        if p.name.lower() not in _WL:
+            malware_chain.add(p.pid)
+    # 씨드의 자손을 반복 확장 (whitelist 이름이더라도 악성 프로세스가 낳은 자식은 포함)
+    changed = True
+    while changed:
+        changed = False
+        for p in all_procs:
+            if p.pid not in malware_chain and p.ppid in malware_chain:
+                malware_chain.add(p.pid)
+                changed = True
+
     # 전체 parent→children 맵
     children_map: dict[int, list] = {}
     for p in all_procs:
@@ -1088,6 +1112,7 @@ def _compute_display_procs(result):
         if (p.name.lower() in _WL
                 and p.pid not in suspicious_pids
                 and p.pid != sample_pid
+                and p.pid not in malware_chain       # 악성 실행 체인 내부는 항상 표시
                 and not _has_suspicious_desc(p.pid)):
             excluded += 1
         else:
