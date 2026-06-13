@@ -59,6 +59,12 @@ NOISY_PROCESSES: frozenset[str] = frozenset(
         "wireshark.exe",
         "zoomit.exe",
         "zoomit64.exe",
+        "hollows_hunter.exe",
+        "hollows_hunter64.exe",
+        "hollows-hunter.exe",
+        "hollows-hunter64.exe",
+        "pe-sieve.exe",
+        "pe-sieve64.exe",
     }
 )
 

@@ -1161,6 +1161,15 @@ def _compute_display_procs(result):
     all_procs  = result.process_diff.get("new_processes", [])
     sample_pid = getattr(result, "sample_pid", None)
 
+    # ── 분석 도구 PID 집합 (suspicious 판정에서 항상 제외) ────────────
+    # HH/pe-sieve가 자기 자신을 탐지하는 FP를 방지.
+    _TOOL_NAMES: frozenset[str] = frozenset({
+        "hollows_hunter.exe", "hollows_hunter64.exe",
+        "hollows-hunter.exe", "hollows-hunter64.exe",
+        "pe-sieve.exe", "pe-sieve64.exe",
+    })
+    _tool_pids: set[int] = {p.pid for p in all_procs if p.name.lower() in _TOOL_NAMES}
+
     # ── 의심 PID 집합 ────────────────────────────────────────────────
     suspicious_pids: set[int] = set()
     for r in (getattr(result, "pe_sieve_results", None) or []):
@@ -1171,6 +1180,9 @@ def _compute_display_procs(result):
         for pr in getattr(hh_r, "process_results", []):
             if getattr(pr, "suspicious", 0) > 0:
                 suspicious_pids.add(pr.pid)
+
+    # 분석 도구 자체는 의심 목록에서 제거
+    suspicious_pids -= _tool_pids
 
     # ── pe-sieve 이상없음(정상 판정) PID 집합 ────────────────────────
     # pe-sieve 가 명시적으로 스캔하고 이상없음으로 판정한 프로세스.
@@ -1243,6 +1255,10 @@ def _compute_display_procs(result):
 
     display, excluded = [], 0
     for p in all_procs:
+        # 분석 도구(HH, pe-sieve)는 탐지 결과와 무관하게 항상 제외
+        if p.pid in _tool_pids:
+            excluded += 1
+            continue
         # 악성 체인 내부 / pe-sieve 의심 / sample_pid → 항상 표시
         if p.pid in malware_chain or p.pid in suspicious_pids or p.pid == sample_pid:
             display.append(p)

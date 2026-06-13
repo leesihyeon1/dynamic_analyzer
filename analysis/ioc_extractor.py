@@ -137,6 +137,9 @@ _ANALYSIS_TOOL_PATH_FRAGMENTS: tuple[str, ...] = (
     "imhex.exe",
     "cff explorer",
     "internet_detector",
+    "hollows_hunter",
+    "hollows-hunter",
+    "pe-sieve",
 )
 
 # Registry path fragments that indicate persistence / injection
