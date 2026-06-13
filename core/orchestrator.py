@@ -377,6 +377,20 @@ def run_analysis(
         try:
             if ext in _SHELL_EXEC_SUFFIXES:
                 # Office/스크립트/PDF 등 — 연관 앱(Word, wscript 등)으로 ShellExecute
+                # 기존 인스턴스가 살아있으면 DDE 핸드오프로 새 PID 가 즉시 종료됨.
+                # → startfile 전에 호스트 앱을 종료해 추적 가능한 새 PID 를 생성.
+                _OFFICE_HOSTS: list[tuple[frozenset, str, list[str]]] = [
+                    (frozenset({".doc", ".docx", ".docm", ".dot", ".dotm", ".rtf"}),
+                     "기존 Word 인스턴스", ["winword.exe"]),
+                    (frozenset({".xls", ".xlsx", ".xlsm", ".xlt", ".xltm"}),
+                     "기존 Excel 인스턴스", ["excel.exe"]),
+                    (frozenset({".ppt", ".pptx", ".pptm", ".pot", ".potm"}),
+                     "기존 PowerPoint 인스턴스", ["powerpnt.exe"]),
+                ]
+                for _exts, _label, _exes in _OFFICE_HOSTS:
+                    if ext in _exts:
+                        _kill_analysis_tool(None, exe_names=_exes, status=status, label=_label)
+                        break
                 import os as _os
                 _os.startfile(str(config.sample_path))
                 result.sample_pid = None   # 호스트 앱 PID는 procmon/process_diff 로 추적
@@ -637,6 +651,12 @@ def run_analysis(
         for _psr in result.pe_sieve_results:
             if not _psr.error and (_psr.implanted_shc > 0 or _psr.implanted_pe > 0):
                 result.all_pids.add(_psr.pid)
+        # ProcessWatcher 가 실시간 감지한 PID 를 all_pids 에 추가.
+        # after-snapshot 이전에 종료된 단명 프로세스(PowerShell 로더, 인젝터 등)는
+        # process_diff["new_processes"] 에 포함되지 않으므로 여기서 보완.
+        if rt_scanned_pids:
+            result.all_pids.update(rt_scanned_pids)
+            status(f"      [실시간] 감지 PID {len(rt_scanned_pids)}개 추적 추가")
         # ShellExecute (doc/xls/js 등) 모드: sample_pid = None 이므로
         # 분석 중 새로 생성된 모든 프로세스 PID 를 추적 대상에 포함합니다.
         # → 호스트 앱(WINWORD.EXE, wscript.exe 등)의 네트워크·파일 이벤트 누락 방지

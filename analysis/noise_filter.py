@@ -177,7 +177,13 @@ def filter_events(
                 and is_suspicious_path(ev.path)
             )
 
-            if is_noisy_proc and not write_to_suspicious:
+            # wmiprvse.exe 의 Process Create 는 WMI 경유 프로세스 생성(T1047)
+            # 체인을 추적하기 위해 통과시킴 — 나머지 wmiprvse 이벤트는 계속 제거
+            wmi_spawn = (
+                proc_lower == "wmiprvse.exe"
+                and ev.operation == "Process Create"
+            )
+            if is_noisy_proc and not write_to_suspicious and not wmi_spawn:
                 continue
 
             # --- 3. Noisy operations ----------------------------------------
