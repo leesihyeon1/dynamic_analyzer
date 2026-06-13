@@ -1288,6 +1288,9 @@ def _process_tree_html(result) -> str:
     root_parent_pids: set[int] = {
         p.ppid for p in new_procs if p.ppid not in new_pid_set
     }
+    # pe-sieve/HH 탐지 기존 프로세스 (new_processes 에 없는 것):
+    # 인젝션 후 자식 없이 C2 통신만 하는 경우에도 트리에 표시
+    root_parent_pids |= (set(pe_map) | set(hh_map)) - new_pid_set
 
     def get_snap(pid: int):
         if pid in snapshot:
