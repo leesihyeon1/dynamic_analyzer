@@ -668,15 +668,26 @@ def run_analysis(
                 result.all_pids.update(_new_proc_pids)
                 status(f"      [ShellExecute] 신규 프로세스 {len(_new_proc_pids)}개 PID 추적 추가")
         # ── 단명 프로세스 보완 ────────────────────────────────────────
-        # all_pids 확정 후 BFS로 ProcMon Process Create 체인을 순회해
-        # 스냅샷 종료 전에 이미 종료된 프로세스(단발성 PowerShell, cmd 로더 등)를
-        # process_diff["new_processes"] 에 추가하고 all_pids 에도 반영합니다.
-        # → filter_events 호출 전에 실행해야 단명 프로세스의 이벤트도 포함됩니다.
+        # 두 단계로 구성:
+        #
+        # [Step 1] all_pids 에 있지만 new_processes 에 없는 PID 보완
+        #   ProcessWatcher 또는 pe-sieve 가 탐지했으나 스냅샷 전에 종료된 프로세스
+        #   (DDE handoff 기존 WINWORD, 단발 PowerShell 등)
+        #   → ProcMon Process Create 이벤트에서 child_pid 로 등장하면 신규 프로세스로 확정
+        #
+        # [Step 2] BFS 로 새 자손 발굴
+        #   보완된 프로세스(Step 1 포함)의 자식 중 new_processes 에 없는 것 추가
+        #
+        # filter_events 호출 전에 실행해야 보완된 PID 의 이벤트도 포함됩니다.
         from parsers.procmon_csv import get_child_proc_infos, ChildProcInfo
         from core.process_tracker import ProcessSnapshot as _ProcSnap
 
         _child_infos: list[ChildProcInfo] = get_child_proc_infos(result.procmon_events)
-        # 부모 PID → 자식 목록 인덱스 (BFS용)
+        # child_pid → ChildProcInfo (Step 1 보완용)
+        _child_by_pid: dict[int, ChildProcInfo] = {
+            _ci.child_pid: _ci for _ci in _child_infos
+        }
+        # 부모 PID → 자식 목록 (Step 2 BFS 용)
         _parent_idx: dict[int, list[ChildProcInfo]] = {}
         for _ci in _child_infos:
             _parent_idx.setdefault(_ci.parent_pid, []).append(_ci)
@@ -684,9 +695,38 @@ def run_analysis(
         _new_proc_pids: set[int] = {
             p.pid for p in result.process_diff.get("new_processes", [])
         }
-        _visited: set[int] = set(result.all_pids) | _new_proc_pids
+        _added: int = 0
+
+        def _add_proc(_ci: ChildProcInfo) -> None:
+            """합성 ProcessSnapshot을 new_processes / all_pids 에 추가."""
+            nonlocal _added
+            result.process_diff["new_processes"].append(_ProcSnap(
+                pid         = _ci.child_pid,
+                ppid        = _ci.parent_pid,
+                name        = _ci.name,
+                exe         = _ci.exe,
+                cmdline     = _ci.cmdline,
+                create_time = 0.0,
+                note        = "단명 프로세스 (ProcMon Process Create 보완)",
+            ))
+            result.all_pids.add(_ci.child_pid)
+            _new_proc_pids.add(_ci.child_pid)
+            _added += 1
+
+        # Step 1: all_pids 중 new_processes 에 없는 PID를 직접 보완
+        # ProcessWatcher 가 감지했으나 스냅샷 전에 종료된 단명 프로세스
+        # (ProcMon Process Create 이벤트에 child_pid 로 등장 = 분석 중 신규 생성 확정)
+        for _pid in list(result.all_pids):
+            if _pid in _new_proc_pids:
+                continue
+            if _pid in _child_by_pid:
+                _add_proc(_child_by_pid[_pid])
+
+        # Step 2: 보완된 프로세스를 포함한 all_pids 에서 BFS로 추가 자손 발굴
+        # _visited 는 new_proc_pids 기준으로 초기화 (all_pids 를 넣으면 Step 1 이후
+        # 보완된 PID 를 BFS 가 다시 건너뛰는 문제가 생기므로 분리)
+        _visited: set[int] = set(_new_proc_pids)
         _queue: list[int]  = list(result.all_pids)
-        _added: int        = 0
 
         while _queue:
             _pid = _queue.pop()
@@ -696,18 +736,7 @@ def run_analysis(
                 _visited.add(_ci.child_pid)
                 _queue.append(_ci.child_pid)
                 if _ci.child_pid not in _new_proc_pids:
-                    result.process_diff["new_processes"].append(_ProcSnap(
-                        pid         = _ci.child_pid,
-                        ppid        = _ci.parent_pid,
-                        name        = _ci.name,
-                        exe         = _ci.exe,
-                        cmdline     = _ci.cmdline,
-                        create_time = 0.0,
-                        note        = "단명 프로세스 (ProcMon Process Create 보완)",
-                    ))
-                    result.all_pids.add(_ci.child_pid)
-                    _new_proc_pids.add(_ci.child_pid)
-                    _added += 1
+                    _add_proc(_ci)
 
         if _added:
             status(f"      [ProcMon] 단명 프로세스 {_added}개 보완 (스냅샷 누락)")
