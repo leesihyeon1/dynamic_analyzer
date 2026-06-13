@@ -804,6 +804,16 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def _proc_cell(procs: list[str]) -> str:
+    """프로세스 목록 → <td> HTML. 빈 경우 회색 '-' 반환."""
+    if procs:
+        return "<td>" + "<br>".join(
+            f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
+            for p in procs[:3]
+        ) + "</td>"
+    return "<td style='color:#8b949e'>-</td>"
+
+
 def _network_html(result) -> str:
     pcap = result.pcap_result
     if not pcap:
@@ -851,14 +861,6 @@ def _network_html(result) -> str:
             _ip2_lst = ip_proc_lookup.setdefault(_mapped_ip, [])
             if _label not in _ip2_lst:
                 _ip2_lst.append(_label)
-
-    def _proc_cell(procs: list[str]) -> str:
-        if procs:
-            return "<td>" + "<br>".join(
-                f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
-                for p in procs[:3]
-            ) + "</td>"
-        return "<td style='color:#8b949e'>-</td>"
 
     parts = []
 
@@ -1857,6 +1859,63 @@ def _ioc_html(result) -> str:
 </script>"""
         )
 
+    # ── 프로세스 매핑 조회 테이블 구성 ───────────────────────────
+    # 도메인 → IP 역매핑 (URL 프로세스 매핑용)
+    hostname_to_ips: dict[str, list[str]] = {}
+    for _ip, _doms in combined_dom.items():
+        for _d in _doms:
+            hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
+
+    # (proto, dst_ip, dst_port) → 프로세스 목록  &  ip → 프로세스 목록
+    pnmap = getattr(result, "process_network_map", [])
+    _proc_lookup: dict[tuple, list[str]] = {}
+    ip_proc_lookup: dict[str, list[str]] = {}
+    for _pn in pnmap:
+        _label = f"{_pn.process} ({_pn.pid})"
+        _key   = (_pn.proto.upper(), _pn.remote_ip, _pn.remote_port)
+        _proc_lookup.setdefault(_key, [])
+        if _label not in _proc_lookup[_key]:
+            _proc_lookup[_key].append(_label)
+        _ipl = ip_proc_lookup.setdefault(_pn.remote_ip, [])
+        if _label not in _ipl:
+            _ipl.append(_label)
+        for _mip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
+            _mk = (_pn.proto.upper(), _mip, _pn.remote_port)
+            _proc_lookup.setdefault(_mk, [])
+            if _label not in _proc_lookup[_mk]:
+                _proc_lookup[_mk].append(_label)
+            _mipl = ip_proc_lookup.setdefault(_mip, [])
+            if _label not in _mipl:
+                _mipl.append(_label)
+
+    # WriteFile 이벤트 → 파일경로(소문자): 프로세스 매핑
+    file_proc_map: dict[str, list[str]] = {}
+    try:
+        from parsers.procmon_csv import EventCategory as _EC
+        for _ev in getattr(result, "filtered_events", []):
+            if _ev.category != _EC.FILE or _ev.operation != "WriteFile":
+                continue
+            _lp    = _ev.path.lower()
+            _label = f"{_ev.process} ({_ev.pid})"
+            _lst   = file_proc_map.setdefault(_lp, [])
+            if _label not in _lst:
+                _lst.append(_label)
+    except Exception:
+        pass
+
+    # HTTP 요청 → URL: 프로세스 매핑
+    url_proc_map: dict[str, list[str]] = {}
+    if pcap:
+        for _r in getattr(pcap, "http_requests", []):
+            _url = f"http://{_r.host}{_r.path or '/'}"
+            _url_procs: list[str] = []
+            for _hip in hostname_to_ips.get(_r.host.lower(), []):
+                for _p in ip_proc_lookup.get(_hip, []):
+                    if _p not in _url_procs:
+                        _url_procs.append(_p)
+            if _url_procs:
+                url_proc_map[_url] = _url_procs
+
     # ── 나머지 IOC 목록 ───────────────────────────────────────────
     def _list_table(title: str, items: list, label: str, table_id: str = "") -> str:
         if not items:
@@ -1870,9 +1929,46 @@ def _ioc_html(result) -> str:
         )
 
     parts.append(_list_table("도메인", ioc.domains, "도메인", "tbl-ioc-domain"))
-    parts.append(_list_table("드롭된 파일", ioc.dropped_files, "파일 경로", "tbl-ioc-file"))
+
+    # ── 드롭된 파일 (프로세스 매핑 포함) ──────────────────────────
+    if ioc.dropped_files:
+        rows = ""
+        for fp in ioc.dropped_files[:_IOC_LIMIT]:
+            procs = file_proc_map.get(fp.lower(), [])
+            rows += (
+                f"<tr>"
+                f"<td class='mono'>{_e(fp)}</td>"
+                + _proc_cell(procs) +
+                f"</tr>"
+            )
+        parts.append(
+            "<h3>드롭된 파일</h3>"
+            + _trunc_notice(len(ioc.dropped_files), _IOC_LIMIT)
+            + "<table id='tbl-ioc-file'>"
+            + "<tr><th>파일 경로</th><th>프로세스</th></tr>"
+            + rows + "</table>"
+        )
+
     parts.append(_list_table("레지스트리 키", ioc.registry_keys, "키 경로", "tbl-ioc-reg"))
-    parts.append(_list_table("URL", ioc.urls, "URL", "tbl-ioc-url"))
+
+    # ── URL (프로세스 매핑 포함) ───────────────────────────────────
+    if ioc.urls:
+        rows = ""
+        for url in ioc.urls[:_IOC_LIMIT]:
+            procs = url_proc_map.get(url, [])
+            rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(url)}</td>"
+                + _proc_cell(procs) +
+                f"</tr>"
+            )
+        parts.append(
+            "<h3>URL</h3>"
+            + _trunc_notice(len(ioc.urls), _IOC_LIMIT)
+            + "<table id='tbl-ioc-url'>"
+            + "<tr><th>URL</th><th>프로세스</th></tr>"
+            + rows + "</table>"
+        )
 
     return "\n".join(p for p in parts if p)
 
