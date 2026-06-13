@@ -985,14 +985,10 @@ def run_analysis(
             status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
 
     status("[분석] 프로세스↔네트워크 연결 매핑...")
-    # filtered_events 는 NOISY_PROCESSES 필터로 인해 인젝션된 시스템 프로세스의
-    # TCP 이벤트가 제거될 수 있음 → procmon_events 원본에서 PID 필터만 적용
-    _nm_pids = result.all_pids if result.all_pids else None
-    _nm_events = (
-        [ev for ev in result.procmon_events if ev.pid in _nm_pids]
-        if _nm_pids else result.procmon_events
-    )
-    result.process_network_map = build_process_network_map(_nm_events)
+    # procmon_events 전체 사용 — PID 필터 없이 모든 프로세스의 통신을 기록.
+    # NOISY_PROCESSES 는 noise_filter 에서 제거되지만 여기서는 raw 이벤트를 써서
+    # 인젝션된 시스템 프로세스(svchost 등)의 TCP 이벤트도 누락 없이 포함.
+    result.process_network_map = build_process_network_map(result.procmon_events)
     if result.process_network_map:
         status(f"      {len(result.process_network_map)}개 연결 집계")
 

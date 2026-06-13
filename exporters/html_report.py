@@ -1006,6 +1006,14 @@ def _network_html(result) -> str:
             else:
                 dom_td = "<td style='color:#484f58'>-</td>"
 
+            # 프로세스 lookup: OUTBOUND는 dst_ip 기준, INBOUND(dst=VM 사설IP)는 src_ip 기준
+            if _is_private_ip_str(c.dst_ip):
+                _conn_procs = ip_proc_lookup.get(c.src_ip, [])
+            else:
+                _conn_procs = (
+                    proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
+                    or ip_proc_lookup.get(c.dst_ip, [])
+                )
             rows += (
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
@@ -1015,7 +1023,7 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
-                + _proc_cell(proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])) +
+                + _proc_cell(_conn_procs) +
                 f"</tr>"
             )
         parts.append(
