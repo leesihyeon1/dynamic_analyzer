@@ -1435,10 +1435,25 @@ def _render_proc_result(proc) -> str:
     )
 
 
+def _mem_is_noise(proc_result, wl: frozenset) -> bool:
+    """화이트리스트 프로세스 + PE인젝션·교체 없음 → 시스템 프로세스 오탐으로 간주해 숨김."""
+    name = (getattr(proc_result, "name", "") or "").lower()
+    if name not in wl:
+        return False
+    pe       = getattr(proc_result, "implanted_pe", 0) or 0
+    replaced = getattr(proc_result, "replaced",     0) or 0
+    return pe == 0 and replaced == 0
+
+
 def _shellcode_html(result) -> str:
     """pe-sieve / hollows-hunter 쉘코드·인젝션 결과"""
     hh_r    = getattr(result, "hh_result",        None)
     pe_list = getattr(result, "pe_sieve_results",  None) or []
+
+    try:
+        from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _MEM_WL
+    except ImportError:
+        _MEM_WL = frozenset()
 
     if hh_r is None and not pe_list:
         return (
@@ -1511,15 +1526,30 @@ def _shellcode_html(result) -> str:
             f"</div>"
         )
 
-    # ── hollows-hunter 상세 (의심 프로세스만) ─────────────────────
+    # ── hollows-hunter 상세 (의심 프로세스만, 화이트리스트 noise 제외) ────
     if has_hh_data:
-        if hh_r.suspicious_processes:
-            for proc in hh_r.suspicious_processes:
+        hh_show    = [p for p in hh_r.suspicious_processes if not _mem_is_noise(p, _MEM_WL)]
+        hh_noise_n = len(hh_r.suspicious_processes) - len(hh_show)
+        if hh_show:
+            for proc in hh_show:
                 parts.append(_render_proc_result(proc))
+            if hh_noise_n:
+                parts.append(
+                    f"<p style='font-size:.76rem;color:#6e7681;margin:.25rem 0'>"
+                    f"시스템 프로세스 {hh_noise_n}개 제외 "
+                    f"(쉘코드·훅만 탐지, PE인젝션·교체 없음 — 오탐 가능성 높음)</p>"
+                )
         else:
-            parts.append(
-                "<p class='alert alert-success'>✅ hollows-hunter: 인젝션 / 쉘코드 미탐지</p>"
-            )
+            if hh_noise_n:
+                parts.append(
+                    f"<p class='alert alert-success'>✅ hollows-hunter: 유의미한 인젝션 미탐지"
+                    f"<span style='font-size:.8rem;color:#6e7681'> "
+                    f"(시스템 프로세스 {hh_noise_n}개 제외)</span></p>"
+                )
+            else:
+                parts.append(
+                    "<p class='alert alert-success'>✅ hollows-hunter: 인젝션 / 쉘코드 미탐지</p>"
+                )
 
     # ── pe-sieve 프로세스 상세 ────────────────────────────────────
     if pe_list:
@@ -1527,9 +1557,9 @@ def _shellcode_html(result) -> str:
             "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;padding-top:.75rem'>"
             "pe-sieve — 신규 프로세스 &amp; 의심 DLL 로드 프로세스 스캔 결과</h3>"
         )
+        pe_noise_n = 0
         for r in pe_list:
             if r.error:
-                # 에러 전문을 title 툴팁에, 앞 160자를 본문에 표시
                 full_err  = _e(r.error)
                 short_err = _e(r.error[:160]) + ("…" if len(r.error) > 160 else "")
                 parts.append(
@@ -1537,13 +1567,22 @@ def _shellcode_html(result) -> str:
                     f"PID {r.pid}: {short_err}</p>"
                 )
             elif r.suspicious > 0:
-                parts.append(_render_proc_result(r))
+                if _mem_is_noise(r, _MEM_WL):
+                    pe_noise_n += 1
+                else:
+                    parts.append(_render_proc_result(r))
             else:
                 arch = "64bit" if r.is_64bit else "32bit"
                 parts.append(
                     f"<p style='color:#56d364;font-size:0.82rem;margin:.25rem 0'>"
                     f"✅ PID {r.pid} ({_e(arch)}): 이상 없음</p>"
                 )
+        if pe_noise_n:
+            parts.append(
+                f"<p style='font-size:.76rem;color:#6e7681;margin:.25rem 0'>"
+                f"pe-sieve: 시스템 프로세스 {pe_noise_n}개 제외 "
+                f"(PE인젝션·교체 없음 — 오탐 가능성 높음)</p>"
+            )
 
     # ── 쉘코드 덤프 재분석 결과 ───────────────────────────────────────
     analyses = getattr(result, "shellcode_analyses", None) or []
