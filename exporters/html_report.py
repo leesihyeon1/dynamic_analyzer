@@ -1304,8 +1304,16 @@ def _process_tree_html(result) -> str:
         p.ppid for p in new_procs if p.ppid not in new_pid_set
     }
     # pe-sieve/HH 탐지 기존 프로세스 (new_processes 에 없는 것):
-    # 인젝션 후 자식 없이 C2 통신만 하는 경우에도 트리에 표시
-    root_parent_pids |= (set(pe_map) | set(hh_map)) - new_pid_set
+    # 인젝션 후 자식 없이 C2 통신만 하는 경우에도 트리에 표시.
+    # HH 탐지 중 쉘코드 전용(PE인젝션 없음)은 JIT 컴파일 오탐 가능성이 높아 제외.
+    # (Chrome V8, DWM, SearchApp 등 JIT 엔진은 HH가 쉘코드로 오인함)
+    _hh_pe_injected = {
+        pid for pid, pr in hh_map.items()
+        if getattr(pr, "implanted_pe", 0) > 0
+    }
+    # 트리에서 제외된 HH 쉘코드 전용 탐지 기존 프로세스 집합 (헤더 노트용)
+    _hh_shc_only_excl = (set(hh_map) - _hh_pe_injected - new_pid_set - set(pe_map))
+    root_parent_pids |= (set(pe_map) | _hh_pe_injected) - new_pid_set
 
     def get_snap(pid: int):
         if pid in snapshot:
@@ -1406,6 +1414,12 @@ def _process_tree_html(result) -> str:
         f"&nbsp;·&nbsp;<span style='color:#6e7681'>정상 시스템 프로세스 {_excl}개 제외</span>"
         if _excl else ""
     )
+    _hh_excl_note = (
+        f"&nbsp;·&nbsp;<span style='color:#6e7681' "
+        f"title='JIT 컴파일 엔진(Chrome V8, DWM, SearchApp 등) HH 쉘코드 오탐 가능성'>"
+        f"HH 쉘코드 전용 탐지 {len(_hh_shc_only_excl)}개 제외</span>"
+        if _hh_shc_only_excl else ""
+    )
     parts = [
         "<div style='display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem'>",
         "<span style='font-size:.78rem;color:#8b949e'>",
@@ -1414,6 +1428,7 @@ def _process_tree_html(result) -> str:
         "🎯 <span style='color:#e3b341'>샘플</span>&nbsp;&nbsp;",
         "🚨 <span style='color:#ff7b72'>의심 (pe-sieve/HH)</span>",
         _excl_note,
+        _hh_excl_note,
         "</span>",
         "<button onclick='expandAllPT()' style='background:#21262d;border:1px solid #30363d;"
         "color:#8b949e;border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 펼치기</button>",
