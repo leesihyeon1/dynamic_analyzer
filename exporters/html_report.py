@@ -736,7 +736,7 @@ def _registry_events_html(result) -> str:
     parts = []
 
     _REG_DIFF_LIMIT = 500
-    _REG_EV_LIMIT   = 1000
+    _REG_EV_LIMIT   = 3000
 
     # Regshot 0건이지만 ProcMon 이벤트가 존재할 때 불일치 경고
     if not (added or modified) and events:
