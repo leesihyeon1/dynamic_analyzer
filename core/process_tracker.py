@@ -83,6 +83,7 @@ class ProcessSnapshot:
     exe: str
     cmdline: list[str] = field(default_factory=list)
     create_time: float = 0.0
+    note: str = ""   # 보완 사유 (예: "pe-sieve 탐지 / 스냅샷 수집 전 종료")
 
 
 # ---------------------------------------------------------------------------

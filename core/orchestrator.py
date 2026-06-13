@@ -636,6 +636,7 @@ def run_analysis(
                     exe         = "",
                     cmdline     = [],
                     create_time = 0.0,
+                    note        = "pe-sieve 탐지 · 스냅샷 수집 전 종료 (부모·경로 정보 없음)",
                 ))
         if _supplemental:
             result.process_diff.setdefault("new_processes", []).extend(_supplemental)
