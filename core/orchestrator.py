@@ -831,6 +831,13 @@ def run_analysis(
                 status(f"      [알림] 종료된 PID (스캔 불가): {sorted(_dead_inject)}")
         # else: 의심 DLL 로드 없음 — 상태 로그 불필요
 
+    # step 7.5 에서 새로 추가된 pe-sieve 결과(DLL 인젝션 대상 기존 프로세스)를
+    # all_pids 에 반영. filter_events 이후에 발견된 PID 이므로 filtered_events 에는
+    # 포함되지 않지만, 프로세스↔네트워크 매핑에서는 포함되어야 한다.
+    for _psr2 in result.pe_sieve_results:
+        if not _psr2.error and (_psr2.implanted_shc > 0 or _psr2.implanted_pe > 0):
+            result.all_pids.add(_psr2.pid)
+
     # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
     status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
     result.behavior_report = classify_behaviors(
@@ -973,7 +980,14 @@ def run_analysis(
             status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
 
     status("[분석] 프로세스↔네트워크 연결 매핑...")
-    result.process_network_map = build_process_network_map(result.filtered_events)
+    # filtered_events 는 NOISY_PROCESSES 필터로 인해 인젝션된 시스템 프로세스의
+    # TCP 이벤트가 제거될 수 있음 → procmon_events 원본에서 PID 필터만 적용
+    _nm_pids = result.all_pids if result.all_pids else None
+    _nm_events = (
+        [ev for ev in result.procmon_events if ev.pid in _nm_pids]
+        if _nm_pids else result.procmon_events
+    )
+    result.process_network_map = build_process_network_map(_nm_events)
     if result.process_network_map:
         status(f"      {len(result.process_network_map)}개 연결 집계")
 
