@@ -1018,13 +1018,22 @@ def _network_html(result) -> str:
     # ── DGA / 의심 도메인 ──────────────────────────────────────
     susp_domains = getattr(pcap, "suspicious_domains", [])
     if susp_domains:
-        rows = "".join(
-            f"<tr><td class='mono' style='color:#ff7b72'>{_e(d)}</td></tr>"
-            for d in susp_domains[:50]
-        )
+        rows = ""
+        for d in susp_domains[:50]:
+            dga_procs: list[str] = []
+            for _dip in hostname_to_ips.get(d.lower(), []):
+                for _p in ip_proc_lookup.get(_dip, []):
+                    if _p not in dga_procs:
+                        dga_procs.append(_p)
+            rows += (
+                f"<tr>"
+                f"<td class='mono' style='color:#ff7b72'>{_e(d)}</td>"
+                + _proc_cell(dga_procs) +
+                f"</tr>"
+            )
         parts.append(
             "<h3>⚠ DGA / 고엔트로피 도메인</h3>"
-            f"<table id='tbl-net-dga'><tr><th>도메인</th></tr>{rows}</table>"
+            f"<table id='tbl-net-dga'><tr><th>도메인</th><th>프로세스</th></tr>{rows}</table>"
         )
 
     # ── 연결 목록 ──────────────────────────────────────────────
@@ -2064,6 +2073,24 @@ def _ioc_html(result) -> str:
             if label not in entry:
                 entry.append(label)
 
+    # ── 프로세스 매핑 조회 테이블 구성 (IP/도메인 테이블 렌더 전 선행 빌드) ──
+    hostname_to_ips: dict[str, list[str]] = {}
+    for _ip, _doms in combined_dom.items():
+        for _d in _doms:
+            hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
+
+    pnmap = getattr(result, "process_network_map", [])
+    ip_proc_lookup: dict[str, list[str]] = {}
+    for _pn in pnmap:
+        _label = f"{_pn.process} ({_pn.pid})"
+        _ipl = ip_proc_lookup.setdefault(_pn.remote_ip, [])
+        if _label not in _ipl:
+            _ipl.append(_label)
+        for _mip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
+            _mipl = ip_proc_lookup.setdefault(_mip, [])
+            if _label not in _mipl:
+                _mipl.append(_label)
+
     # ── 외부 IP 테이블 (풍부한 컬럼) ─────────────────────────────
     if ioc.ip_addresses:
         pub_ips = ioc.ip_addresses[:_IOC_LIMIT]
@@ -2093,6 +2120,7 @@ def _ioc_html(result) -> str:
                 f"<td style='white-space:nowrap'>{port_html}</td>"
                 f"<td data-geo-ip='{_e(ip)}' style='color:#8b949e;font-size:.78rem'>"
                 f"<span style='color:#484f58'>…</span></td>"
+                + _proc_cell(ip_proc_lookup.get(ip, [])) +
                 f"</tr>"
             )
         geo_ips_js = _json.dumps(pub_ips[:100])
@@ -2100,7 +2128,7 @@ def _ioc_html(result) -> str:
             "<h3>외부 IP</h3>"
             + _trunc_notice(len(ioc.ip_addresses), _IOC_LIMIT)
             + "<table id='tbl-ioc-ip'>"
-            + "<tr><th>IP 주소</th><th>연관 도메인</th><th>포트</th><th>국가 / 기관</th></tr>"
+            + "<tr><th>IP 주소</th><th>연관 도메인</th><th>포트</th><th>국가 / 기관</th><th>프로세스</th></tr>"
             + rows + "</table>"
             + f"""<script>
 (function(){{
@@ -2140,35 +2168,6 @@ def _ioc_html(result) -> str:
 }})();
 </script>"""
         )
-
-    # ── 프로세스 매핑 조회 테이블 구성 ───────────────────────────
-    # 도메인 → IP 역매핑 (URL 프로세스 매핑용)
-    hostname_to_ips: dict[str, list[str]] = {}
-    for _ip, _doms in combined_dom.items():
-        for _d in _doms:
-            hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
-
-    # (proto, dst_ip, dst_port) → 프로세스 목록  &  ip → 프로세스 목록
-    pnmap = getattr(result, "process_network_map", [])
-    _proc_lookup: dict[tuple, list[str]] = {}
-    ip_proc_lookup: dict[str, list[str]] = {}
-    for _pn in pnmap:
-        _label = f"{_pn.process} ({_pn.pid})"
-        _key   = (_pn.proto.upper(), _pn.remote_ip, _pn.remote_port)
-        _proc_lookup.setdefault(_key, [])
-        if _label not in _proc_lookup[_key]:
-            _proc_lookup[_key].append(_label)
-        _ipl = ip_proc_lookup.setdefault(_pn.remote_ip, [])
-        if _label not in _ipl:
-            _ipl.append(_label)
-        for _mip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
-            _mk = (_pn.proto.upper(), _mip, _pn.remote_port)
-            _proc_lookup.setdefault(_mk, [])
-            if _label not in _proc_lookup[_mk]:
-                _proc_lookup[_mk].append(_label)
-            _mipl = ip_proc_lookup.setdefault(_mip, [])
-            if _label not in _mipl:
-                _mipl.append(_label)
 
     # WriteFile 이벤트 → 파일경로(소문자): 프로세스 매핑
     file_proc_map: dict[str, list[str]] = {}
@@ -2210,7 +2209,27 @@ def _ioc_html(result) -> str:
             + f"<table{id_attr}><tr><th>{label}</th></tr>{rows}</table>"
         )
 
-    parts.append(_list_table("도메인", ioc.domains, "도메인", "tbl-ioc-domain"))
+    if ioc.domains:
+        _dom_rows = ""
+        for _dom in ioc.domains[:_IOC_LIMIT]:
+            _dom_procs: list[str] = []
+            for _dip in hostname_to_ips.get(_dom.lower(), []):
+                for _p in ip_proc_lookup.get(_dip, []):
+                    if _p not in _dom_procs:
+                        _dom_procs.append(_p)
+            _dom_rows += (
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(_dom)}</td>"
+                + _proc_cell(_dom_procs) +
+                f"</tr>"
+            )
+        parts.append(
+            "<h3>도메인</h3>"
+            + _trunc_notice(len(ioc.domains), _IOC_LIMIT)
+            + "<table id='tbl-ioc-domain'>"
+            + "<tr><th>도메인</th><th>프로세스</th></tr>"
+            + _dom_rows + "</table>"
+        )
 
     # ── 드롭된 파일 (프로세스 매핑 포함) ──────────────────────────
     if ioc.dropped_files:
