@@ -664,7 +664,7 @@ def _section_html(result) -> str:
     status_html = _ext_integration_status_html(result)
     if not techs:
         return status_html + "<p class='alert alert-success'>탐지된 MITRE 기법 없음</p>"
-    rows = ""
+    rows = []
     for t in techs:
         color = _TACTIC_COLOR.get(t.tactic, "gray")
         ref   = t.reference or f"https://attack.mitre.org/techniques/{t.technique_id.replace('.','/')}/"
@@ -674,7 +674,7 @@ def _section_html(result) -> str:
         )
         # sources 필드는 구버전 JSON 호환을 위해 getattr 사용
         src_badges = _source_badges(getattr(t, "sources", []) or [])
-        rows += (
+        rows.append(
             f"<tr>"
             f"<td><a href='{_e(ref)}' target='_blank' style='color:#f97583;text-decoration:none'>"
             f"{_e(t.technique_id)}</a></td>"
@@ -688,7 +688,7 @@ def _section_html(result) -> str:
         status_html
         + "<table id='tbl-mitre'>"
         "<tr><th>ID</th><th>기법</th><th>전술</th><th>출처</th><th>근거 (최대 5건)</th></tr>"
-        f"{rows}</table>"
+        + "".join(rows) + "</table>"
     )
 
 
@@ -724,7 +724,7 @@ def _file_events_html(result) -> tuple[str, int]:
     deduped_events = list(deduped.values())
     total_deduped = len(deduped_events)
 
-    rows = ""
+    rows = []
     op_color = {
         "WriteFile": "blue", "DeleteFile": "red",
         "RenameFile": "yellow", "SetEndOfFile": "gray", "CreateFile": "purple",
@@ -742,7 +742,7 @@ def _file_events_html(result) -> tuple[str, int]:
             f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
             if detail_str else ""
         )
-        rows += (
+        rows.append(
             f"<tr>"
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
             f"<td class='mono'>{_e(e.process)} <span style='color:#8b949e'>({e.pid})</span></td>"
@@ -762,7 +762,7 @@ def _file_events_html(result) -> tuple[str, int]:
         _trunc_notice(total, _FILE_LIMIT)
         + dedup_note
         + "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
-        + rows + "</table>"
+        + "".join(rows) + "</table>"
     )
     return html, total
 
@@ -831,13 +831,13 @@ def _registry_events_html(result) -> str:
             "<span style='font-size:.75rem;color:#6e7681'> (winreg 감시 범위 밖 — ProcMon 기반 도출)</span>"
             if _from_procmon else ""
         )
-        rows = ""
+        rows = []
         for entry in added[:_REG_DIFF_LIMIT]:
             k, n, v = entry[0], entry[1], entry[2]
             proc = entry[3] if len(entry) > 3 else ""
             proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
                        if proc else "<td style='color:#8b949e'>-</td>")
-            rows += (f"<tr><td>{_b('추가','green')}</td>"
+            rows.append(f"<tr><td>{_b('추가','green')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td>"
@@ -847,7 +847,7 @@ def _registry_events_html(result) -> str:
             proc = entry[4] if len(entry) > 4 else ""
             proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
                        if proc else "<td style='color:#8b949e'>-</td>")
-            rows += (f"<tr><td>{_b('변경','orange')}</td>"
+            rows.append(f"<tr><td>{_b('변경','orange')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td>"
@@ -856,14 +856,14 @@ def _registry_events_html(result) -> str:
             f"<h3>레지스트리 스냅샷 비교{_src_note}</h3>"
             + _trunc_notice(total_diff, _REG_DIFF_LIMIT)
             + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th><th>프로세스</th></tr>"
-            + f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ProcMon 이벤트
     if events:
-        rows = ""
+        rows = []
         for e in events[:_REG_EV_LIMIT]:
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
                 f"<td class='mono'>{_e(e.process)}</td>"
@@ -876,7 +876,7 @@ def _registry_events_html(result) -> str:
             "<h3>ProcMon 레지스트리 이벤트</h3>"
             + _trunc_notice(len(events), _REG_EV_LIMIT)
             + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th></tr>"
-            + f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     return "\n".join(parts) if parts else "<p class='alert alert-success'>레지스트리 변경 없음</p>"
@@ -967,11 +967,11 @@ def _network_html(result) -> str:
     # ── 비콘 탐지 ──────────────────────────────────────────────
     beacons = getattr(pcap, "beacon_candidates", [])
     if beacons:
-        rows = ""
+        rows = []
         for b in beacons[:100]:
             b_procs = (proc_lookup.get(("TCP", b.dst_ip, b.dst_port), [])
                        or proc_lookup.get(("UDP", b.dst_ip, b.dst_port), []))
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(b.dst_ip)}</td>"
                 f"<td class='mono'>{b.dst_port}</td>"
@@ -985,7 +985,7 @@ def _network_html(result) -> str:
             "<h3>🚨 비콘(Beaconing) 탐지</h3>"
             "<table id='tbl-net-beacon'><tr><th>목적지 IP</th><th>포트</th><th>횟수</th>"
             "<th>평균 간격</th><th>규칙성</th><th>프로세스</th></tr>"
-            f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ── TLS SNI ────────────────────────────────────────────────
@@ -997,10 +997,10 @@ def _network_html(result) -> str:
                 seen[t.sni] = t
         _TLS_LIMIT = 500
         seen_vals  = list(seen.values())
-        rows = ""
+        rows = []
         for t in seen_vals[:_TLS_LIMIT]:
             t_procs = proc_lookup.get(("TCP", t.dst_ip, t.dst_port), [])
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(t.sni)}</td>"
                 f"<td class='mono'>{_e(t.dst_ip)}</td>"
@@ -1012,20 +1012,20 @@ def _network_html(result) -> str:
             "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
             + _trunc_notice(len(seen_vals), _TLS_LIMIT)
             + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th><th>프로세스</th></tr>"
-            + f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ── DGA / 의심 도메인 ──────────────────────────────────────
     susp_domains = getattr(pcap, "suspicious_domains", [])
     if susp_domains:
-        rows = ""
+        rows = []
         for d in susp_domains[:50]:
             dga_procs: list[str] = []
             for _dip in hostname_to_ips.get(d.lower(), []):
                 for _p in ip_proc_lookup.get(_dip, []):
                     if _p not in dga_procs:
                         dga_procs.append(_p)
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono' style='color:#ff7b72'>{_e(d)}</td>"
                 + _proc_cell(dga_procs) +
@@ -1033,14 +1033,14 @@ def _network_html(result) -> str:
             )
         parts.append(
             "<h3>⚠ DGA / 고엔트로피 도메인</h3>"
-            f"<table id='tbl-net-dga'><tr><th>도메인</th><th>프로세스</th></tr>{rows}</table>"
+            + f"<table id='tbl-net-dga'><tr><th>도메인</th><th>프로세스</th></tr>" + "".join(rows) + "</table>"
         )
 
     # ── 연결 목록 ──────────────────────────────────────────────
     if pcap.connections:
         _CONN_LIMIT = 1000
         sorted_conns = sorted(pcap.connections, key=lambda x: -x.bytes_out)
-        rows = ""
+        rows = []
         for c in sorted_conns[:_CONN_LIMIT]:
             ext = not _is_private_ip_str(c.dst_ip)
             ip_color = "ev-network" if ext else ""
@@ -1067,7 +1067,7 @@ def _network_html(result) -> str:
                     proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
                     or ip_proc_lookup.get(c.dst_ip, [])
                 )
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
                 f"<td class='mono'>{_e(c.src_ip)}</td>"
@@ -1084,21 +1084,21 @@ def _network_html(result) -> str:
             + _trunc_notice(len(pcap.connections), _CONN_LIMIT)
             + "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
             "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
-            + f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ── DNS 쿼리 ───────────────────────────────────────────────
     if pcap.dns_queries:
         _DNS_LIMIT   = 1000
         sorted_dns   = sorted(pcap.dns_queries, key=lambda x: -x.entropy)
-        rows = ""
+        rows = []
         for q in sorted_dns[:_DNS_LIMIT]:
             dns_procs: list[str] = []
             for rip in q.response_ips[:5]:
                 for p in ip_proc_lookup.get(rip, []):
                     if p not in dns_procs:
                         dns_procs.append(p)
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono {'ev-network' if not q.suspicious else ''}"
                 f"' style='{'color:#ff7b72' if q.suspicious else ''}'>{_e(q.name)}</td>"
@@ -1115,20 +1115,20 @@ def _network_html(result) -> str:
             + _trunc_notice(len(pcap.dns_queries), _DNS_LIMIT)
             + "<table id='tbl-net-dns'><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
             "<th>응답 IP</th><th>의심</th><th>프로세스</th></tr>"
-            + f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ── HTTP 요청 ──────────────────────────────────────────────
     if pcap.http_requests:
         _HTTP_LIMIT = 500
-        rows = ""
+        rows = []
         for r in pcap.http_requests[:_HTTP_LIMIT]:
             h_procs: list[str] = []
             for hname in hostname_to_ips.get(r.host.lower(), []):
                 for p in ip_proc_lookup.get(hname, []):
                     if p not in h_procs:
                         h_procs.append(p)
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td>{_b(r.method,'orange')}</td>"
                 f"<td class='mono'>{_e(r.host)}</td>"
@@ -1144,18 +1144,18 @@ def _network_html(result) -> str:
             + _trunc_notice(len(pcap.http_requests), _HTTP_LIMIT)
             + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
             "<th>User-Agent</th><th>Body</th><th>Cookie</th><th>프로세스</th></tr>"
-            + f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ── SMTP C2 세션 (AgentTesla 등 자격증명 탈취 악성코드) ─────────
     smtp_sessions = getattr(pcap, "smtp_sessions", [])
     if smtp_sessions:
-        rows = ""
+        rows = []
         for s in smtp_sessions:
             auth_badge  = _b("AUTH", "red")   if s.has_auth else ""
             data_badge  = _b("DATA", "orange") if s.has_data else ""
             smtp_procs  = proc_lookup.get(("TCP", s.dst_ip, s.dst_port), [])
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(s.dst_ip)}</td>"
                 f"<td class='mono'>{s.dst_port}</td>"
@@ -1172,17 +1172,17 @@ def _network_html(result) -> str:
             "<table id='tbl-net-smtp'><tr><th>C2 서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
             "<th>발신자 (MAIL FROM)</th><th>수신자 (RCPT TO)</th>"
             "<th>AUTH 사용자명</th><th>플래그</th><th>프로세스</th></tr>"
-            f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     # ── FTP C2 세션 ────────────────────────────────────────────
     ftp_sessions = getattr(pcap, "ftp_sessions", [])
     if ftp_sessions:
-        rows = ""
+        rows = []
         for s in ftp_sessions:
             auth_badge = _b("AUTH", "red") if s.has_auth else ""
             ftp_procs  = proc_lookup.get(("TCP", s.dst_ip, s.dst_port), [])
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(s.dst_ip)}</td>"
                 f"<td class='mono'>{s.dst_port}</td>"
@@ -1197,7 +1197,7 @@ def _network_html(result) -> str:
             "<h3 style='color:#ff7b72'>🚨 FTP C2 세션</h3>"
             "<table id='tbl-net-ftp'><tr><th>C2 서버 IP</th><th>포트</th><th>사용자명</th>"
             "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th><th>프로세스</th></tr>"
-            f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     return "\n".join(parts) if parts else "<p class='alert alert-success'>외부 네트워크 활동 없음</p>"
@@ -1589,10 +1589,10 @@ def _process_html(result) -> str:
             f"(화이트리스트 시스템 프로세스 또는 ProcMon 활동 없는 프로세스, 의심 탐지 없음)</p>"
         )
 
-    rows = ""
+    rows = []
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
-        rows += (
+        rows.append(
             f"<tr>"
             f"<td class='mono'>{p.pid}</td>"
             f"<td class='mono ev-process'>{_e(p.name)}</td>"
@@ -1602,7 +1602,7 @@ def _process_html(result) -> str:
         )
     table_html = (
         "<table id='tbl-process'><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
-        f"{rows}</table>"
+        + "".join(rows) + "</table>"
     )
 
     # ── 전체 프로세스 기록 (화이트리스트 오탐만 제외) ────────────────
@@ -1629,11 +1629,11 @@ def _all_procs_html(result, chain_pids: set) -> str:
         f"&nbsp;·&nbsp;<span style='opacity:.5'>흐린 행</span> = 악성 체인 외부</p>"
     )
 
-    rows = ""
+    rows = []
     for p in table_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
         tr_open = "<tr>" if p.pid in chain_pids else "<tr style='opacity:.45'>"
-        rows += (
+        rows.append(
             f"{tr_open}"
             f"<td class='mono'>{p.pid}</td>"
             f"<td class='mono ev-process'>{_e(p.name)}</td>"
@@ -1646,7 +1646,7 @@ def _all_procs_html(result, chain_pids: set) -> str:
         note
         + "<table id='tbl-process-all'>"
         + "<tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
-        + rows
+        + "".join(rows)
         + "</table>"
     )
 
@@ -1681,7 +1681,7 @@ def _render_proc_result(proc, exe: str = "") -> str:
             f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}</p>"
             f"{exe_tag}"
         )
-    rows = ""
+    rows = []
     for mod in proc.modules:
         mod_name  = Path(mod.module_path).name if mod.module_path else "-"
         dump_name = Path(mod.dump_file).name   if mod.dump_file   else "-"
@@ -1691,7 +1691,7 @@ def _render_proc_result(proc, exe: str = "") -> str:
             kind_badge = _b("PE 인젝션", "orange")
         else:
             kind_badge = _b("훅/패치", "yellow")
-        rows += (
+        rows.append(
             f"<tr>"
             f"<td class='mono' style='color:#c9d1d9'>{_e(mod_name)}</td>"
             f"<td>{kind_badge}</td>"
@@ -1709,7 +1709,7 @@ def _render_proc_result(proc, exe: str = "") -> str:
         f"{exe_tag}"
         f"<table>"
         f"<tr><th>모듈</th><th>유형</th><th>패치 수</th><th>이식 수</th><th>덤프 파일</th></tr>"
-        f"{rows}</table>"
+        + "".join(rows) + "</table>"
     )
 
 
@@ -1773,12 +1773,12 @@ def _shellcode_html(result) -> str:
 
     # ── 요약 카드 ──────────────────────────────────────────────────
     if has_hh_data or has_pe_data:
-        rows = ""
+        rows = []
         if has_hh_data:
             ss = "#ff7b72" if hh_susp   else "#56d364"
             pi = "#e3b341" if hh_pe_inj else "#8b949e"
             sc = "#ff7b72" if hh_shc    else "#8b949e"
-            rows += (
+            rows.append(
                 f"<tr><td>hollows-hunter (전체 시스템)</td><td>"
                 f"{hh_scanned}개 스캔 &nbsp;"
                 f"<b style='color:{ss}'>의심 {hh_susp}개</b> &nbsp;"
@@ -1790,7 +1790,7 @@ def _shellcode_html(result) -> str:
             pss = "#ff7b72" if pe_susp   else "#56d364"
             ppi = "#e3b341" if pe_pe_inj else "#8b949e"
             psc = "#ff7b72" if pe_shc    else "#8b949e"
-            rows += (
+            rows.append(
                 f"<tr><td>pe-sieve (신규 + 의심 DLL 로드 프로세스)</td><td>"
                 f"{len(pe_valid)}개 스캔 &nbsp;"
                 f"<b style='color:{pss}'>의심 {len(pe_susp)}개</b> &nbsp;"
@@ -1800,7 +1800,7 @@ def _shellcode_html(result) -> str:
             )
         parts.append(
             f"<div class='card' style='margin-bottom:1rem'>"
-            f"<table class='kv'>{rows}</table>"
+            f"<table class='kv'>{''.join(rows)}</table>"
             f"</div>"
         )
 
@@ -1916,7 +1916,7 @@ def _shellcode_html(result) -> str:
 
         # ── 전체 스캔 파일 목록 테이블 ────────────────────────────────
         # hits → no_hits → err_items 순으로 출력
-        rows = ""
+        rows = []
         for sa in hits + no_hits + err_items:
             fname     = Path(sa.dump_file).name
             folder    = Path(sa.dump_file).parent.name   # e.g. "process_3812"
@@ -2007,7 +2007,7 @@ def _shellcode_html(result) -> str:
                 if sa.has_findings or _vt_det > 0
                 else ("background:rgba(255,123,114,.03)" if sa.error else "")
             )
-            rows += (
+            rows.append(
                 f"<tr style='{row_style}'>"
                 # 파일명 + 폴더명 + 전체 경로 토글
                 f"<td class='mono' style='font-size:.8rem'>"
@@ -2033,7 +2033,7 @@ def _shellcode_html(result) -> str:
         parts.append(
             "<table id='tbl-shc-files' style='width:100%'>"
             "<tr><th>파일명</th><th>프로세스</th><th>크기</th><th>VT</th><th>결과 (YARA / CAPA)</th></tr>"
-            f"{rows}</table>"
+            + "".join(rows) + "</table>"
         )
 
     return "\n".join(parts)
@@ -2094,7 +2094,7 @@ def _ioc_html(result) -> str:
     # ── 외부 IP 테이블 (풍부한 컬럼) ─────────────────────────────
     if ioc.ip_addresses:
         pub_ips = ioc.ip_addresses[:_IOC_LIMIT]
-        rows = ""
+        rows = []
         for ip in pub_ips:
             doms  = combined_dom.get(ip, [])
             ports = sorted(ip_ports.get(ip, []),
@@ -2113,7 +2113,7 @@ def _ioc_html(result) -> str:
                 ) + (f"<span style='color:#8b949e'>&nbsp;+{len(ports)-5}</span>" if len(ports) > 5 else "")
                 if ports else "<span style='color:#484f58'>-</span>"
             )
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(ip)}</td>"
                 f"<td>{dom_html}</td>"
@@ -2129,7 +2129,7 @@ def _ioc_html(result) -> str:
             + _trunc_notice(len(ioc.ip_addresses), _IOC_LIMIT)
             + "<table id='tbl-ioc-ip'>"
             + "<tr><th>IP 주소</th><th>연관 도메인</th><th>포트</th><th>국가 / 기관</th><th>프로세스</th></tr>"
-            + rows + "</table>"
+            + "".join(rows) + "</table>"
             + f"""<script>
 (function(){{
   var ips={geo_ips_js};
@@ -2210,14 +2210,14 @@ def _ioc_html(result) -> str:
         )
 
     if ioc.domains:
-        _dom_rows = ""
+        _dom_rows = []
         for _dom in ioc.domains[:_IOC_LIMIT]:
             _dom_procs: list[str] = []
             for _dip in hostname_to_ips.get(_dom.lower(), []):
                 for _p in ip_proc_lookup.get(_dip, []):
                     if _p not in _dom_procs:
                         _dom_procs.append(_p)
-            _dom_rows += (
+            _dom_rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(_dom)}</td>"
                 + _proc_cell(_dom_procs) +
@@ -2228,15 +2228,15 @@ def _ioc_html(result) -> str:
             + _trunc_notice(len(ioc.domains), _IOC_LIMIT)
             + "<table id='tbl-ioc-domain'>"
             + "<tr><th>도메인</th><th>프로세스</th></tr>"
-            + _dom_rows + "</table>"
+            + "".join(_dom_rows) + "</table>"
         )
 
     # ── 드롭된 파일 (프로세스 매핑 포함) ──────────────────────────
     if ioc.dropped_files:
-        rows = ""
+        rows = []
         for fp in ioc.dropped_files[:_IOC_LIMIT]:
             procs = file_proc_map.get(fp.lower(), [])
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono'>{_e(fp)}</td>"
                 + _proc_cell(procs) +
@@ -2247,17 +2247,17 @@ def _ioc_html(result) -> str:
             + _trunc_notice(len(ioc.dropped_files), _IOC_LIMIT)
             + "<table id='tbl-ioc-file'>"
             + "<tr><th>파일 경로</th><th>프로세스</th></tr>"
-            + rows + "</table>"
+            + "".join(rows) + "</table>"
         )
 
     parts.append(_list_table("레지스트리 키", ioc.registry_keys, "키 경로", "tbl-ioc-reg"))
 
     # ── URL (프로세스 매핑 포함) ───────────────────────────────────
     if ioc.urls:
-        rows = ""
+        rows = []
         for url in ioc.urls[:_IOC_LIMIT]:
             procs = url_proc_map.get(url, [])
-            rows += (
+            rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(url)}</td>"
                 + _proc_cell(procs) +
@@ -2268,7 +2268,7 @@ def _ioc_html(result) -> str:
             + _trunc_notice(len(ioc.urls), _IOC_LIMIT)
             + "<table id='tbl-ioc-url'>"
             + "<tr><th>URL</th><th>프로세스</th></tr>"
-            + rows + "</table>"
+            + "".join(rows) + "</table>"
         )
 
     return "\n".join(p for p in parts if p)

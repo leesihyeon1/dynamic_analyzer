@@ -987,15 +987,18 @@ def run_analysis(
             result.tools_used["virustotal"] = "SHA256 계산 실패"
             status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
 
-        # ── 쉘코드 덤프 파일별 VT 조회 ────────────────────────────────
+        # ── 쉘코드 덤프 파일별 VT 조회 (SHA256 기반 캐싱으로 중복 요청 방지) ──
         _sc_with_hash = [sa for sa in result.shellcode_analyses if sa.sha256]
         if _sc_with_hash:
             from analysis.vt_analyzer import query_vt_file_info as _qvt_fi
+            _vt_fi_cache: dict[str, dict] = {}
             status(f"[분석] 쉘코드 덤프 VT 조회 중... ({len(_sc_with_hash)}개 파일)")
             _sc_vt_hits = 0
             for _sa in _sc_with_hash:
                 try:
-                    _fi = _qvt_fi(_sa.sha256, _vt_key, _vt_timeout)
+                    if _sa.sha256 not in _vt_fi_cache:
+                        _vt_fi_cache[_sa.sha256] = _qvt_fi(_sa.sha256, _vt_key, _vt_timeout)
+                    _fi = _vt_fi_cache[_sa.sha256]
                     _sa.vt_detections = _fi["detections"]
                     _sa.vt_total      = _fi["total"]
                     _sa.vt_label      = _fi["label"]

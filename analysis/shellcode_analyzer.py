@@ -25,9 +25,14 @@ pe-sieve / hollows-hunter 가 process_{pid}/ 에 덤프한
 from __future__ import annotations
 
 import json
+import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# 디렉토리명에서 PID 추출: "process_1234" → 1234
+_PID_DIR_RE = re.compile(r'(\d+)')
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +240,9 @@ def analyze_shellcode_dumps(
 ) -> list[ShellcodeAnalysis]:
     """pe-sieve / HH 덤프 디렉터리 전체에 YARA + CAPA 를 수행합니다.
 
-    두 경로로 파일을 수집합니다:
+    두 경로로 파일을 수집한 뒤 ThreadPoolExecutor 로 병렬 분석합니다:
     1. pe-sieve / HH 결과 중 오탐 필터(화이트리스트 + 점수 + 신규PID)를 통과한 프로세스
-    2. dumps_root 하위 모든 폴더의 모든 파일 (화이트리스트만 제외)
+    2. dumps_root 하위 모든 폴더의 non-PE 파일 (화이트리스트만 제외)
 
     Parameters
     ----------
@@ -250,13 +255,13 @@ def analyze_shellcode_dumps(
     rules_dir        : YARA 룰 디렉터리 (None = 기본)
     timeout          : CAPA 타임아웃(초), 파일당 적용
     """
-    import re as _re
+    import hashlib as _hl
 
-    results: list[ShellcodeAnalysis] = []
-    seen_files: set[str] = set()
-
+    # ─────────────────────────────────────────────────────────────────
+    # 파일별 분석 함수 (ThreadPoolExecutor 에서 실행)
+    # ─────────────────────────────────────────────────────────────────
     def _analyze_file(dump_path: Path, pid: int, proc_name: str,
-                      proc_exe: str, proc_cmdline: str) -> "ShellcodeAnalysis":
+                      proc_exe: str, proc_cmdline: str) -> ShellcodeAnalysis:
         sa = ShellcodeAnalysis(
             dump_file    = str(dump_path.resolve()),
             pid          = pid,
@@ -269,7 +274,6 @@ def analyze_shellcode_dumps(
         except Exception:
             pass
         try:
-            import hashlib as _hl
             _md5    = _hl.md5()
             _sha256 = _hl.sha256()
             with open(dump_path, "rb") as _fh:
@@ -292,7 +296,14 @@ def analyze_shellcode_dumps(
                 sa.error += f"CAPA: {exc}"
         return sa
 
-    # ── 1. pe-sieve / HH 오탐 필터 통과 프로세스 ──────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 1: 분석 대상 파일 수집 (seen_files 로 중복 방지)
+    # ─────────────────────────────────────────────────────────────────
+    seen_files: set[str] = set()
+    # 각 태스크: (dump_path, pid, proc_name, proc_exe, proc_cmdline)
+    tasks: list[tuple[Path, int, str, str, str]] = []
+
+    # 1-a. pe-sieve / HH 오탐 필터 통과 프로세스
     candidates: list = []
     for pr in pe_sieve_results or []:
         if should_reanalyze(pr, new_pids):
@@ -304,40 +315,57 @@ def analyze_shellcode_dumps(
 
     for pr in candidates:
         _snap_name, _snap_exe, _snap_cmdline = _lookup_proc_info(pr.pid, proc_snapshots)
-        proc_name = getattr(pr, "name", "") or _snap_name
-        proc_exe  = _snap_exe
-        proc_cmdline = _snap_cmdline
-
+        _proc_name = getattr(pr, "name", "") or _snap_name
         for dump_path in _collect_all_dump_files(getattr(pr, "dump_dir", "")):
             abs_path = str(dump_path.resolve())
             if abs_path in seen_files:
                 continue
             seen_files.add(abs_path)
-            results.append(_analyze_file(dump_path, pr.pid, proc_name, proc_exe, proc_cmdline))
+            tasks.append((dump_path, pr.pid, _proc_name, _snap_exe, _snap_cmdline))
 
-    # ── 2. dumps_root 전체 폴더 순회 (화이트리스트만 제외) ───────────────
+    # 1-b. dumps_root 전체 폴더 순회 (화이트리스트만 제외, non-PE 만)
     if dumps_root is not None:
         _dr = Path(dumps_root)
         if _dr.exists():
             for subdir in sorted(_dr.iterdir()):
                 if not subdir.is_dir():
                     continue
-                _m = _re.search(r'(\d+)', subdir.name)
+                _m = _PID_DIR_RE.search(subdir.name)
                 if not _m:
                     continue
                 _pid = int(_m.group(1))
-
                 _snap_name, _snap_exe, _snap_cmdline = _lookup_proc_info(_pid, proc_snapshots)
                 if _snap_name.lower() in _SYSTEM_PROC_WHITELIST:
                     continue
-
-                # dumps_root 전체 스캔: non-PE 만 — PE 는 pe-sieve 결과에서 이미 처리
-                for dump_path in [p for p in subdir.iterdir()
-                                  if p.is_file() and p.suffix != ".json" and not _is_pe_file(p)]:
+                for dump_path in subdir.iterdir():
+                    if not dump_path.is_file() or dump_path.suffix == ".json":
+                        continue
+                    if _is_pe_file(dump_path):
+                        continue
                     abs_path = str(dump_path.resolve())
                     if abs_path in seen_files:
                         continue
                     seen_files.add(abs_path)
-                    results.append(_analyze_file(dump_path, _pid, _snap_name, _snap_exe, _snap_cmdline))
+                    tasks.append((dump_path, _pid, _snap_name, _snap_exe, _snap_cmdline))
+
+    if not tasks:
+        return []
+
+    # ─────────────────────────────────────────────────────────────────
+    # Phase 2: 병렬 분석 (CAPA 는 subprocess 이므로 스레드풀로 충분)
+    # max_workers=4: CAPA 4개 동시 실행 — CPU 코어 수에 맞게 조정 가능
+    # ─────────────────────────────────────────────────────────────────
+    _workers = min(4, len(tasks))
+    results: list[ShellcodeAnalysis] = []
+    with ThreadPoolExecutor(max_workers=_workers) as _pool:
+        future_map = {
+            _pool.submit(_analyze_file, *task): task
+            for task in tasks
+        }
+        for future in as_completed(future_map):
+            try:
+                results.append(future.result())
+            except Exception:
+                pass
 
     return results
