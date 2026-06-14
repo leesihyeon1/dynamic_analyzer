@@ -251,7 +251,6 @@ def analyze_shellcode_dumps(
     timeout          : CAPA 타임아웃(초), 파일당 적용
     """
     import re as _re
-    from analysis.capa_analyzer import run_capa as _run_capa_pe
 
     results: list[ShellcodeAnalysis] = []
     seen_files: set[str] = set()
@@ -285,13 +284,12 @@ def analyze_shellcode_dumps(
             sa.yara_matches = run_yara_on_dump(dump_path, rules_dir)
         except Exception as exc:
             sa.error += f"YARA: {exc}  "
-        try:
-            if _is_pe_file(dump_path):
-                sa.capa_techs = _run_capa_pe(dump_path, capa_exe, timeout)
-            else:
+        # PE 덤프는 CAPA 생략 — pe-sieve 가 이미 분석했고 CAPA PE 모드는 파일당 수십 초 소요
+        if not _is_pe_file(dump_path):
+            try:
                 sa.capa_techs = run_capa_shellcode(dump_path, capa_exe, timeout)
-        except Exception as exc:
-            sa.error += f"CAPA: {exc}"
+            except Exception as exc:
+                sa.error += f"CAPA: {exc}"
         return sa
 
     # ── 1. pe-sieve / HH 오탐 필터 통과 프로세스 ──────────────────────
@@ -333,7 +331,9 @@ def analyze_shellcode_dumps(
                 if _snap_name.lower() in _SYSTEM_PROC_WHITELIST:
                     continue
 
-                for dump_path in [p for p in subdir.iterdir() if p.is_file() and p.suffix != ".json"]:
+                # dumps_root 전체 스캔: non-PE 만 — PE 는 pe-sieve 결과에서 이미 처리
+                for dump_path in [p for p in subdir.iterdir()
+                                  if p.is_file() and p.suffix != ".json" and not _is_pe_file(p)]:
                     abs_path = str(dump_path.resolve())
                     if abs_path in seen_files:
                         continue
