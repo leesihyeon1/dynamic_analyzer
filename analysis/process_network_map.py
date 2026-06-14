@@ -3,10 +3,15 @@ process_network_map.py — ProcMon 네트워크 이벤트 기반 프로세스↔
 
 ProcMon CSV의 TCP/UDP 이벤트를 집계하여 어떤 프로세스가
 어떤 외부 IP·포트와 통신했는지 정리합니다.
+
+netstat 기반 보완 함수도 포함합니다 — ProcMon이 Network 이벤트를
+캡처하지 못한 경우(필터 설정 등)에 fallback으로 사용합니다.
 """
 from __future__ import annotations
 
 import re
+import subprocess
+from collections import defaultdict
 from dataclasses import dataclass
 
 from parsers.procmon_csv import ProcMonEvent, EventCategory
@@ -155,3 +160,91 @@ def build_process_network_map(
         agg.values(),
         key=lambda c: (-c.event_count, c.process.lower(), c.remote_ip),
     )
+
+
+# ---------------------------------------------------------------------------
+# netstat 기반 보완 — ProcMon Network 이벤트 부재 시 fallback
+# ---------------------------------------------------------------------------
+
+_NETSTAT_RE = re.compile(
+    r'TCP\s+\S+\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):(\d+)\s+ESTABLISHED\s+(\d+)',
+    re.IGNORECASE,
+)
+
+
+def capture_netstat_snapshot() -> list[tuple[str, int, int]]:
+    """현재 ESTABLISHED TCP 연결을 `netstat -ano`로 캡처.
+
+    Returns
+    -------
+    list of (remote_ip, remote_port, pid)
+        사설 IP 및 루프백은 제외됩니다.
+    """
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=6,
+        ).stdout
+    except Exception:
+        return []
+
+    results: list[tuple[str, int, int]] = []
+    for m in _NETSTAT_RE.finditer(out):
+        remote_ip   = m.group(1)
+        remote_port = int(m.group(2))
+        pid         = int(m.group(3))
+        if not _is_private(remote_ip):
+            results.append((remote_ip, remote_port, pid))
+    return results
+
+
+def build_netstat_proc_map(
+    snapshots:      list[list[tuple[str, int, int]]],
+    proc_snapshots: "dict | None" = None,
+) -> list[ProcNetConnection]:
+    """netstat 스냅샷 목록 → ProcNetConnection 목록.
+
+    여러 스냅샷에서 동일한 (pid, remote_ip, remote_port) 조합이
+    반복될수록 event_count가 높아집니다.
+
+    Parameters
+    ----------
+    snapshots:
+        ``capture_netstat_snapshot()`` 반환값 목록.
+    proc_snapshots:
+        ``dict[int, ProcessSnapshot]`` — PID → 프로세스 정보.
+        None이거나 해당 PID가 없으면 psutil 조회로 폴백합니다.
+    """
+    if not snapshots:
+        return []
+
+    agg: dict[tuple[int, str, int], int] = defaultdict(int)
+    for snap in snapshots:
+        for (remote_ip, remote_port, pid) in snap:
+            agg[(pid, remote_ip, remote_port)] += 1
+
+    connections: list[ProcNetConnection] = []
+    for (pid, remote_ip, remote_port), count in agg.items():
+        # PID → 프로세스명 조회
+        proc_name = ""
+        if proc_snapshots and pid in proc_snapshots:
+            ps = proc_snapshots[pid]
+            proc_name = getattr(ps, "name", "") or ""
+        if not proc_name:
+            try:
+                import psutil
+                proc_name = psutil.Process(pid).name()
+            except Exception:
+                proc_name = f"pid_{pid}"
+
+        connections.append(ProcNetConnection(
+            pid=pid,
+            process=proc_name,
+            proto="TCP",
+            remote_ip=remote_ip,
+            remote_port=remote_port,
+            direction="outbound",
+            event_count=count,
+        ))
+
+    return sorted(connections, key=lambda c: (-c.event_count, c.process.lower(), c.remote_ip))

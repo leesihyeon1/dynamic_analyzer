@@ -27,52 +27,6 @@ _VT_API_BASE = "https://www.virustotal.com/api/v3"
 # Public API
 # ---------------------------------------------------------------------------
 
-def query_vt_file_info(
-    sha256:  str,
-    api_key: str,
-    timeout: int = 20,
-) -> dict:
-    """파일 해시로 VT 탐지 통계를 조회합니다.
-
-    GET /files/{sha256} 를 한 번만 호출합니다 (요청 1건).
-
-    Returns
-    -------
-    dict:
-        detections  — 악성 탐지 엔진 수. -1 이면 미등록 또는 조회 실패.
-        total       — 전체 스캔 엔진 수.
-        label       — 위협 레이블 (예: "trojan.agent/injector").
-    """
-    empty: dict = {"detections": -1, "total": 0, "label": ""}
-    if not sha256 or not api_key or len(sha256) != 64:
-        return empty
-
-    data = _vt_get(f"{_VT_API_BASE}/files/{sha256}", api_key, timeout)
-    if not data or not isinstance(data.get("data"), dict):
-        return empty
-
-    attrs  = data["data"].get("attributes") or {}
-    stats  = attrs.get("last_analysis_stats") or {}
-
-    malicious  = int(stats.get("malicious",  0))
-    total      = (malicious
-                  + int(stats.get("suspicious", 0))
-                  + int(stats.get("undetected", 0))
-                  + int(stats.get("harmless",   0))
-                  + int(stats.get("failure",    0)))
-
-    label = ""
-    ptc = attrs.get("popular_threat_classification") or {}
-    label = ptc.get("suggested_threat_label", "") or ""
-    if not label:
-        names = attrs.get("popular_threat_names") or []
-        if names and isinstance(names, list):
-            first = names[0]
-            label = first.get("value", "") if isinstance(first, dict) else str(first)
-
-    return {"detections": malicious, "total": total, "label": label}
-
-
 def query_vt(
     sha256:  str,
     api_key: str,

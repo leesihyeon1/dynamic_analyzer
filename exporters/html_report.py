@@ -890,14 +890,57 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def _proc_cell(procs: list[str]) -> str:
+def _proc_cell(procs: list[str], reason: str = "") -> str:
     """프로세스 목록 → <td> HTML. 빈 경우 회색 '-' 반환."""
     if procs:
         return "<td>" + "<br>".join(
             f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
             for p in procs[:3]
         ) + "</td>"
-    return "<td style='color:#8b949e'>-</td>"
+    title = f" title='{_e(reason)}'" if reason else ""
+    return f"<td style='color:#484f58;cursor:default'{title}>-</td>"
+
+
+def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
+    """process_network_map 진단 패널 HTML."""
+    if not pnmap:
+        return (
+            "<details open style='margin:.5rem 0 1rem;"
+            "background:rgba(255,123,114,.07);border:1px solid #ff7b72;"
+            "border-radius:6px;padding:.5rem .75rem'>"
+            "<summary style='color:#ff7b72;font-size:.82rem;cursor:pointer;font-weight:600'>"
+            "⚠ 프로세스 매핑 없음 — process_network_map 비어있음</summary>"
+            "<p style='font-size:.78rem;color:#8b949e;margin:.4rem 0 0'>"
+            "ProcMon CSV에 TCP/UDP 네트워크 이벤트가 없습니다.<br>"
+            "원인: ProcMon 디스플레이 필터에서 Network 카테고리 비활성화.<br>"
+            "<code style='font-size:.75rem'>procmon.csv</code> 에서 "
+            "<code>TCP Connect</code> / <code>TCP Send</code> 행 존재 여부를 확인하세요.<br>"
+            "netstat 스냅샷도 캡처되지 않았거나 분석 중 연결이 없었습니다."
+            "</p></details>"
+        )
+
+    sample_rows = []
+    for _pn in pnmap[:8]:
+        sample_rows.append(
+            f"<tr><td class='mono' style='font-size:.72rem'>{_e(_pn.process)}</td>"
+            f"<td style='color:#8b949e;font-size:.72rem'>({_pn.pid})</td>"
+            f"<td class='mono' style='font-size:.72rem'>{_e(_pn.proto)}</td>"
+            f"<td class='mono' style='font-size:.72rem'>{_e(_pn.remote_ip)}:{_pn.remote_port}</td>"
+            f"<td style='color:#8b949e;font-size:.72rem'>{_pn.event_count}회</td></tr>"
+        )
+    more = len(pnmap) - 8
+    return (
+        f"<details style='margin:.5rem 0 1rem'>"
+        f"<summary style='color:#56d364;font-size:.8rem;cursor:pointer'>"
+        f"✓ 프로세스 매핑 {len(pnmap)}개 / IP 룩업 키 {len(ip_proc_lookup)}개 (클릭하여 샘플 보기)</summary>"
+        f"<table style='margin-top:.4rem;border-collapse:collapse'>"
+        f"<tr><th style='font-size:.72rem'>프로세스</th><th></th><th>Proto</th>"
+        f"<th>Remote</th><th>횟수</th></tr>"
+        + "".join(sample_rows)
+        + (f"<tr><td colspan='5' style='color:#6e7681;font-size:.72rem'>… {more}개 더</td></tr>"
+           if more > 0 else "")
+        + "</table></details>"
+    )
 
 
 def _network_html(result) -> str:
@@ -949,6 +992,9 @@ def _network_html(result) -> str:
                 _ip2_lst.append(_label)
 
     parts = []
+
+    # ── 프로세스 매핑 진단 패널 ──────────────────────────────────
+    parts.append(_pnmap_debug_panel(pnmap, ip_proc_lookup))
 
     # ── 캡처 요약 ──────────────────────────────────────────────
     s = getattr(pcap, "summary", None)
@@ -1061,12 +1107,21 @@ def _network_html(result) -> str:
 
             # 프로세스 lookup: OUTBOUND는 dst_ip 기준, INBOUND(dst=VM 사설IP)는 src_ip 기준
             if _is_private_ip_str(c.dst_ip):
+                _lookup_ip = c.src_ip
                 _conn_procs = ip_proc_lookup.get(c.src_ip, [])
             else:
+                _lookup_ip = c.dst_ip
                 _conn_procs = (
                     proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
                     or ip_proc_lookup.get(c.dst_ip, [])
                 )
+            if not _conn_procs:
+                if not pnmap:
+                    _reason = "process_network_map 비어있음 (ProcMon Network 이벤트 없음)"
+                else:
+                    _reason = f"ip_proc_lookup에 '{_lookup_ip}' 없음 (pnmap={len(pnmap)}개)"
+            else:
+                _reason = ""
             rows.append(
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
@@ -1076,7 +1131,7 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
-                + _proc_cell(_conn_procs) +
+                + _proc_cell(_conn_procs, _reason) +
                 f"</tr>"
             )
         parts.append(
@@ -1256,11 +1311,7 @@ def _compute_display_procs(result):
       EXE 모드에서는 pids_with_events를 추가 조건으로 적용해
       ReadFile 전용 백그라운드 프로세스(SearchFilterHost 등)를 제거.
     """
-    try:
-        from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
-    except Exception:
-        _WL = frozenset()
-
+    _WL = frozenset()
     all_procs  = result.process_diff.get("new_processes", [])
     sample_pid = getattr(result, "sample_pid", None)
 
@@ -1614,11 +1665,7 @@ def _process_html(result) -> str:
 def _all_procs_html(result, chain_pids: set) -> str:
     """화이트리스트 오탐만 제외한 신규 프로세스 전체 기록 테이블."""
     all_new = result.process_diff.get("new_processes", [])
-    try:
-        from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _WL
-    except Exception:
-        _WL = frozenset()
-
+    _WL = frozenset()
     table_procs = [p for p in all_new if p.name.lower() not in _WL]
     wl_excl = len(all_new) - len(table_procs)
 
@@ -1728,10 +1775,7 @@ def _shellcode_html(result) -> str:
     hh_r    = getattr(result, "hh_result",        None)
     pe_list = getattr(result, "pe_sieve_results",  None) or []
 
-    try:
-        from analysis.shellcode_analyzer import _SYSTEM_PROC_WHITELIST as _MEM_WL
-    except ImportError:
-        _MEM_WL = frozenset()
+    _MEM_WL = frozenset()
 
     if hh_r is None and not pe_list:
         return (
@@ -1893,149 +1937,6 @@ def _shellcode_html(result) -> str:
                 f"(PE인젝션·교체 없음 — 오탐 가능성 높음)</p>"
             )
 
-    # ── 쉘코드 덤프 재분석 결과 ───────────────────────────────────────
-    analyses = getattr(result, "shellcode_analyses", None) or []
-    if analyses:
-        parts.append(
-            "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;"
-            "padding-top:.75rem'>🔬 쉘코드 덤프 재분석 (YARA + CAPA)</h3>"
-        )
-        hits      = [sa for sa in analyses if sa.has_findings]
-        no_hits   = [sa for sa in analyses if not sa.has_findings and not sa.error]
-        err_items = [sa for sa in analyses if sa.error and not sa.has_findings]
-
-        hit_color = "#ff7b72" if hits else "#56d364"
-        parts.append(
-            f"<p style='color:#8b949e;font-size:.82rem;margin:.3rem 0 .75rem'>"
-            f"분석 파일 {len(analyses)}개 &nbsp;·&nbsp; "
-            f"<b style='color:{hit_color}'>시그니처 히트 {len(hits)}개</b>"
-            + (f" &nbsp;·&nbsp; 이상 없음 {len(no_hits)}개" if no_hits else "")
-            + (f" &nbsp;·&nbsp; <span style='color:#ff7b72'>오류 {len(err_items)}개</span>" if err_items else "")
-            + f"</p>"
-        )
-
-        # ── 전체 스캔 파일 목록 테이블 ────────────────────────────────
-        # hits → no_hits → err_items 순으로 출력
-        rows = []
-        for sa in hits + no_hits + err_items:
-            fname     = Path(sa.dump_file).name
-            folder    = Path(sa.dump_file).parent.name   # e.g. "process_3812"
-            size_str  = _fmt_bytes(sa.size_bytes) if sa.size_bytes else "?"
-
-            # 프로세스 셀
-            _sa_exe = getattr(sa, "proc_exe", "") or ""
-            _sa_cmd = getattr(sa, "proc_cmdline", "") or ""
-            proc_cell = (
-                f"<span class='ev-process mono' style='font-size:.8rem'>"
-                f"{_e(sa.proc_name)}</span>"
-                f"<span style='color:#8b949e;font-size:.75rem'> ({sa.pid})</span>"
-            )
-            if _sa_exe:
-                proc_cell += (
-                    f"<div style='font-size:.7rem;color:#6e7681;margin-top:.15rem;"
-                    f"word-break:break-all'>{_e(_sa_exe)}</div>"
-                )
-            if _sa_cmd and _sa_cmd.lower() not in (_sa_exe.lower(), sa.proc_name.lower()):
-                proc_cell += (
-                    f"<div style='font-size:.68rem;color:#484f58;margin-top:.1rem;"
-                    f"word-break:break-all' title='명령줄'>{_e(_sa_cmd[:200])}</div>"
-                )
-
-            # 결과 셀
-            if sa.error and not sa.has_findings:
-                result_cell = (
-                    f"<span style='color:#ff7b72;font-size:.75rem'>"
-                    f"오류: {_e(sa.error[:120])}</span>"
-                )
-            elif sa.has_findings:
-                yara_badges = " ".join(_b(m, "red") for m in sa.yara_matches)
-                capa_badges = " ".join(
-                    "<span class='badge badge-purple' title='"
-                    + _e((t.tactic or "") + " / " + (t.technique_name or ""))
-                    + "'>" + _e(t.technique_id) + "</span>"
-                    for t in sa.capa_techs
-                )
-                result_cell = (yara_badges + " " + capa_badges).strip()
-            else:
-                result_cell = "<span style='color:#56d364;font-size:.8rem'>이상없음</span>"
-
-            # 해시 (있으면 details 토글)
-            hash_detail = ""
-            if sa.md5 or sa.sha256:
-                hash_inner = ""
-                if sa.md5:
-                    hash_inner += (
-                        f"<tr><td style='color:#8b949e;font-size:.7rem;"
-                        f"padding-right:.5rem;white-space:nowrap'>MD5</td>"
-                        f"<td class='mono' style='font-size:.7rem;word-break:break-all;"
-                        f"color:#adbac7'>{_e(sa.md5)}</td></tr>"
-                    )
-                if sa.sha256:
-                    hash_inner += (
-                        f"<tr><td style='color:#8b949e;font-size:.7rem;"
-                        f"padding-right:.5rem;white-space:nowrap'>SHA256</td>"
-                        f"<td class='mono' style='font-size:.7rem;word-break:break-all;"
-                        f"color:#adbac7'>{_e(sa.sha256)}</td></tr>"
-                    )
-                hash_detail = (
-                    f"<details style='margin-top:.2rem'>"
-                    f"<summary style='color:#484f58;font-size:.7rem;cursor:pointer'>"
-                    f"해시</summary>"
-                    f"<table style='border-collapse:collapse;margin-top:.2rem'>"
-                    f"{hash_inner}</table></details>"
-                )
-
-            # VT 셀
-            _vt_det = getattr(sa, "vt_detections", -1)
-            _vt_tot = getattr(sa, "vt_total", 0)
-            _vt_lbl = getattr(sa, "vt_label", "") or ""
-            if _vt_det == -1:
-                vt_cell = "<span style='color:#484f58;font-size:.75rem'>-</span>"
-            elif _vt_det == 0:
-                vt_cell = "<span style='color:#6e7681;font-size:.75rem'>미등록</span>"
-            else:
-                _vt_ratio = f"{_vt_det}/{_vt_tot}" if _vt_tot else str(_vt_det)
-                vt_cell = f"<span class='badge badge-red'>{_vt_ratio}</span>"
-                if _vt_lbl:
-                    vt_cell += (
-                        f"<div style='font-size:.7rem;color:#ff7b72;margin-top:.2rem;"
-                        f"word-break:break-all'>{_e(_vt_lbl)}</div>"
-                    )
-
-            row_style = (
-                "background:rgba(255,123,114,.06)"
-                if sa.has_findings or _vt_det > 0
-                else ("background:rgba(255,123,114,.03)" if sa.error else "")
-            )
-            rows.append(
-                f"<tr style='{row_style}'>"
-                # 파일명 + 폴더명 + 전체 경로 토글
-                f"<td class='mono' style='font-size:.8rem'>"
-                f"<div style='color:#6e7681;font-size:.72rem;margin-bottom:.1rem'>"
-                f"📁 {_e(folder)}</div>"
-                f"<details><summary style='cursor:pointer;list-style:none'>"
-                f"{_e(fname)}</summary>"
-                f"<span style='color:#8b949e;font-size:.7rem;word-break:break-all'>"
-                f"{_e(sa.dump_file)}</span></details>"
-                f"{hash_detail}</td>"
-                # 프로세스
-                f"<td>{proc_cell}</td>"
-                # 크기
-                f"<td class='mono' style='color:#8b949e;text-align:right;font-size:.8rem'>"
-                f"{size_str}</td>"
-                # VT
-                f"<td>{vt_cell}</td>"
-                # 결과
-                f"<td>{result_cell}</td>"
-                f"</tr>"
-            )
-
-        parts.append(
-            "<table id='tbl-shc-files' style='width:100%'>"
-            "<tr><th>파일명</th><th>프로세스</th><th>크기</th><th>VT</th><th>결과 (YARA / CAPA)</th></tr>"
-            + "".join(rows) + "</table>"
-        )
-
     return "\n".join(parts)
 
 
@@ -2090,6 +1991,8 @@ def _ioc_html(result) -> str:
             _mipl = ip_proc_lookup.setdefault(_mip, [])
             if _label not in _mipl:
                 _mipl.append(_label)
+
+    parts.append(_pnmap_debug_panel(pnmap, ip_proc_lookup))
 
     # ── 외부 IP 테이블 (풍부한 컬럼) ─────────────────────────────
     if ioc.ip_addresses:
@@ -2397,43 +2300,16 @@ def generate_html_report(result, output_path: str) -> None:
     _hh      = getattr(result, "hh_result",        None)
     _ps_list = getattr(result, "pe_sieve_results",  None) or []
 
-    # 의심 프로세스 수 집계 — shellcode_analyzer 와 동일한 오탐 필터 적용
-    # (화이트리스트 시스템 프로세스 + 점수 미달 JIT 쉘코드 제외)
-    try:
-        from analysis.shellcode_analyzer import (
-            suspicion_score  as _shc_score,
-            _SYSTEM_PROC_WHITELIST as _SHC_WL,
-            _SCORE_THRESHOLD as _SHC_THR,
-        )
-        _shc_filter_ok = True
-    except Exception:
-        _shc_filter_ok = False
-
-    _new_pids_for_shc = {p.pid for p in result.process_diff.get("new_processes", [])}
-
-    def _is_real_suspicious(r) -> bool:
-        if not _shc_filter_ok:
-            return True
-        if getattr(r, "name", "").lower() in _SHC_WL:
-            return False
-        return r.pid in _new_pids_for_shc or _shc_score(r) >= _SHC_THR
-
+    # 의심 프로세스 수 집계 (pe-sieve / hollows-hunter 결과 기준)
     shc_total       = 0
-    shc_fp_excluded = 0   # 오탐 필터로 제외된 수
+    shc_fp_excluded = 0
 
     if _hh and not _hh.error:
-        for _proc in _hh.suspicious_processes:
-            if _is_real_suspicious(_proc):
-                shc_total += 1
-            else:
-                shc_fp_excluded += 1
+        shc_total += len(_hh.suspicious_processes)
 
     for _r in _ps_list:
         if not _r.error and _r.suspicious > 0:
-            if _is_real_suspicious(_r):
-                shc_total += 1
-            else:
-                shc_fp_excluded += 1
+            shc_total += 1
 
     tech_count = len(techs)
     ip_count   = len(ioc.ip_addresses)  if ioc else 0
