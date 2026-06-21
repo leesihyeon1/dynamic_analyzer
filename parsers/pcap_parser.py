@@ -55,6 +55,7 @@ SUSPICIOUS_PORTS: frozenset[int] = frozenset({
     3389,               # RDP
     5900,               # VNC
     1080,               # SOCKS
+    5228,               # Firebase FCM — RAT C2 채널로 악용 (Google Play Services와 구분 필요)
 })
 
 # 정보 탈취 C2에 사용되는 프로토콜별 포트 목록
@@ -121,7 +122,8 @@ _ANALYSIS_SERVICE_SUFFIXES: tuple[str, ...] = (
     "virustotal.com",       # VirusTotal API
     "alienvault.com",       # OTX AlienVault
     "shodan.io",            # Shodan
-    "system-informer.com",  # System Informer (분석 VM 업데이트)
+    # system-informer.com 제외: Cloudflare 도메인 프론팅 C2로 악용 사례 있음 —
+    # 악성코드가 이 도메인을 SNI로 사용하면 필터 시 누락되므로 표시
     "github.com",           # GitHub (도구 업데이트)
     "githubusercontent.com",
     "phantom.app",          # 브라우저 Web3 확장
@@ -131,10 +133,10 @@ _ANALYSIS_SERVICE_SUFFIXES: tuple[str, ...] = (
 
 
 def _is_analysis_service_domain(domain: str) -> bool:
-    """분석 도구·위협인텔 서비스 도메인이면 True를 반환합니다.
+    """분석 인프라 전용 도메인이면 True를 반환합니다 (DNS/TLS 레코드에서 제외).
 
-    tshark 캡처 중 분석 도구 자체가 이 도메인들에 접속할 수 있으므로
-    DNS / TLS SNI 레코드에서 제외하여 오탐을 방지합니다.
+    주의: 악성코드 C2로 악용 가능한 도메인(system-informer.com 등)은 제외하지 말 것.
+    위협 인텔 API나 패키지 저장소처럼 악성코드가 직접 접촉할 이유가 없는 도메인만 포함.
     """
     d = domain.lower().rstrip(".")
     for suffix in _ANALYSIS_SERVICE_SUFFIXES:

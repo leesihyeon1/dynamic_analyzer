@@ -1116,6 +1116,10 @@ def _network_html(result) -> str:
             ext = not _is_private_ip_str(c.dst_ip)
             ip_color = "ev-network" if ext else ""
             susp_badge = _b("!", "red") if c.suspicious_port else ""
+            _PORT_NOTE = {5228: "FCM"}  # Firebase Cloud Messaging — RAT C2 채널 악용
+            port_note = (f" <span style='font-size:.7rem;color:#e3b341'>"
+                         f"{_PORT_NOTE[c.dst_port]}</span>"
+                         if c.dst_port in _PORT_NOTE else "")
 
             # 도메인 컬럼
             conn_doms = combined_domains.get(c.dst_ip, [])
@@ -1153,7 +1157,7 @@ def _network_html(result) -> str:
                 f"<td class='mono'>{_e(c.src_ip)}</td>"
                 f"<td class='mono {ip_color}'>{_e(c.dst_ip)}</td>"
                 f"{dom_td}"
-                f"<td class='mono'>{c.dst_port} {susp_badge}</td>"
+                f"<td class='mono'>{c.dst_port}{port_note} {susp_badge}</td>"
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
                 + _proc_cell(_conn_procs, _reason) +
