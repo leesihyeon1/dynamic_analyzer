@@ -15,6 +15,7 @@ Requires scapy; degrades gracefully when not installed.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import statistics
@@ -83,6 +84,32 @@ DNS_TUNNEL_LABEL_LEN = 30
 # 비콘 탐지: 최소 반복 횟수, 최대 지터 비율
 BEACON_MIN_COUNT = 5
 BEACON_MAX_JITTER = 0.30   # 30% 이내 편차면 비콘으로 판단
+
+# ── JA3 / JA3S 핑거프린팅 ─────────────────────────────────────────────
+# GREASE 값 (RFC 8701) — JA3 계산 시 제외
+_GREASE: frozenset[int] = frozenset({
+    0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
+    0x8a8a, 0x9a9a, 0xaaaa, 0xbaba, 0xcaca, 0xdada, 0xeaea, 0xfafa,
+})
+
+# 잘 알려진 JA3 해시 → 도구/악성코드 패밀리 매핑
+_KNOWN_JA3: dict[str, str] = {
+    "72a589da586844d7f0818ce684948eea": "Cobalt Strike",
+    "d4e457bda0a18c7cc79e3c5ca38bb3c8": "Metasploit",
+    "a5de71cf37a7f895ead6e6e70f5b6de7": "QakBot",
+    "6734f37431109a72a7b3d9c53ef77f20": "TrickBot",
+    "51c64c77e60f3980eea90869b68c58a8": "Python-requests",
+    "b32309a26951912be7dba376398abc3b": "Go net/http",
+    "cca81c9c0d1e5bcaf2e0cc2bef8e61d1": "Emotet",
+    "9e10692f1b7f78228b2d4e424db3a98c": "Dridex",
+    "de9f2c7fd25e1b3afad3e85a0226c4de": "urllib3",
+    "e7d705a3286e19ea42f587b6e7359b5d": "Tor Browser",
+    "c35b954d2b7f858c76b9de8f5ec19e76": "Nmap",
+    "0d7c6f933c5f4e1c76afa545c5714b49": "Zeek/Bro",
+    "3b5074b1b5d032e5620f69f9159c6b5e": "IcedID",
+    "a0e9f5d64349fb13191bc781f81f42e1": "BazarLoader",
+    "13b3d7c9b3481e0a4e09b4a0bd2de9fd": "RedLine Stealer",
+}
 
 # ---------------------------------------------------------------------------
 # 분석 도구 / 위협인텔 서비스 도메인 화이트리스트
@@ -161,10 +188,13 @@ class HTTPRequest:
 
 @dataclass
 class TLSInfo:
-    """TLS ClientHello에서 추출한 SNI 정보"""
-    sni:      str         # 서버 이름 (복호화 없이 추출)
-    dst_ip:   str
-    dst_port: int
+    """TLS ClientHello에서 추출한 연결 정보 + JA3 핑거프린트"""
+    sni:         str          # 서버 이름 (복호화 없이 추출)
+    dst_ip:      str
+    dst_port:    int
+    ja3:         str  = ""    # JA3 MD5 핑거프린트
+    ja3_label:   str  = ""    # 알려진 도구명 (Cobalt Strike 등)
+    tls_version: str  = ""    # TLS 버전 문자열 (TLS 1.2 / TLS 1.3)
 
 
 @dataclass
@@ -281,6 +311,120 @@ def _base_domain(fqdn: str) -> str:
     """FQDN → eTLD+1 근사 (단순 상위 2레이블)"""
     parts = fqdn.rstrip(".").split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else fqdn
+
+
+# ---------------------------------------------------------------------------
+# JA3 / JA3S 핑거프린팅
+# ---------------------------------------------------------------------------
+
+_TLS_VER_STR: dict[int, str] = {
+    0x0304: "TLS 1.3", 0x0303: "TLS 1.2",
+    0x0302: "TLS 1.1", 0x0301: "TLS 1.0", 0x0300: "SSL 3.0",
+}
+
+
+def _parse_ja3_clienthello(raw: bytes) -> Optional[tuple]:
+    """
+    TLS ClientHello 원시 바이트에서 JA3 필드 및 SNI를 추출.
+
+    Returns: (tls_version:int, ciphers:list, ext_types:list,
+              curves:list, point_formats:list, sni:str|None)
+    None 반환 시 ClientHello가 아님.
+    """
+    try:
+        if len(raw) < 43:
+            return None
+        if raw[0] != 0x16 or raw[5] != 0x01:
+            return None
+
+        offset = 9  # record header(5) + handshake type(1) + length(3)
+
+        tls_version = int.from_bytes(raw[offset:offset + 2], "big")
+        offset += 2 + 32  # version + random
+
+        if offset >= len(raw):
+            return None
+        sid_len = raw[offset]
+        offset += 1 + sid_len
+
+        if offset + 2 > len(raw):
+            return None
+        cs_len = int.from_bytes(raw[offset:offset + 2], "big")
+        offset += 2
+        ciphers = []
+        for i in range(0, cs_len, 2):
+            if offset + i + 2 > len(raw):
+                break
+            v = int.from_bytes(raw[offset + i:offset + i + 2], "big")
+            if v not in _GREASE:
+                ciphers.append(v)
+        offset += cs_len
+
+        if offset >= len(raw):
+            return None
+        comp_len = raw[offset]
+        offset += 1 + comp_len
+
+        if offset + 2 > len(raw):
+            return (tls_version, ciphers, [], [], [], None)
+        ext_total = int.from_bytes(raw[offset:offset + 2], "big")
+        offset += 2
+        ext_end = min(offset + ext_total, len(raw))
+
+        ext_types: list[int]  = []
+        curves:    list[int]  = []
+        pf:        list[int]  = []
+        sni:       Optional[str] = None
+
+        while offset + 4 <= ext_end:
+            et  = int.from_bytes(raw[offset:offset + 2], "big")
+            el  = int.from_bytes(raw[offset + 2:offset + 4], "big")
+            offset += 4
+            ed  = raw[offset:offset + el]
+
+            if et not in _GREASE:
+                ext_types.append(et)
+
+            if et == 0x0000 and len(ed) >= 5:          # SNI
+                nl = int.from_bytes(ed[3:5], "big")
+                if 5 + nl <= len(ed):
+                    sni = ed[5:5 + nl].decode("ascii", errors="replace")
+            elif et == 0x000a and len(ed) >= 2:        # supported_groups
+                gl = int.from_bytes(ed[0:2], "big")
+                for i in range(0, gl, 2):
+                    if 2 + i + 2 <= len(ed):
+                        g = int.from_bytes(ed[2 + i:2 + i + 2], "big")
+                        if g not in _GREASE:
+                            curves.append(g)
+            elif et == 0x000b and len(ed) >= 1:        # ec_point_formats
+                pl = ed[0]
+                pf.extend(ed[1:1 + pl])
+            elif et == 0x002b and len(ed) >= 1:        # supported_versions (TLS 1.3)
+                sv_len = ed[0]
+                for i in range(0, sv_len, 2):
+                    if 1 + i + 2 <= len(ed):
+                        sv = int.from_bytes(ed[1 + i:1 + i + 2], "big")
+                        if sv not in _GREASE and sv > tls_version:
+                            tls_version = sv
+
+            offset += el
+
+        return (tls_version, ciphers, ext_types, curves, pf, sni)
+    except Exception:
+        return None
+
+
+def _build_ja3(tls_ver: int, ciphers: list, exts: list,
+               curves: list, pf: list) -> str:
+    """JA3 문자열을 구성하고 MD5 해시를 반환."""
+    s = (
+        f"{tls_ver},"
+        f"{'-'.join(str(c) for c in ciphers)},"
+        f"{'-'.join(str(e) for e in exts)},"
+        f"{'-'.join(str(g) for g in curves)},"
+        f"{'-'.join(str(p) for p in pf)}"
+    )
+    return hashlib.md5(s.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +734,9 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         "frame.len",                               # 7
         "dns.qry.name",                            # 8
         "dns.qry.type",                            # 9
-        "tls.handshake.extensions_server_name",    # 10
+        "tls.handshake.extensions_server_name",    # 10  SNI
+        "tls.handshake.ja3",                       # 11  JA3 해시 (tshark 내장)
+        "tls.record.version",                      # 12  TLS 레코드 버전
     ]
     for row in _run_tshark_fields(tshark_path, pcap_path, P1):
         packets_loaded += 1
@@ -654,11 +800,17 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
                         name=dns_name, qtype=qtype, entropy=round(ent, 3),
                     )
 
-            # TLS SNI
+            # TLS SNI + JA3 (tshark 내장 계산값 사용)
             sni = _f(10)
-            if sni:
-                raw_domains.add(sni)
-                tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
+            ja3 = _f(11)
+            if sni or ja3:
+                if sni:
+                    raw_domains.add(sni)
+                if not (sni and _is_analysis_service_domain(sni)):
+                    tls_list.append(TLSInfo(
+                        sni=sni, dst_ip=dst_ip, dst_port=dst_port,
+                        ja3=ja3, ja3_label=_KNOWN_JA3.get(ja3, ""),
+                    ))
 
         except Exception:
             packets_skipped += 1
@@ -904,15 +1056,31 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                     except Exception:
                         pass
 
-            # --- TLS SNI 추출 (TCP 443 또는 의심 포트) ---
+            # --- TLS ClientHello 파싱 (JA3 + SNI) ---
             if proto == "TCP" and Raw in pkt:
                 raw_bytes = bytes(pkt[Raw])
-                sni = _extract_tls_sni(raw_bytes)
-                if sni:
-                    raw_domains.add(sni)
-                    # 분석 서비스 도메인은 TLS SNI 목록에서 제외
-                    if not _is_analysis_service_domain(sni):
-                        tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
+                ja3_fields = _parse_ja3_clienthello(raw_bytes)
+                if ja3_fields:
+                    tls_ver, ciphers, ext_types, curves, pfmts, sni = ja3_fields
+                    ja3_hash  = _build_ja3(tls_ver, ciphers, ext_types, curves, pfmts)
+                    ja3_label = _KNOWN_JA3.get(ja3_hash, "")
+                    ver_str   = _TLS_VER_STR.get(tls_ver, f"0x{tls_ver:04x}")
+                    if sni:
+                        raw_domains.add(sni)
+                    if not (sni and _is_analysis_service_domain(sni)):
+                        tls_list.append(TLSInfo(
+                            sni=sni or "",
+                            dst_ip=dst_ip, dst_port=dst_port,
+                            ja3=ja3_hash, ja3_label=ja3_label,
+                            tls_version=ver_str,
+                        ))
+                else:
+                    # ClientHello가 아닌 경우 SNI 전용 폴백
+                    sni = _extract_tls_sni(raw_bytes)
+                    if sni:
+                        raw_domains.add(sni)
+                        if not _is_analysis_service_domain(sni):
+                            tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
 
             # --- HTTP 파싱 ---
             if proto == "TCP" and Raw in pkt:

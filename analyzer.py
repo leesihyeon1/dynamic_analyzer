@@ -206,6 +206,44 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Wireshark 등에서 미리 캡처한 PCAP/PCAPng 파일 경로. "
                          "지정 시 tshark 캡처 대신 해당 파일로 네트워크 분석 수행")
 
+    # TLS 복호화
+    tg = p.add_argument_group("TLS 심층 분석")
+    tg.add_argument("--no-keylog", action="store_true",
+                    help="SSLKEYLOGFILE 환경변수 주입 비활성화 "
+                         "(기본: 활성 — Python/Go/NSS 기반 악성코드 TLS 복호화)")
+    tg.add_argument("--fakenet", action="store_true",
+                    help="FakeNet-NG 사용 (tshark 대신, DNS 리다이렉션 + 전 프로토콜 인터셉트). "
+                         "FLARE-VM 필수. Schannel/WinHTTP 기반 HTTPS도 복호화 가능")
+    tg.add_argument("--fakenet-path", metavar="EXE",
+                    help="FakeNet-NG 실행파일 경로 명시 (자동 탐색 실패 시)")
+
+    # 메모리 포렌식
+    mg = p.add_argument_group("메모리 포렌식 (winpmem + Volatility3)")
+    mg.add_argument("--memdump", action="store_true",
+                    help="분석 완료 후 물리 메모리 덤프 획득 + Volatility3 실행 "
+                         "(malfind·pstree·netscan·cmdline·handles·dlllist). "
+                         "RAM 크기에 비례한 추가 시간 소요 (4 GB ≈ 2~5분)")
+    mg.add_argument("--dump", metavar="FILE",
+                    help="기존 메모리 덤프 파일 경로 (winpmem 생략, Volatility3만 실행)")
+    mg.add_argument("--winpmem-path", metavar="EXE",
+                    help="winpmem / DumpIt 실행파일 경로 명시")
+    mg.add_argument("--vol-path", metavar="FILE",
+                    help="vol.py 또는 vol3 경로 명시")
+    mg.add_argument("--dump-timeout", type=int, default=600, metavar="SEC",
+                    help="메모리 덤프 타임아웃 (기본 600초)")
+    mg.add_argument("--vol-timeout", type=int, default=300, metavar="SEC",
+                    help="Volatility3 플러그인당 타임아웃 (기본 300초)")
+
+    ag = p.add_argument_group("AI 분석 (Ollama qwen2.5:7b)")
+    ag.add_argument("--no-ai", action="store_true",
+                    help="AI 분석 비활성화 (Ollama 미설치 환경)")
+    ag.add_argument("--ai-model", metavar="MODEL", default="qwen2.5:7b",
+                    help="Ollama 모델 이름 (기본 qwen2.5:7b)")
+    ag.add_argument("--ollama-url", metavar="URL", default="http://localhost:11434",
+                    help="Ollama 서버 URL (기본 http://localhost:11434)")
+    ag.add_argument("--ai-timeout", type=int, default=300, metavar="SEC",
+                    help="AI 응답 타임아웃 초 (기본 300)")
+
     # 유틸리티
     p.add_argument("--check-tools",      action="store_true", help="도구 설치 상태 확인 후 종료")
     p.add_argument("--list-interfaces",  action="store_true", help="tshark 인터페이스 목록 후 종료")
@@ -309,6 +347,19 @@ def main() -> None:
         no_tshark     = args.no_tshark,
         no_ph         = args.no_ph,
         external_pcap = external_pcap,
+        use_keylog    = not getattr(args, "no_keylog", False),
+        use_fakenet   = getattr(args, "fakenet", False),
+        fakenet_path  = getattr(args, "fakenet_path", None),
+        use_memdump       = getattr(args, "memdump", False) or bool(getattr(args, "dump", None)),
+        winpmem_path      = getattr(args, "winpmem_path", None),
+        volatility_path   = getattr(args, "vol_path", None),
+        dump_timeout      = getattr(args, "dump_timeout", 600),
+        vol_plugin_timeout= getattr(args, "vol_timeout", 300),
+        existing_dump     = getattr(args, "dump", None),
+        use_ai            = not getattr(args, "no_ai", False),
+        ai_model          = getattr(args, "ai_model", "qwen2.5:7b"),
+        ollama_url        = getattr(args, "ollama_url", "http://localhost:11434"),
+        ai_timeout        = getattr(args, "ai_timeout", 300),
     )
 
     def on_status(msg: str) -> None:

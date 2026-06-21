@@ -1,7 +1,7 @@
 # dynamic_analyzer
 
 Windows 악성코드 동적 분석 자동화 도구.  
-ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA 를 조합해 **Noriben.py** 스타일로 동작하며,  
+ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 · Ollama 를 조합해 **Noriben.py** 스타일로 동작하며,  
 실행 한 줄로 샘플 모니터링 → MITRE ATT&CK 매핑 → HTML/JSON 리포트까지 자동 생성합니다.
 
 ---
@@ -15,11 +15,16 @@ ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA 를 조합해 **
 | **외부 PCAP 분석** | `--pcap` 옵션으로 Wireshark 캡처 파일 직접 분석 |
 | **scapy 없이 PCAP 분석** | scapy 미설치 시 tshark fallback 파서로 자동 대체 |
 | **SMTP/FTP C2 분석** | AgentTesla 류 정보탈취 악성코드의 메일·FTP 탈취 통신 자동 파싱 |
+| **TLS 세션 키 복호화** | `SSLKEYLOGFILE` 환경변수로 HTTPS 평문 재구성 (브라우저·curl 등) |
+| **FakeNet-NG 연동** | 가짜 DNS/HTTP/TCP 서버로 C2 응답 시뮬레이션, 연결 시도 도메인·URL 수집 |
 | **레지스트리 diff** | 실행 전·후 winreg 스냅샷 비교 (Regshot 대체) |
 | **프로세스 추적** | psutil로 자식 PID 추적, 신규/종료 프로세스 감지 |
 | **실시간 프로세스 감시** | 1초 폴링으로 신규 PID 즉시 pe-sieve 스캔 (타이밍 문제 해소) |
 | **pe-sieve / hollows-hunter** | 프로세스 인젝션·PE 할로잉·쉘코드 삽입 탐지, raw dump 자동 추출 |
 | **쉘코드 덤프 재분석** | pe-sieve/HH가 덤프한 `.shc`·`.bin` 파일에 YARA + CAPA `--shellcode` 적용, 오탐 필터링 포함 |
+| **물리 메모리 덤프** | winpmem / DumpIt으로 RAM 전체 덤프 (`--memdump`) |
+| **Volatility3 포렌식** | malfind · pstree · netscan · cmdline · handles · dlllist 병렬 실행, 오류 원인 리포트 포함 |
+| **AI 행위 분석** | Ollama (qwen2.5:7b 기본) 기반 — 악성코드 패밀리 추정 · 위협 수준 · 행위 분석 · C2 패턴 한국어 자동 생성 |
 | **CAPA 정적 분석** | 샘플 바이너리에 CAPA 적용 → ATT&CK 기법 자동 추출 |
 | **VirusTotal 연동** | SHA256 기반 샌드박스 ATT&CK 기법 조회 (API 키 선택 설정) |
 | **프로세스↔네트워크 매핑** | ProcMon TCP/UDP 이벤트 기반, 프로세스별 외부 연결 집계 |
@@ -38,7 +43,7 @@ ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA 를 조합해 **
 ### 필수
 - **Windows 10/11** (또는 Windows VM)
 - **Python 3.10+**
-- **관리자 권한** (ProcMon, tshark 모두 필요)
+- **관리자 권한** (ProcMon, tshark, winpmem 모두 필요)
 - **FLARE VM** 또는 동적 분석 전용 VM 환경 권장
 
 ```powershell
@@ -49,10 +54,11 @@ pip install -r requirements.txt
 psutil>=5.9.0
 scapy>=2.5.0   # 없으면 tshark fallback 파서로 자동 대체
 rich>=13.7.0
-yara-python    # 선택 — 쉘코드 YARA 스캔 (pip install yara-python)
+yara-python    # 선택 — 쉘코드 YARA 스캔
 ```
 
 ### 선택 도구 (자동 감지)
+
 | 도구 | 기본 경로 | 없으면 |
 |------|-----------|--------|
 | **ProcMon** (`Procmon64.exe`) | `C:\Tools\SysinternalsSuite\` 또는 PATH | ProcMon 기능 스킵 |
@@ -61,6 +67,10 @@ yara-python    # 선택 — 쉘코드 YARA 스캔 (pip install yara-python)
 | **pe-sieve** (`pe-sieve64.exe`) | `C:\Tools\pe-sieve\` 또는 PATH | 인젝션/쉘코드 탐지 스킵 |
 | **hollows_hunter** (`hollows_hunter64.exe`) | `C:\Tools\hollows_hunter\` 또는 PATH | 전체 시스템 스캔 스킵 |
 | **CAPA** (`capa.exe`) | `C:\Tools\capa\` 또는 PATH | 정적 ATT&CK 분석 스킵 |
+| **winpmem** / **DumpIt** | `C:\Tools\winpmem\` 또는 PATH | `--memdump` 사용 불가 |
+| **Volatility3** (`vol.py` / `vol3`) | `C:\Tools\volatility3\` 또는 PATH | 메모리 포렌식 스킵 |
+| **FakeNet-NG** (`FakeNet.exe`) | PATH 또는 `--fakenet-path` 명시 | FakeNet 기능 스킵 |
+| **Ollama** | `http://localhost:11434` | AI 분석 스킵 |
 
 ---
 
@@ -73,7 +83,7 @@ yara-python    # 선택 — 쉘코드 YARA 스캔 (pip install yara-python)
 python analyzer.py malware.exe
 ```
 
-### 옵션
+### 주요 옵션
 
 ```powershell
 # 모니터링 시간 변경 (기본 60초)
@@ -89,15 +99,62 @@ python analyzer.py malware.exe --interface 2
 python analyzer.py malware.exe --no-procmon
 python analyzer.py malware.exe --no-tshark
 
-# Process Hacker GUI 실행 안 함
-python analyzer.py malware.exe --no-ph
-
-# 파일 저장 없이 콘솔 출력만
-python analyzer.py malware.exe --no-export
-
 # 분석 완료 후 HTML 리포트 자동 열기 비활성화
 python analyzer.py malware.exe --no-open
 ```
+
+### 메모리 포렌식 (Volatility3)
+
+```powershell
+# 분석 종료 후 물리 메모리 덤프 + Volatility3 실행
+# (RAM 크기에 비례한 시간 소요 — 4 GB ≈ 2~5분)
+python analyzer.py malware.exe --memdump
+
+# winpmem / Volatility3 경로 직접 지정
+python analyzer.py malware.exe --memdump --winpmem-path C:\Tools\winpmem.exe --vol-path C:\Tools\volatility3\vol.py
+
+# 덤프 타임아웃 변경 (기본 600초)
+python analyzer.py malware.exe --memdump --dump-timeout 900
+
+# 이미 만들어진 덤프 파일 재사용 (재덤프 없이 Volatility3만 실행)
+python analyzer.py malware.exe --memdump --dump C:\dumps\memory.raw
+```
+
+> **심볼 파일**: Volatility3는 OS 버전에 맞는 ISF 심볼 파일이 필요합니다.  
+> `vol -f memory.raw windows.info` 로 최초 실행 시 자동 다운로드됩니다.
+
+### TLS 복호화 (HTTPS 평문 재구성)
+
+```powershell
+# SSLKEYLOGFILE 자동 주입 (Chrome·Edge·Firefox·curl 등)
+python analyzer.py malware.exe  # 기본 활성화
+
+# 비활성화
+python analyzer.py malware.exe --no-keylog
+```
+
+### FakeNet-NG 연동
+
+```powershell
+# 가짜 DNS/HTTP/TCP 서버로 C2 응답 시뮬레이션 (tshark 대신)
+python analyzer.py malware.exe --fakenet
+
+# FakeNet-NG 경로 명시
+python analyzer.py malware.exe --fakenet --fakenet-path C:\Tools\FakeNet\FakeNet.exe
+```
+
+### AI 행위 분석 (Ollama)
+
+```powershell
+# Ollama가 실행 중이면 자동 활성화 — 분석 종료 후 AI 탭에 결과 표시
+python analyzer.py malware.exe --ai
+
+# 모델 지정 (기본: qwen2.5:7b)
+python analyzer.py malware.exe --ai --ai-model qwen2.5:14b
+```
+
+> **Ollama 설치**: https://ollama.com  
+> 모델 다운로드: `ollama pull qwen2.5:7b`
 
 ### PCAP 분석
 
@@ -144,14 +201,15 @@ python analyzer.py --list-interfaces
 ## 분석 흐름
 
 ```
-python analyzer.py malware.exe
+python analyzer.py malware.exe --memdump --ai
         │
         ▼
 [1/6] 사전 스냅샷       레지스트리 + 프로세스 목록 저장
         │
         ▼
 [2/6] 모니터링 시작     ProcMon 백그라운드 실행
-                        tshark 패킷 캡처 시작
+                        tshark 패킷 캡처 시작 (또는 FakeNet-NG)
+                        TLS 키 로거 활성화 (SSLKEYLOGFILE)
                         Process Hacker GUI 실행 (선택)
         │
         ▼
@@ -164,21 +222,25 @@ python analyzer.py malware.exe
         ▼
 [5/6] 종료              ProcMon /Terminate → PML → CSV 변환
                         tshark 종료 → pcap 저장
-                        Process Hacker / SystemInformer 종료
+                        TLS 세션 키 수집 완료
                         hollows_hunter 전체 시스템 스캔
                         pe-sieve 신규 프로세스 스캔 (잔존 PID 대상)
         │
         ▼
 [6/6] 분석              사후 스냅샷 → 레지스트리·프로세스 diff
                         ProcMon CSV 파싱 + 노이즈 필터
-                        인젝션 대상 PID 이벤트 자동 포함
                         PCAP 파싱 (연결, DNS, TLS SNI, HTTP, SMTP, FTP)
+                        TLS 세션 키로 HTTPS 복호화 (decrypted_requests)
+                        FakeNet-NG 결과 파싱 (DNS/HTTP/TCP 연결 시도)
                         프로세스↔네트워크 연결 매핑
                         MITRE ATT&CK 매핑
                         CAPA 정적 분석 → ATT&CK 기법 병합
                         쉘코드 덤프 재분석 (YARA + CAPA --shellcode)
                         VirusTotal 조회 → ATT&CK 기법 병합 (선택)
                         IOC 추출 (SMTP/FTP C2 IP 포함)
+                        물리 메모리 덤프 (winpmem) ← --memdump
+                        Volatility3 병렬 실행 (malfind·pstree·netscan·cmdline·handles·dlllist)
+                        Ollama AI 행위 분석 (qwen2.5:7b) ← --ai
         │
         ▼
       리포트             results/<이름>_<timestamp>/
@@ -187,63 +249,29 @@ python analyzer.py malware.exe
                           ├── procmon.pml
                           ├── procmon.csv
                           ├── capture.pcap
-                          └── pe_dumps/                    ← pe-sieve raw dump
+                          ├── memory.raw                   ← --memdump
+                          └── dumps/                       ← pe-sieve raw dump
                               └── process_<pid>/
-                                  ├── *.exe / *.dll        ← PE 덤프
-                                  └── *.shc / *.bin        ← 쉘코드 덤프
+                                  ├── *.exe / *.dll
+                                  └── *.shc / *.bin
 ```
 
 ---
 
-## 출력 예시
+## HTML 리포트 탭 구성
 
-### 콘솔
-
-```
-─────────────── 🧪 dynamic_analyzer — malware.exe ───────────────
-  대상   : C:\samples\malware.exe
-  출력   : results\malware_20260526_120000
-  timeout: 60초
-
-  [캡처 최적화] Chrome DoH  Chrome QUIC  Edge DoH  Edge QUIC  Firefox DoH  LLMNR  NetBIOS-NS
-  [도구 확인] ProcMon=✔  tshark=✔  RegSnap=✔  ProcHacker=✔
-  [1/6] 사전 스냅샷 수집 중...
-  [2/6] 모니터링 시작...
-  [3/6] 샘플 실행: malware.exe
-        PID: 4832
-  [4/6] 모니터링 중... (60초)
-        5s 경과 / 잔여 55s...
-        샘플 종료 감지 (15s)
-  [5/6] 모니터링 종료...
-        ProcMon 로그 변환 중...
-        hollows-hunter 스캔: 의심 프로세스 3개
-        Process Hacker 종료됨
-  [6/6] 사후 스냅샷 수집 중...
-        [보완] 조기 종료 프로세스 1개 추가 (malware.exe)
-  [분석] ProcMon CSV 파싱...
-        이벤트 18,432개 → 필터 후 512개
-  [분석] CAPA 정적 분석 중...
-        CAPA 완료: 기법 7개 탐지 (누적 7개)
-  [분석] 쉘코드 덤프 재분석 중 (YARA + CAPA --shellcode)...
-        쉘코드 파일 3개 분석  시그니처 히트 2개 🚨
-
-  MITRE 기법       9건
-  외부 IP          2개
-  드롭 파일        1개
-  레지스트리 추가  4건
-  신규 프로세스    2개
-  ProcMon 이벤트   18,432개 → 필터 후 512개
-
-탐지된 MITRE ATT&CK 기법:
-  ✔ T1055.001  Process Injection: DLL Injection  Defense Evasion
-  ✔ T1059.003  Windows Command Shell  Execution
-  ✔ T1547.001  Registry Run Keys / Startup Folder  Persistence
-
-  [*] 결과 저장 중...
-  JSON → results\malware_20260526_120000\malware_dynamic_report.json
-  HTML → results\malware_20260526_120000\malware_dynamic_report.html
-────────────────────── 분석 완료 ──────────────────────
-```
+| 탭 | 내용 |
+|----|------|
+| 🔍 **기본 분석** | 분석 요약 카드 (도구 상태·IOC 수·탐지 기법 수) |
+| 🎯 **ATT&CK** | MITRE ATT&CK 기법 테이블 (전술·기법·증거·출처) |
+| ⚙️ **프로세스** | 신규/종료 프로세스, pe-sieve 탐지 결과 |
+| 📁 **파일** | ProcMon 파일 이벤트 (Write·Create·Rename·Delete) |
+| 🗝️ **레지스트리** | ProcMon 레지스트리 이벤트 + Regshot diff |
+| 🌐 **네트워크** | 외부 연결·DNS·TLS SNI·HTTP·SMTP/FTP·HTTPS 복호화·FakeNet-NG |
+| 🧠 **메모리** | pe-sieve/HH 인젝션 탐지 + Volatility3 포렌식 (malfind·pstree·netscan·handles) |
+| 🔎 **IOC** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL (프로세스 매핑 포함) |
+| 🤖 **AI 분석** | Ollama 행위 분석 — 패밀리 추정·위협 수준·행위 요약·C2 패턴 (한국어) |
+| 🕵️ **Hunt** | abuse.ch 실시간 IOC 조회 (MalwareBazaar·ThreatFox·URLhaus·Feodo) |
 
 ---
 
@@ -265,6 +293,10 @@ dynamic_analyzer/
 │   ├── process_watcher.py    # 실시간 신규 PID 감지 + 즉시 pe-sieve 스캔
 │   ├── pesieve_scanner.py    # pe-sieve 실행 래퍼
 │   ├── hollows_hunter.py     # hollows-hunter 실행 래퍼
+│   ├── tls_keylog.py         # SSLKEYLOGFILE 기반 TLS 세션 키 수집
+│   ├── fakenet_integrator.py # FakeNet-NG 실행 + 결과 파싱
+│   ├── memory_forensics.py   # winpmem 메모리 덤프 + Volatility3 포렌식
+│   ├── ai_analyzer.py        # Ollama 기반 AI 행위 분석 (qwen2.5:7b)
 │   ├── config_loader.py      # config.json 로더
 │   └── vm_setup.py           # 캡처 최적화 레지스트리 정책 자동 적용
 │
@@ -330,12 +362,47 @@ dynamic_analyzer/
 
 ## 변경 이력
 
+### v1.8 — AI 분석 · 메모리 포렌식 · TLS 복호화 · FakeNet-NG
+
+- **🤖 AI 행위 분석** (`core/ai_analyzer.py` 신규)
+  - Ollama 로컬 LLM(기본: `qwen2.5:7b`) 기반 한국어 자동 위협 분석
+  - 분석 항목 4개: 악성코드 패밀리 추정 · 위협 수준 평가 · 행위 분석 · C2 통신 패턴
+  - 프롬프트 구성: MITRE ATT&CK 전술별 그룹 + 프로세스·파일·레지스트리·네트워크 행위 데이터
+  - 10,000자 프롬프트 한도, `temperature=0.2` (사실 기반 일관성), `num_ctx=8192`
+  - Ollama 미실행 또는 모델 미설치 시 자동 스킵, `--ai` 옵션으로 활성화
+
+- **🧠 물리 메모리 덤프 + Volatility3** (`core/memory_forensics.py` 신규)
+  - winpmem / DumpIt으로 RAM 전체 덤프 후 Volatility3 플러그인 병렬 실행
+  - 실행 플러그인: `windows.malfind` · `windows.pstree` · `windows.netscan` · `windows.cmdline` · `windows.handles` · `windows.dlllist`
+  - 플러그인 오류 원인 보고: 심볼 파일 없음 · 타임아웃 · JSON 파싱 오류 → HTML에 상세 표시
+  - `--memdump`, `--winpmem-path`, `--vol-path`, `--dump-timeout`, `--dump` (기존 덤프 재사용) 옵션 지원
+
+- **🔐 TLS 세션 키 복호화** (`core/tls_keylog.py` 신규)
+  - `SSLKEYLOGFILE` 환경변수를 샘플 프로세스에 자동 주입 → HTTPS 평문 재구성
+  - tshark로 TLS 세션 키 적용 후 HTTP2/HTTP1 요청 추출
+  - 복호화된 요청은 네트워크 탭 "HTTPS 복호화" 섹션에 별도 표시
+  - `--no-keylog` 옵션으로 비활성화
+
+- **🌐 FakeNet-NG 연동** (`core/fakenet_integrator.py` 신규)
+  - 가짜 DNS/HTTP/TCP 서버로 C2 응답 시뮬레이션 (tshark 대체 또는 병행)
+  - 악성코드가 연결 시도하는 도메인·URL·TCP 세션 자동 수집
+  - 결과는 네트워크 탭 "FakeNet-NG" 섹션에 표시
+  - `--fakenet`, `--fakenet-path` 옵션 지원
+
+- **HTML 리포트 탭 확장** (`exporters/html_report.py`)
+  - **AI 분석 탭** 신규: 마크다운 → HTML 렌더링, 모델명·프롬프트 길이·소요시간 메타 표시
+  - **네트워크 탭**: HTTPS 복호화 섹션 · FakeNet-NG DNS/HTTP/TCP 섹션 추가
+  - **메모리 탭**: Volatility3 malfind · pstree · netscan · handles · cmdline 테이블 추가, 플러그인 오류 접기(`<details>`) 표시
+  - `pcap=None`일 때 decrypted_requests / FakeNet 결과도 정상 렌더링 (조기 반환 버그 수정)
+  - IOC 탭: 드롭 파일 프로세스 매핑 정확도 향상 (WriteFile + CreateFile/Created + RenameFile 처리)
+
+---
+
 ### v1.7 — HTML 리포트 품질 개선 · 프로세스/메모리 탭 정확도 향상
 
 - **프로세스 탭 정상 프로세스 필터링** (`exporters/html_report.py`)
   - `svchost.exe`, `explorer.exe`, `dwm.exe` 등 시스템 프로세스를 프로세스 트리·테이블에서 자동 제외
-  - **악성코드 실행 체인 보존**: 악성 프로세스가 생성한 자식은 이름이 시스템 프로세스명이어도 표시 (`malware_chain` 재귀 확장)
-  - 탭 배지 숫자 및 "N개 제외" 범례 표시
+  - **악성코드 실행 체인 보존**: 악성 프로세스가 생성한 자식은 이름이 시스템 프로세스명이어도 표시
 
 - **프로세스 탭 데이터 소스 명확화** (`core/orchestrator.py`)
   - pe-sieve 스캔 PID를 `new_processes`에 주입하던 "보완 블록" 완전 제거
@@ -343,114 +410,43 @@ dynamic_analyzer/
 
 - **메모리 탭 시스템 프로세스 오탐 필터링** (`exporters/html_report.py`)
   - hollows-hunter / pe-sieve가 탐지한 결과 중 화이트리스트 프로세스 + PE인젝션·교체 없음 → 자동 숨김
-  - `dwm.exe`, `explorer.exe`, `SearchApp.exe` 등 Windows 정상 프로세스의 쉘코드·훅 오탐 제거
   - 실제 PE인젝션(`implanted_pe > 0`) 또는 교체(`replaced > 0`) 탐지 시 화이트리스트여도 표시
-  - 필터된 개수를 하단에 표기하여 분석가에게 투명하게 공개
 
 - **MITRE ATT&CK 탭 연동 상태 표시** (`core/orchestrator.py`, `exporters/html_report.py`)
-  - CAPA / VirusTotal 실행 결과를 상태 칩으로 표시 (미설치·PE 미지원·비활성·결과 N건 등)
-  - CAPA가 PE 파일만 지원함을 명시하여 .doc/.xls 분석 시 혼선 방지
-
-- **레지스트리 이벤트 표시 한도 3,000건으로 상향** (`exporters/html_report.py`)
-  - 기존 1,000건 → 3,000건 (JS 페이지네이션으로 브라우저 성능 영향 없음)
+  - CAPA / VirusTotal 실행 결과를 상태 칩으로 표시
 
 - **네트워크 탭 도메인 컬럼 추가** (`exporters/html_report.py`)
-  - 연결 테이블에 "도메인" 독립 컬럼 추가 (기존: IP 셀 내 숨겨진 서브텍스트)
-  - DNS 응답(`ip_to_domain`) + TLS SNI(`tls_info`) 두 소스를 합산하여 가장 넓은 커버리지 제공
-  - 동일 IP에 복수 도메인 매핑 시 대표 도메인 + `+N` 배지
+  - 연결 테이블에 "도메인" 독립 컬럼 추가 (DNS 응답 + TLS SNI 합산)
 
 ---
 
 ### v1.6 — 쉘코드 재분석 · CAPA/VT 통합 · 이벤트 필터 개선
 
 - **쉘코드 덤프 재분석** (`analysis/shellcode_analyzer.py` 신규)
-  - pe-sieve / hollows-hunter 가 `process_<pid>/` 에 덤프한 `.shc`·`.bin` 파일을 자동 재분석
-  - YARA 룰 스캔 (`rules/yaraify/`) + CAPA `--shellcode` 플래그로 ATT&CK 기법 추출
-  - 오탐 필터링 2단계:
-    - **화이트리스트**: dwm, explorer, chrome, svchost 등 시스템/브라우저 프로세스 제외
-    - **의심도 점수**: PE인젝션(+40), 프로세스할로잉(+40), 훅(+20), 쉘코드단독(+10) — 임계값 30 미만 제외
-  - 신규 생성 PID는 점수 무관 포함 (드로퍼 즉시 종료 대응)
-  - 발견된 ATT&CK 기법은 `behavior_report` 에 자동 병합
-
 - **CAPA 정적 분석 통합** (`analysis/capa_analyzer.py` 신규)
-  - 샘플 바이너리에 CAPA 적용, 결과 ATT&CK 기법을 메모리·ATT&CK 탭에 통합 표시
-  - `config.json` > `capa.enabled / path / timeout` 으로 제어
-
 - **VirusTotal ATT&CK 조회** (`analysis/vt_analyzer.py` 신규)
-  - SHA256 기반 `/files/{hash}/behaviours` + `behaviour_summary` 엔드포인트 조회
-  - `config.json` > `virustotal.enabled / api_key / timeout` 으로 제어 (기본 비활성)
-
-- **🧠 메모리 탭 개편** (`exporters/html_report.py`)
-  - 쉘코드 덤프 재분석 결과 섹션 추가 (YARA 룰명 · CAPA ATT&CK 배지)
-  - 덤프 파일별 **MD5·SHA256** 해시 표시
-  - 전체 경로 접힘(`<details>`) + 파일명·크기 헤더
-
-- **이벤트 필터 개선** (`core/orchestrator.py`)
-  - HH/pe-sieve가 탐지한 인젝션 대상 프로세스 PID를 `focus_pids` 에 자동 포함  
-    → 드로퍼가 dwm.exe·PanGPA.exe 등 기존 프로세스에 주입한 경우에도 파일·레지스트리 이벤트 표시
-  - 조기 종료된 샘플(드로퍼·로더)을 pe-sieve 스캔 결과로 프로세스 탭에 보완  
-    → proc_after 스냅샷 이전에 종료된 프로세스도 프로세스 탭에 표시
-
-- **pe-sieve / hollows-hunter 파싱 개선** (`parsers/pesieve_result.py`, `core/hollows_hunter.py`, `core/pesieve_scanner.py`)
-  - HH summary.json 형식 양방향 파싱 (full output / summary 자동 감지)
-  - 다중 JSON 키 후보 처리 (버전별 차이 흡수)
-  - 덤프 디렉터리 경로 자동 해석
+- **🧠 메모리 탭 개편** — 덤프 파일 MD5·SHA256 해시, YARA 룰명·CAPA ATT&CK 배지
 
 ### v1.5 — Hunt 탭 · 탭 분리 · VM 자동 세팅
 
-- **Hunt 탭 추가** (`exporters/html_report.py`)
-  - HTML 리포트 내 `🕵️ Hunt` 탭 신규 추가
-  - 검색 입력창에 해시(MD5/SHA1/SHA256) · IP · URL · 도메인을 입력하면 **브라우저에서 직접 abuse.ch API 조회** (서버 불필요, CORS 허용)
-  - 지원 서비스:
-    - **MalwareBazaar** — 해시(MD5/SHA1/SHA256) 악성코드 데이터베이스
-    - **ThreatFox** — 해시/IP/URL/도메인 IOC 조회
-    - **URLhaus** — IP/URL/도메인 악성 URL 조회
-    - **Feodo Tracker** — IP 봇넷 C2 서버 조회
-  - IOC 타입 자동 감지(정규식) → 적합한 서비스만 활성화
-  - 현재 분석 결과에서 추출된 IOC(외부IP·도메인·드롭파일 SHA256)를 **Quick 버튼**으로 원클릭 검색
-  - 각 서비스별 상태 배지(대기/조회중/탐지됨/클린/오류) 실시간 업데이트
-
-- **HTML 리포트 탭 구조 재편** (`exporters/html_report.py`)
-  - `🔍 기본 분석` 탭: 개요 카드만 표시 (요약 중심)
-  - `🎯 ATT&CK` 탭 분리: MITRE ATT&CK 기법 테이블 독립 탭으로 이동
-  - `⚙️ 프로세스` 탭 분리: 신규 프로세스·pe-sieve 탐지 테이블 독립 탭으로 이동
-  - `🕵️ Hunt` 탭 신규 추가 (우측 끝)
-
-- **VM 자동 세팅** (`core/vm_setup.py` 신규, `analyzer.py`)
-  - 스냅샷 복원 후 매 실행 시 `apply_capture_policies()` 자동 호출
-  - 적용 항목 7가지 (관리자 권한 필요):
-    | 정책 | 효과 |
-    |------|------|
-    | Chrome DoH 비활성화 | A 쿼리 평문 UDP 53으로 노출 |
-    | Chrome QUIC 비활성화 | HTTP/3 → TLS(TCP) 강제, SNI 캡처 가능 |
-    | Edge DoH 비활성화 | 동일 |
-    | Edge QUIC 비활성화 | 동일 |
-    | Firefox DoH 비활성화 | 동일 |
-    | LLMNR 비활성화 | `.in-addr.arpa` PTR 노이즈 제거 |
-    | NetBIOS-NS 비활성화 | UDP 137 브로드캐스트 노이즈 제거 |
-  - 이미 적용된 경우 멱등(덮어쓰기) — 중복 실행 안전
+- **Hunt 탭 추가** — abuse.ch 실시간 IOC 조회 (브라우저 직접 API 호출)
+- **HTML 리포트 탭 구조 재편** — ATT&CK · 프로세스 · Hunt 탭 분리
+- **VM 자동 세팅** (`core/vm_setup.py` 신규) — Chrome/Edge/Firefox DoH·QUIC·LLMNR·NetBIOS 비활성화
 
 ### v1.4 — pe-sieve 통합 · SMTP/FTP C2 분석 · HTML 검색바
 
-- **pe-sieve / hollows-hunter 통합**
-  - 모니터링 중 `ProcessWatcher`: 1초 폴링으로 신규 PID를 즉시 pe-sieve 스캔
-  - hollows_hunter 전체 시스템 스캔 (`/dmode 3`) + pe-sieve 신규 프로세스 개별 스캔 병행
-
-- **SMTP/FTP C2 통신 분석** (`parsers/pcap_parser.py`)
-  - AgentTesla, FormBook 등 정보탈취 악성코드의 SMTP(25/465/587/2525) · FTP(21/2121) 세션 자동 파싱
-
-- **HTML 리포트 전 탭 검색바 + 페이지네이션 개선**
+- pe-sieve / hollows-hunter 통합, ProcessWatcher 1초 폴링
+- SMTP/FTP C2 통신 분석 (`parsers/pcap_parser.py`)
+- HTML 리포트 전 탭 검색바 + 페이지네이션
 
 ### v1.3 — 프로세스↔네트워크 매핑 · 노이즈 필터 강화
 
-- `analysis/process_network_map.py` 신규: ProcMon TCP/UDP 기반 프로세스별 연결 집계
-- 노이즈 필터 강화: ProcMon, tshark, SystemInformer, Process Hacker 이벤트 전체 제거
+- `analysis/process_network_map.py` 신규 — ProcMon TCP/UDP 기반 프로세스별 연결 집계
 
 ### v1.2 — PCAP 분석 강화 · HTML 페이지네이션
 
 - scapy 없이 PCAP 분석 (tshark fallback)
-- 외부 PCAP 파일 지원 (`--pcap`)
-- HTML 페이지네이션, TLS SNI 분석
+- 외부 PCAP 파일 지원 (`--pcap`), TLS SNI 분석
 
 ### v1.1 — 초기 기능 개선
 
@@ -464,6 +460,7 @@ dynamic_analyzer/
 - 실제 악성코드를 호스트 PC에서 실행하지 마세요
 - `results/` 디렉터리는 `.gitignore`에 포함되어 있습니다
 - ProcMon은 서명된 드라이버가 필요하므로 Secure Boot가 활성화된 환경에서는 동작하지 않을 수 있습니다
+- `--memdump`는 관리자 권한 + winpmem 드라이버 로드가 필요합니다
 
 ---
 
@@ -476,3 +473,6 @@ dynamic_analyzer/
 - [CAPA](https://github.com/mandiant/capa) — 실행 파일 기능 탐지
 - [pe-sieve](https://github.com/hasherezade/pe-sieve) — 프로세스 인젝션 탐지
 - [hollows-hunter](https://github.com/hasherezade/hollows_hunter) — 전체 시스템 인젝션 스캔
+- [Volatility3](https://github.com/volatilityfoundation/volatility3) — 메모리 포렌식 프레임워크
+- [Ollama](https://ollama.com) — 로컬 LLM 실행 환경
+- [FakeNet-NG](https://github.com/mandiant/flare-fakenet-ng) — 네트워크 시뮬레이션 도구

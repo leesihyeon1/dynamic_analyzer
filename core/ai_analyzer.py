@@ -1,0 +1,561 @@
+"""
+ai_analyzer.py — Ollama 기반 행위 중심 AI 위협 분석
+
+동적 분석 결과(프로세스·파일·레지스트리·네트워크·MITRE ATT&CK)를
+행위 중심 프롬프트로 변환해 Ollama에 전송하고, 위협 분석 텍스트를 반환합니다.
+
+사용:
+    from core.ai_analyzer import OllamaAnalyzer
+    az = OllamaAnalyzer()
+    if az.is_available():
+        ai_result = az.analyze(result)
+"""
+from __future__ import annotations
+
+import json
+import re as _re
+import time
+import urllib.request
+import urllib.error
+from dataclasses import dataclass
+from pathlib import Path
+
+
+OLLAMA_BASE_URL  = "http://localhost:11434"
+DEFAULT_MODEL    = "qwen2.5:7b"
+# qwen2.5:7b num_ctx=8192, num_predict=2048 → 입력 여유 ~6000토큰 ≈ 12000 한국어 자
+_MAX_PROMPT_CHARS = 10000
+
+
+# ── 결과 ─────────────────────────────────────────────────────────────────────
+
+@dataclass
+class AiAnalysisResult:
+    model:        str   = DEFAULT_MODEL
+    response:     str   = ""    # Ollama 응답 원문 (마크다운)
+    elapsed_sec:  float = 0.0
+    prompt_chars: int   = 0
+    error:        str   = ""
+
+
+# ── Ollama 가용성 확인 ────────────────────────────────────────────────────────
+
+def _is_ollama_running(base_url: str, timeout: int = 4) -> bool:
+    try:
+        req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _is_model_available(base_url: str, model: str, timeout: int = 4) -> bool:
+    try:
+        req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        names = [m.get("name", "") for m in data.get("models", [])]
+        model_base = model.split(":")[0]
+        return any(model_base in n for n in names)
+    except Exception:
+        return False
+
+
+# ── 내부 유틸 ────────────────────────────────────────────────────────────────
+
+def _trunc(s: str, n: int) -> str:
+    s = str(s)
+    return s[:n] + "…" if len(s) > n else s
+
+
+def _fmt_bytes(n: int) -> str:
+    if n >= 1_048_576:
+        return f"{n/1_048_576:.1f}MB"
+    if n >= 1024:
+        return f"{n/1024:.1f}KB"
+    return f"{n}B"
+
+
+def _is_private_ip(ip: str) -> bool:
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return False
+        a, b = int(parts[0]), int(parts[1])
+        return (a == 10 or (a == 172 and 16 <= b <= 31)
+                or (a == 192 and b == 168) or a == 127)
+    except Exception:
+        return False
+
+
+_RENAME_DEST_RE = _re.compile(r'FileName:\s*([^,\r\n]+)', _re.IGNORECASE)
+
+
+# ── 프롬프트 빌더 ─────────────────────────────────────────────────────────────
+
+def _build_prompt(result) -> str:
+    """AnalysisResult → 행위 중심 분석 프롬프트."""
+    lines: list[str] = [
+        "당신은 악성코드 동적 분석 전문가입니다.",
+        "아래 동적 분석 데이터를 바탕으로 **한국어**로 행위 기반 위협 분석을 수행하세요.",
+        "대응 권고는 작성하지 않습니다.",
+        "",
+    ]
+
+    # ── 분석 대상 ────────────────────────────────────────────────────────
+    sample_name = "전체 시스템 모니터링"
+    if getattr(result.config, "sample_path", None):
+        sample_name = Path(result.config.sample_path).name
+    pid_str = f" (PID: {result.sample_pid})" if result.sample_pid else ""
+    all_pids = sorted(result.all_pids) if result.all_pids else []
+
+    lines.append("## 분석 대상")
+    lines.append(f"- 파일명: {sample_name}{pid_str}")
+    if all_pids:
+        lines.append(f"- 추적 PID: {', '.join(str(p) for p in all_pids[:20])}")
+    lines.append("")
+
+    # ── MITRE ATT&CK (전술별 그룹) ──────────────────────────────────────
+    br = result.behavior_report
+    if br and getattr(br, "techniques", None):
+        techs = br.techniques
+        tactic_groups: dict[str, list] = {}
+        for t in techs:
+            tactic_groups.setdefault(t.tactic, []).append(t)
+        lines.append(f"## MITRE ATT&CK ({len(techs)}건)")
+        for tactic, ts in tactic_groups.items():
+            lines.append(f"### {tactic}")
+            for t in ts[:5]:
+                ev    = t.evidence[:1]
+                ev_str = f" → {_trunc(ev[0], 80)}" if ev else ""
+                lines.append(f"- [{t.technique_id}] {t.technique_name}{ev_str}")
+        lines.append("")
+
+    # ── 프로세스 행위 ───────────────────────────────────────────────────
+    new_procs = (result.process_diff or {}).get("new_processes", [])
+    if new_procs:
+        lines.append(f"## 프로세스 행위 (신규 {len(new_procs)}개)")
+        for p in new_procs[:15]:
+            name = getattr(p, "name", "?")
+            pid  = getattr(p, "pid", "?")
+            exe  = getattr(p, "exe", "") or ""
+            cmd  = " ".join(getattr(p, "cmdline", []) or []) or exe
+            lines.append(f"- {name} (PID {pid}): {_trunc(cmd, 120)}")
+        lines.append("")
+
+    # pe-sieve / hollows-hunter 인젝션
+    pe_list = getattr(result, "pe_sieve_results", []) or []
+    pe_susp = [r for r in pe_list if not getattr(r, "error", "") and getattr(r, "suspicious", 0) > 0]
+    hh_r    = getattr(result, "hh_result", None)
+    hh_susp = []
+    if hh_r and not hh_r.error:
+        hh_susp = getattr(hh_r, "suspicious_processes", []) or []
+
+    if pe_susp or hh_susp:
+        lines.append("## 메모리 인젝션 탐지")
+        for r in pe_susp[:6]:
+            name   = getattr(r, "name", "")
+            shc    = getattr(r, "implanted_shc", 0)
+            pe_inj = getattr(r, "implanted_pe", 0)
+            mods   = getattr(r, "modules", []) or []
+            mod_names = [Path(m.module_path).name for m in mods if getattr(m, "module_path", "")]
+            mod_str = f" ({', '.join(mod_names[:3])})" if mod_names else ""
+            lines.append(
+                f"- [pe-sieve] PID {r.pid} {name}: 쉘코드 {shc}개, PE인젝션 {pe_inj}개{mod_str}"
+            )
+        for sp in hh_susp[:4]:
+            lines.append(f"- [hollows-hunter] {_trunc(str(sp), 100)}")
+        lines.append("")
+
+    # ── 파일 시스템 활동 ─────────────────────────────────────────────────
+    _FILE_OPS_SHOW = {"WriteFile", "CreateFile", "RenameFile", "DeleteFile"}
+    try:
+        from parsers.procmon_csv import EventCategory
+        file_evs = [
+            e for e in (result.filtered_events or [])
+            if e.category == EventCategory.FILE
+            and e.operation in _FILE_OPS_SHOW
+            and e.result == "SUCCESS"
+        ]
+        # (pid, op, path) 기준 중복 제거
+        seen_fe: set = set()
+        uniq_fe = []
+        for e in file_evs:
+            key = (e.pid, e.operation, e.path.lower())
+            if key not in seen_fe:
+                seen_fe.add(key)
+                uniq_fe.append(e)
+
+        if uniq_fe:
+            lines.append(f"## 파일 시스템 활동 ({len(uniq_fe)}건 고유)")
+            op_label = {
+                "WriteFile": "Write", "CreateFile": "Create",
+                "RenameFile": "Rename", "DeleteFile": "Delete",
+            }
+            for e in uniq_fe[:20]:
+                detail = ""
+                if e.operation == "RenameFile":
+                    m = _RENAME_DEST_RE.search(e.detail or "")
+                    detail = f" → {_trunc(m.group(1).strip(), 80)}" if m else ""
+                elif e.operation == "CreateFile" and "OpenResult: Created" in (e.detail or ""):
+                    detail = " [신규생성]"
+                lines.append(
+                    f"- [{op_label.get(e.operation, e.operation)}] "
+                    f"{e.process}({e.pid}) → {_trunc(e.path, 100)}{detail}"
+                )
+            lines.append("")
+    except Exception:
+        pass
+
+    # IOC 드롭 파일
+    ioc = result.ioc_report
+    if ioc and ioc.dropped_files:
+        lines.append(f"## 드롭/생성 파일 ({len(ioc.dropped_files)}개)")
+        for f in ioc.dropped_files[:12]:
+            lines.append(f"- {_trunc(f, 120)}")
+        lines.append("")
+
+    # ── 레지스트리 활동 ──────────────────────────────────────────────────
+    _REG_OPS_SHOW = {"RegSetValue", "RegCreateKey", "RegDeleteValue", "RegDeleteKey"}
+    try:
+        from parsers.procmon_csv import EventCategory
+        reg_evs = [
+            e for e in (result.filtered_events or [])
+            if e.category == EventCategory.REGISTRY
+            and e.operation in _REG_OPS_SHOW
+            and e.result == "SUCCESS"
+        ]
+        seen_re: set = set()
+        uniq_re = []
+        for e in reg_evs:
+            key = (e.operation, e.path.lower())
+            if key not in seen_re:
+                seen_re.add(key)
+                uniq_re.append(e)
+
+        if uniq_re:
+            lines.append(f"## 레지스트리 활동 ({len(uniq_re)}건 고유)")
+            for e in uniq_re[:15]:
+                detail_str = _trunc(e.detail or "", 60)
+                lines.append(
+                    f"- [{e.operation}] {_trunc(e.path, 100)}"
+                    + (f"  ({detail_str})" if detail_str else "")
+                )
+            lines.append("")
+    except Exception:
+        pass
+
+    # Regshot diff
+    reg_diff = result.registry_diff or {}
+    added_reg   = reg_diff.get("added",    [])
+    modified_reg = reg_diff.get("modified", [])
+    if added_reg or modified_reg:
+        lines.append(f"## 레지스트리 스냅샷 diff (추가 {len(added_reg)}건 / 변경 {len(modified_reg)}건)")
+        for entry in added_reg[:10]:
+            k = _trunc(entry[0], 80)
+            n = entry[1] if len(entry) > 1 else ""
+            v = _trunc(str(entry[2]), 50) if len(entry) > 2 else ""
+            lines.append(f"- [추가] {k}\\{n} = {v}")
+        for entry in modified_reg[:5]:
+            k  = _trunc(entry[0], 80)
+            n  = entry[1] if len(entry) > 1 else ""
+            nw = _trunc(str(entry[3]), 50) if len(entry) > 3 else ""
+            lines.append(f"- [변경] {k}\\{n} → {nw}")
+        lines.append("")
+
+    if ioc and ioc.registry_keys:
+        lines.append(f"## 레지스트리 IOC ({len(ioc.registry_keys)}개)")
+        for r in ioc.registry_keys[:10]:
+            lines.append(f"- {_trunc(r, 120)}")
+        lines.append("")
+
+    # ── 네트워크 통신 ───────────────────────────────────────────────────
+    net_lines: list[str] = []
+    pcap = result.pcap_result
+
+    # 프로세스 ↔ IP 매핑 (pnmap)
+    pnmap = getattr(result, "process_network_map", []) or []
+    ip_proc: dict[str, list[str]] = {}
+    for pn in pnmap:
+        lbl = f"{pn.process}({pn.pid})"
+        lst = ip_proc.setdefault(pn.remote_ip, [])
+        if lbl not in lst:
+            lst.append(lbl)
+
+    if pcap:
+        conns = getattr(pcap, "connections", []) or []
+        ext_conns = [c for c in conns if not _is_private_ip(c.dst_ip)]
+        if ext_conns:
+            net_lines.append(f"### 외부 연결 ({len(ext_conns)}건)")
+            for c in ext_conns[:15]:
+                procs   = ip_proc.get(c.dst_ip, [])
+                proc_str = f" [{', '.join(procs[:2])}]" if procs else ""
+                net_lines.append(
+                    f"- {c.proto} {c.dst_ip}:{c.dst_port} "
+                    f"송신 {_fmt_bytes(c.bytes_out)}{proc_str}"
+                )
+
+        tls_list = getattr(pcap, "tls_info", []) or []
+        if tls_list:
+            seen_tls: set = set()
+            net_lines.append("### TLS SNI")
+            for t in tls_list:
+                k = (getattr(t, "sni", ""), t.dst_ip)
+                if k in seen_tls:
+                    continue
+                seen_tls.add(k)
+                sni     = getattr(t, "sni", "")
+                ja3_lbl = getattr(t, "ja3_label", "")
+                ja3_hash = getattr(t, "ja3", "")
+                tls_ver  = getattr(t, "tls_version", "")
+                ja3_str  = (f" [JA3:{ja3_lbl}]" if ja3_lbl
+                            else (f" [JA3:{ja3_hash[:12]}]" if ja3_hash else ""))
+                net_lines.append(f"- {sni} → {t.dst_ip}:{t.dst_port} {tls_ver}{ja3_str}")
+                if len(seen_tls) >= 12:
+                    break
+
+        dns_q = getattr(pcap, "dns_queries", []) or []
+        if dns_q:
+            net_lines.append(f"### DNS 쿼리 ({len(dns_q)}건)")
+            for q in dns_q[:15]:
+                name = getattr(q, "name", str(q))
+                rips = ", ".join(getattr(q, "response_ips", [])[:2])
+                net_lines.append(f"- {_trunc(name, 70)}" + (f" → {rips}" if rips else ""))
+
+        http = getattr(pcap, "http_requests", []) or []
+        if http:
+            net_lines.append(f"### HTTP 요청 ({len(http)}건)")
+            for h in http[:10]:
+                method = getattr(h, "method", "")
+                host   = getattr(h, "host", "")
+                path   = getattr(h, "path", "/")
+                ua     = getattr(h, "user_agent", "")
+                ua_str = f" (UA: {_trunc(ua, 40)})" if ua else ""
+                net_lines.append(f"- {method} http://{host}{_trunc(path, 60)}{ua_str}")
+
+        smtp_sessions = getattr(pcap, "smtp_sessions", []) or []
+        if smtp_sessions:
+            net_lines.append(f"### SMTP C2 ({len(smtp_sessions)}건)")
+            for s in smtp_sessions[:4]:
+                net_lines.append(
+                    f"- {s.dst_ip}:{s.dst_port} FROM:{s.mail_from or '-'} "
+                    f"TO:{', '.join(s.rcpt_to[:2]) or '-'}"
+                )
+
+        ftp_sessions = getattr(pcap, "ftp_sessions", []) or []
+        if ftp_sessions:
+            net_lines.append(f"### FTP C2 ({len(ftp_sessions)}건)")
+            for s in ftp_sessions[:4]:
+                net_lines.append(
+                    f"- {s.dst_ip}:{s.dst_port} user:{s.username or '-'}"
+                    + (f" upload:{', '.join(s.uploaded[:2])}" if s.uploaded else "")
+                )
+
+    # HTTPS 복호화
+    dr = getattr(result, "decrypted_requests", []) or []
+    if dr:
+        net_lines.append(f"### HTTPS 복호화 ({len(dr)}건)")
+        for req in dr[:8]:
+            host   = getattr(req, "host", "")
+            method = getattr(req, "method", "")
+            path   = getattr(req, "path", "")
+            ua     = getattr(req, "user_agent", "")
+            status = str(getattr(req, "resp_status", "") or "")
+            net_lines.append(
+                f"- {method} https://{host}{_trunc(path, 50)}"
+                + (f" → HTTP {status}" if status else "")
+                + (f" (UA: {_trunc(ua, 40)})" if ua else "")
+            )
+
+    # FakeNet-NG
+    fn = getattr(result, "fakenet_result", {}) or {}
+    fn_dns  = fn.get("dns_queries",   []) or []
+    fn_http = fn.get("http_requests", []) or []
+    if fn_dns:
+        net_lines.append(f"### FakeNet-NG DNS ({len(fn_dns)}건)")
+        for d in fn_dns[:10]:
+            net_lines.append(f"- {d.get('domain','')}")
+    if fn_http:
+        net_lines.append(f"### FakeNet-NG HTTP ({len(fn_http)}건)")
+        for h in fn_http[:8]:
+            net_lines.append(
+                f"- [{h.get('proto','')}] {h.get('method','')} "
+                f"{h.get('host','')}{_trunc(h.get('path',''), 50)}"
+            )
+
+    # IOC 네트워크
+    if ioc:
+        if ioc.ip_addresses:
+            net_lines.append(f"### 외부 IP IOC ({len(ioc.ip_addresses)}개)")
+            net_lines += [f"- {ip}" for ip in ioc.ip_addresses[:10]]
+        if ioc.domains:
+            net_lines.append(f"### 도메인 IOC ({len(ioc.domains)}개)")
+            net_lines += [f"- {d}" for d in ioc.domains[:10]]
+        if ioc.urls:
+            net_lines.append(f"### URL IOC ({len(ioc.urls)}개)")
+            net_lines += [f"- {_trunc(u, 100)}" for u in ioc.urls[:8]]
+        if ioc.mutexes:
+            net_lines.append(f"### Mutex ({len(ioc.mutexes)}개)")
+            net_lines += [f"- {m}" for m in ioc.mutexes[:6]]
+
+    if net_lines:
+        lines.append("## 네트워크 통신")
+        lines.extend(net_lines)
+        lines.append("")
+
+    # ── 메모리 포렌식 (Volatility) ───────────────────────────────────────
+    mf = getattr(result, "mem_forensics", {}) or {}
+    if mf and not mf.get("error"):
+        malfind = mf.get("malfind", []) or []
+        handles = mf.get("handles", []) or []
+        mutants = [h for h in handles if h.get("type") == "Mutant"]
+        netscan = mf.get("netscan", []) or []
+        if malfind or mutants or netscan:
+            lines.append("## 메모리 포렌식 (Volatility)")
+            if malfind:
+                lines.append(f"### malfind ({len(malfind)}건)")
+                for m in malfind[:5]:
+                    prot = m.get("protection", "")
+                    lines.append(
+                        f"- PID {m.get('pid')} {m.get('process')} "
+                        f"@ {m.get('start_vpn','?')} [{prot}]"
+                    )
+            if mutants:
+                lines.append(f"### Mutex (Mutant {len(mutants)}개)")
+                for h in mutants[:6]:
+                    lines.append(f"- {h.get('handle_name','')}")
+            if netscan:
+                lines.append(f"### netscan ({len(netscan)}건)")
+                for n in netscan[:6]:
+                    if not _is_private_ip((n.get("foreign", ":0") + ":").split(":")[0]):
+                        lines.append(
+                            f"- {n.get('proto','')} {n.get('local','')} → "
+                            f"{n.get('foreign','')} [{n.get('state','')}] {n.get('owner','')}"
+                        )
+            lines.append("")
+
+    # ── 분석 지시 ───────────────────────────────────────────────────────
+    lines += [
+        "---",
+        "위 분석 데이터를 바탕으로 **아래 4개 항목만** 한국어로 작성하세요.",
+        "각 항목은 마크다운 헤더(##)로 구분합니다. 대응 권고는 작성하지 않습니다.",
+        "",
+        "## 1. 악성코드 패밀리 추정",
+        "탐지 기법·네트워크 패턴·행동 특성을 근거로 패밀리 또는 악성 유형을 추정하세요.",
+        "",
+        "## 2. 위협 수준 평가",
+        "**심각 / 높음 / 중간 / 낮음** 중 하나를 선택하고 핵심 근거를 2~3문장으로 서술하세요.",
+        "",
+        "## 3. 행위 분석",
+        "프로세스·파일·레지스트리·네트워크 각 영역에서 확인된 핵심 악성 행위를",
+        "MITRE ATT&CK 기법(ID 포함)과 연결하여 설명하세요.",
+        "- **프로세스 행위:** (어떤 프로세스가 무엇을 실행했는지)",
+        "- **파일 행위:** (드롭·수정된 파일과 악성 의도)",
+        "- **레지스트리 행위:** (영속성·방어 회피·설정 변조 목적)",
+        "- **네트워크 행위:** (C2 통신·데이터 유출·정찰 패턴)",
+        "",
+        "## 4. C2 통신 패턴",
+        "확인된 외부 통신의 프로토콜·대상 주소·식별된 C2 인프라를 기술하세요.",
+        "해당 없으면 '활동 없음'으로 기재하세요.",
+    ]
+
+    prompt = "\n".join(lines)
+    if len(prompt) > _MAX_PROMPT_CHARS:
+        cutoff = _MAX_PROMPT_CHARS - 300
+        prompt = (
+            prompt[:cutoff]
+            + "\n\n(데이터 초과로 일부 생략됨)\n\n---\n"
+            "위 4개 항목만 한국어로 작성하세요. 대응 권고는 포함하지 마세요."
+        )
+    return prompt
+
+
+# ── Ollama 호출 ───────────────────────────────────────────────────────────────
+
+def _call_ollama(
+    prompt:   str,
+    base_url: str,
+    model:    str,
+    timeout:  int,
+) -> str:
+    """Ollama /api/generate (non-streaming) 호출 → 응답 텍스트."""
+    payload = json.dumps({
+        "model":  model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,   # 낮은 온도 → 사실 기반 일관된 분석
+            "num_ctx":     8192,
+            "num_predict": 2048,
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{base_url}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8")
+
+    data = json.loads(body)
+    return data.get("response", "")
+
+
+# ── 공개 API ─────────────────────────────────────────────────────────────────
+
+class OllamaAnalyzer:
+    """Ollama 기반 동적 분석 결과 AI 해석기."""
+
+    def __init__(
+        self,
+        base_url: str = OLLAMA_BASE_URL,
+        model:    str = DEFAULT_MODEL,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model    = model
+
+    def is_available(self) -> bool:
+        return _is_ollama_running(self.base_url)
+
+    def model_loaded(self) -> bool:
+        return _is_model_available(self.base_url, self.model)
+
+    def analyze(
+        self,
+        result,
+        timeout: int = 300,
+    ) -> AiAnalysisResult:
+        """AnalysisResult → AiAnalysisResult."""
+        ai = AiAnalysisResult(model=self.model)
+
+        if not self.is_available():
+            ai.error = f"Ollama 서버에 연결할 수 없습니다 ({self.base_url})"
+            return ai
+
+        prompt = _build_prompt(result)
+        ai.prompt_chars = len(prompt)
+
+        t0 = time.monotonic()
+        try:
+            ai.response = _call_ollama(prompt, self.base_url, self.model, timeout)
+        except urllib.error.URLError as e:
+            ai.error = f"Ollama 연결 오류: {e.reason}"
+        except TimeoutError:
+            ai.error = f"Ollama 타임아웃 ({timeout}s) — 모델이 로드되지 않았거나 응답이 느립니다."
+        except Exception as e:
+            ai.error = str(e)
+
+        ai.elapsed_sec = round(time.monotonic() - t0, 1)
+        return ai
+
+
+def ai_analysis_to_dict(r: AiAnalysisResult) -> dict:
+    return {
+        "model":        r.model,
+        "response":     r.response,
+        "elapsed_sec":  r.elapsed_sec,
+        "prompt_chars": r.prompt_chars,
+        "error":        r.error,
+    }

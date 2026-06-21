@@ -16,8 +16,8 @@
 
   "virustotal": {
     "_comment": "VirusTotal API v3. 무료 키: 4 req/분, 500 req/일. api_key 가 비어있으면 비활성화됩니다.",
-    "enabled": false,
-    "api_key": "",
+    "enabled": true,
+    "api_key": "aa7a0d74857917b94afe99180fc6676d86cdbba27a6cbd4df9af872963e5a199",
     "timeout": 20
   },
 

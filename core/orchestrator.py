@@ -264,6 +264,22 @@ class AnalysisConfig:
     no_tshark:     bool = False
     no_ph:         bool = False
     external_pcap: Optional[Path] = None  # 외부 PCAP 파일 경로 (Wireshark 등)
+    # ── TLS 복호화 옵션 ──────────────────────────────────────────────
+    use_keylog:   bool = True             # SSLKEYLOGFILE 환경변수 주입
+    use_fakenet:  bool = False            # FakeNet-NG 실행 (tshark 대체)
+    fakenet_path: Optional[str] = None   # FakeNet-NG 실행파일 명시 경로
+    # ── 메모리 포렌식 옵션 ───────────────────────────────────────────
+    use_memdump:      bool = False        # 물리 메모리 덤프 + Volatility3 실행
+    winpmem_path:     Optional[str] = None
+    volatility_path:  Optional[str] = None
+    dump_timeout:     int  = 600          # 메모리 덤프 타임아웃 (초)
+    vol_plugin_timeout: int = 300         # 플러그인당 타임아웃 (초)
+    existing_dump:    Optional[str] = None  # 기존 덤프 재사용
+    # ── AI 분석 옵션 ─────────────────────────────────────────────────
+    use_ai:       bool = True               # Ollama AI 분석 사용
+    ai_model:     str  = "qwen2.5:7b"      # Ollama 모델 이름
+    ollama_url:   str  = "http://localhost:11434"
+    ai_timeout:   int  = 300               # AI 응답 타임아웃 (초)
 
 
 @dataclass
@@ -292,6 +308,14 @@ class AnalysisResult:
     pe_sieve_results:   list  = field(default_factory=list)    # list[PeSieveResult] — 신규 프로세스별 스캔
     hh_result:          object = None                          # HollowsHunterResult — 전체 시스템 스캔
     proc_after_snapshot: dict = field(default_factory=dict)   # dict[int, ProcessSnapshot] — 사후 스냅샷 (트리 빌드용)
+    # ── TLS 복호화 결과 ──────────────────────────────────────────────
+    decrypted_requests: list  = field(default_factory=list)   # list[DecryptedRequest] — SSLKEYLOGFILE 복호화
+    tls_key_count:      int   = 0                              # 기록된 TLS 세션 키 수
+    fakenet_result:     dict  = field(default_factory=dict)   # FakeNet-NG 결과 dict
+    # ── 메모리 포렌식 결과 ───────────────────────────────────────────
+    mem_forensics:      dict  = field(default_factory=dict)   # MemForensicsResult dict
+    # ── AI 분석 결과 ─────────────────────────────────────────────────
+    ai_analysis:        dict  = field(default_factory=dict)   # AiAnalysisResult dict
 
 
 def run_analysis(
@@ -328,6 +352,10 @@ def run_analysis(
     from core.hollows_hunter          import HollowsHunter
     from parsers.pesieve_result       import parse_pesieve, parse_hollows_hunter
     from core.config_loader           import load_config as _load_cfg_early
+    from core.tls_keylog              import TLSKeyLogger
+    from core.fakenet_integrator      import FakeNetIntegrator, fakenet_result_to_dict
+    from core.memory_forensics        import run_memory_forensics, memforensics_to_dict, find_winpmem, find_volatility3
+    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     _early_cfg  = _load_cfg_early()
@@ -352,6 +380,13 @@ def run_analysis(
         config_path=_tools_cfg.get("hollows_hunter") or None,
     )
 
+    # ── TLS 복호화 도구 초기화 ────────────────────────────────────────
+    tls_keylogger = TLSKeyLogger(config.output_dir) if config.use_keylog else None
+    fakenet = FakeNetIntegrator(
+        config.output_dir,
+        fakenet_path=Path(config.fakenet_path) if config.fakenet_path else None,
+    ) if config.use_fakenet else None
+
     result.tools_used = {
         "procmon":          pm.available and not config.no_procmon,
         "tshark":           ts.available and not config.no_tshark,
@@ -359,6 +394,10 @@ def run_analysis(
         "process_hacker":   ph_path is not None and not config.no_ph,
         "pe_sieve":         ps_scanner.available,
         "hollows_hunter":   hh_scanner.available,
+        "tls_keylog":       tls_keylogger is not None,
+        "fakenet":          fakenet is not None and (fakenet.is_available() if fakenet else False),
+        "memdump":          config.use_memdump and (find_winpmem() is not None or bool(config.existing_dump)),
+        "volatility3":      config.use_memdump and find_volatility3() is not None,
     }
 
     status(f"[도구 확인] ProcMon={'✔' if result.tools_used['procmon'] else '✘'}  "
@@ -366,7 +405,9 @@ def run_analysis(
            f"RegSnap={'✔' if result.tools_used['registry_snapshot'] else '✘'}  "
            f"ProcHacker={'✔' if result.tools_used['process_hacker'] else '✘'}  "
            f"pe-sieve={'✔' if result.tools_used['pe_sieve'] else '✘'}  "
-           f"HollowsHunter={'✔' if result.tools_used['hollows_hunter'] else '✘'}")
+           f"HollowsHunter={'✔' if result.tools_used['hollows_hunter'] else '✘'}  "
+           f"TLS-keylog={'✔' if result.tools_used['tls_keylog'] else '✘'}  "
+           f"FakeNet={'✔' if result.tools_used['fakenet'] else '✘'}")
 
     # ── 1. 사전 스냅샷 ────────────────────────────────────────────────
     status("[1/6] 사전 스냅샷 수집 중...")
@@ -382,11 +423,20 @@ def run_analysis(
             result.errors.append("ProcMon 시작 실패")
             result.tools_used["procmon"] = False
 
-    if result.tools_used["tshark"]:
+    if result.tools_used["tshark"] and not config.use_fakenet:
         ok = ts.start(config.timeout + 10)
         if not ok:
             result.errors.append("tshark 시작 실패")
             result.tools_used["tshark"] = False
+
+    # FakeNet-NG 시작 (tshark 대신 사용 — DNS 리다이렉트 + 프로토콜 가로채기)
+    if fakenet and result.tools_used["fakenet"]:
+        ok = fakenet.start()
+        if not ok:
+            result.errors.append("FakeNet-NG 시작 실패")
+            result.tools_used["fakenet"] = False
+        else:
+            status("      FakeNet-NG 실행 중 (DNS 리다이렉션 + 프로토콜 인터셉트)")
 
     ph_proc = None
     if result.tools_used["process_hacker"]:
@@ -437,13 +487,16 @@ def run_analysis(
                 result.sample_pid = None   # 호스트 앱 PID는 procmon/process_diff 로 추적
                 status(f"      ShellExecute 실행 ({ext}) — 호스트 앱 PID는 procmon이 추적")
             else:
+                _sample_env = tls_keylogger.get_env() if tls_keylogger else None
                 sample_proc = subprocess.Popen(
                     [str(config.sample_path)],
                     cwd=str(config.sample_path.parent),
+                    env=_sample_env,
                 )
                 result.sample_pid = sample_proc.pid
                 result.all_pids.add(sample_proc.pid)
-                status(f"      PID: {sample_proc.pid}")
+                _klog_note = f" + SSLKEYLOGFILE 주입" if tls_keylogger else ""
+                status(f"      PID: {sample_proc.pid}{_klog_note}")
         except Exception as e:
             result.errors.append(f"샘플 실행 실패: {e}")
             status(f"[오류] 샘플 실행 실패: {e}")
@@ -875,6 +928,41 @@ def run_analysis(
         if not config.no_tshark:
             status("      PCAP 파일 없음 (tshark 미실행 또는 캡처 실패)")
 
+    # ── TLS keylog 복호화 ─────────────────────────────────────────────
+    if tls_keylogger and tshark_bin and pcap_target:
+        result.tls_key_count = tls_keylogger.key_count()
+        if tls_keylogger.has_keys():
+            status(f"[TLS] SSLKEYLOGFILE 키 {result.tls_key_count}개 — PCAP 복호화 중...")
+            try:
+                result.decrypted_requests = tls_keylogger.decrypt_pcap(
+                    pcap_target, Path(tshark_bin)
+                )
+                if result.decrypted_requests:
+                    status(f"      복호화 성공: HTTP(S) 요청 {len(result.decrypted_requests)}개")
+                else:
+                    status("      복호화된 HTTP 요청 없음 (Schannel 기반 또는 커스텀 TLS 가능성)")
+            except Exception as _ke:
+                result.errors.append(f"TLS 복호화 실패: {_ke}")
+        else:
+            status(f"[TLS] {tls_keylogger.summary()}")
+
+    # ── FakeNet-NG 결과 수집 ──────────────────────────────────────────
+    if fakenet and result.tools_used.get("fakenet"):
+        status("[FakeNet] 결과 수집 중...")
+        _fn_result = fakenet.stop()
+        result.fakenet_result = fakenet_result_to_dict(_fn_result)
+        dns_cnt  = len(_fn_result.dns_queries)
+        http_cnt = len(_fn_result.http_requests)
+        tcp_cnt  = len(_fn_result.tcp_sessions)
+        status(f"      DNS {dns_cnt}건  HTTP(S) {http_cnt}건  TCP {tcp_cnt}건")
+        # FakeNet PCAP도 파싱 대상에 추가 (tshark 없이 캡처된 경우)
+        if _fn_result.pcap_path and not pcap_target:
+            try:
+                result.pcap_result = parse_pcap(_fn_result.pcap_path, tshark_path=tshark_bin)
+                status(f"      FakeNet PCAP 파싱 완료: {_fn_result.pcap_path.name}")
+            except Exception as _fe:
+                result.errors.append(f"FakeNet PCAP 파싱 실패: {_fe}")
+
     # ── 7.5 의심 DLL 로드 기존 프로세스 pe-sieve 추가 스캔 ──────────────
     # procmon_events 를 단일 패스로 순회해 인젝션 PID와 네트워크 맵을 동시 수집.
     _precomp_inject_pids: set[int] = set()
@@ -932,9 +1020,20 @@ def run_analysis(
     # step 7.5 에서 새로 추가된 pe-sieve 결과(DLL 인젝션 대상 기존 프로세스)를
     # all_pids 에 반영. filter_events 이후에 발견된 PID 이므로 filtered_events 에는
     # 포함되지 않지만, 프로세스↔네트워크 매핑에서는 포함되어야 한다.
+    _injection_pids: set[int] = set()
     for _psr2 in result.pe_sieve_results:
         if not _psr2.error and (_psr2.implanted_shc > 0 or _psr2.implanted_pe > 0):
             result.all_pids.add(_psr2.pid)
+            _injection_pids.add(_psr2.pid)
+
+    # injection 대상 프로세스가 드롭한 파일 추출을 위해
+    # procmon_events 에서 해당 PID 이벤트만 별도 수집 (filter_events 미적용)
+    _injection_events: list = []
+    if _injection_pids and result.procmon_events:
+        _injection_events = [
+            ev for ev in result.procmon_events
+            if ev.pid in _injection_pids
+        ]
 
     # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
     status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
@@ -949,6 +1048,7 @@ def run_analysis(
         result.pcap_result,
         result.registry_diff,
         result.process_diff,
+        injection_events=_injection_events or None,
     )
 
     # ── CAPA 정적 분석 (선택적) ──────────────────────────────────────
@@ -1069,6 +1169,60 @@ def run_analysis(
 
     if result.process_network_map:
         status(f"      총 {len(result.process_network_map)}개 연결 집계")
+
+    # ── 메모리 포렌식 (Volatility3) ──────────────────────────────────
+    if config.use_memdump:
+        status("[메모리 포렌식] 시작 (winpmem + Volatility3)...")
+        _mem_winpmem = Path(config.winpmem_path) if config.winpmem_path else None
+        _mem_vol     = Path(config.volatility_path) if config.volatility_path else None
+        _mem_dump    = Path(config.existing_dump) if config.existing_dump else None
+        try:
+            mem_result = run_memory_forensics(
+                output_dir=config.output_dir,
+                sample_pids=result.all_pids or None,
+                winpmem_path=_mem_winpmem,
+                vol_path=_mem_vol,
+                dump_timeout=config.dump_timeout,
+                plugin_timeout=config.vol_plugin_timeout,
+                on_status=status,
+                skip_dump=bool(_mem_dump),
+                existing_dump=_mem_dump,
+            )
+            result.mem_forensics = memforensics_to_dict(mem_result)
+            if mem_result.error:
+                status(f"      [오류] {mem_result.error}")
+                result.errors.append(f"메모리 포렌식: {mem_result.error}")
+            else:
+                mf_cnt = len(mem_result.malfind)
+                ns_cnt = len(mem_result.netscan)
+                hd_cnt = len(mem_result.handles)
+                status(f"      malfind {mf_cnt}건  netscan {ns_cnt}건  "
+                       f"handles(Mutant) {hd_cnt}건")
+                if mf_cnt:
+                    status(f"      [!] 주입 코드 탐지 — malfind {mf_cnt}건 (메모리 탭 확인)")
+        except Exception as _me:
+            result.errors.append(f"메모리 포렌식 예외: {_me}")
+            status(f"      [오류] {_me}")
+            result.mem_forensics = {"error": f"실행 예외: {_me}"}
+
+    # ── AI 분석 (Ollama qwen2.5:7b) ──────────────────────────────────
+    if config.use_ai:
+        _az = OllamaAnalyzer(base_url=config.ollama_url, model=config.ai_model)
+        if _az.is_available():
+            status(f"[AI 분석] Ollama {config.ai_model} 호출 중…")
+            try:
+                _ai = _az.analyze(result, timeout=config.ai_timeout)
+                result.ai_analysis = ai_analysis_to_dict(_ai)
+                if _ai.error:
+                    status(f"      [오류] {_ai.error}")
+                    result.errors.append(f"AI 분석: {_ai.error}")
+                else:
+                    status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
+            except Exception as _ae:
+                result.errors.append(f"AI 분석 예외: {_ae}")
+                status(f"      [오류] {_ae}")
+        else:
+            status(f"[AI 분석] Ollama 서버 미실행 — 건너뜀 ({config.ollama_url})")
 
     result.end_time = time.time()
     elapsed_total = result.end_time - result.start_time

@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 from parsers.procmon_csv import ProcMonEvent, EventCategory
 from parsers.pcap_parser import PcapResult
 
+# RenameFile Detail 필드에서 목적지 경로 추출
+# ProcMon Detail 예시: "FileName: C:\Users\victim\evil.exe, Replace If Exists: True"
+_RENAME_DEST_RE = re.compile(r'FileName:\s*([^,\r\n]+)', re.IGNORECASE)
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -98,18 +102,35 @@ def _is_noisy_domain(domain: str) -> bool:
 
 
 # Executable / script extensions that indicate a dropped payload
-_DROPPED_EXTENSIONS: frozenset[str] = frozenset(
-    {".exe", ".dll", ".bat", ".ps1", ".vbs", ".js"}
-)
+_DROPPED_EXTENSIONS: frozenset[str] = frozenset({
+    # PE 실행 파일
+    ".exe", ".dll", ".scr", ".com", ".pif",
+    # 스크립트
+    ".bat", ".ps1", ".vbs", ".js", ".hta", ".wsf", ".jse", ".vbe",
+    # 인스톨러 / 링크
+    ".msi", ".lnk",
+    # 임시 파일 (temp→exe rename 패턴)
+    ".tmp",
+})
 
-# Windows system directory prefixes (lowercased) – files in these dirs are not IOCs
-_SYSTEM_PATH_PREFIXES: tuple[str, ...] = (
+# WriteFile 대상: 기존 시스템 파일 쓰기는 대부분 정상 업데이트이므로 제외
+_SYSTEM_PATH_PREFIXES_WRITE: tuple[str, ...] = (
     r"c:\windows\system32",
     r"c:\windows\syswow64",
     r"c:\windows\sysnative",
     r"c:\windows\winsxs",
+    r"c:\windows\assembly",
     "c:\\program files\\",
     "c:\\program files (x86)\\",
+)
+
+# CreateFile+Created 대상: 새 파일 생성은 System32에서도 의심 (DLL 하이재킹 등)
+# winsxs/softwaredistribution 같은 OS 내부 경로만 제외
+_SYSTEM_PATH_PREFIXES_CREATE: tuple[str, ...] = (
+    r"c:\windows\winsxs",
+    r"c:\windows\assembly",
+    r"c:\windows\softwaredistribution",
+    r"c:\windows\servicing",
 )
 
 # Analysis tool path/name fragments — files whose lowercased path contains any of
@@ -150,10 +171,10 @@ _INTERESTING_REG_FRAGMENTS: tuple[str, ...] = (
     "appinit",
 )
 
-# Ops that constitute a file being written to disk.
-# "CreateFile"는 파일 열기(읽기 포함)에도 사용되는 Windows API이므로 제외.
-# 실제 데이터 기록 작업인 "WriteFile"만 dropped_files 기준으로 사용.
-_WRITE_OPS: frozenset[str] = frozenset({"WriteFile"})
+# ─ 드롭 파일 감지 기준 ─────────────────────────────────────────────────
+# WriteFile  : 실제 데이터 기록 (result==SUCCESS 만 계산)
+# CreateFile : OpenResult: Created 가 Detail에 있으면 신규 파일 생성
+# RenameFile : temp→exe rename 패턴 (목적지 경로를 Detail에서 파싱)
 
 
 def _file_extension(path: str) -> str:
@@ -174,13 +195,14 @@ def extract_iocs(
     pcap: PcapResult,
     reg_diff: dict,
     proc_diff: dict,
+    injection_events: "list[ProcMonEvent] | None" = None,
 ) -> IOCReport:
     """Extract IOCs from all dynamic analysis data sources.
 
     Parameters
     ----------
     events:
-        Filtered ProcMon events.
+        Filtered ProcMon events (sample + known child PIDs).
     pcap:
         Parsed PCAP results.
     reg_diff:
@@ -190,6 +212,10 @@ def extract_iocs(
     proc_diff:
         Dictionary describing process changes (reserved for future use,
         e.g. mutex extraction from proc handles).
+    injection_events:
+        추가 이벤트 목록 — pe-sieve/hollows-hunter로 확인된 injection 대상
+        프로세스(svchost, explorer 등)의 미필터링 이벤트. filter_events 실행
+        이후에 발견된 PIDs이므로 별도 전달이 필요하다.
 
     Returns
     -------
@@ -229,30 +255,116 @@ def extract_iocs(
         pass
 
     # ------------------------------------------------------------------
-    # Dropped files (written executables / scripts outside system dirs)
+    # Dropped files (written/created/renamed executables & scripts)
     # ------------------------------------------------------------------
     try:
         for ev in events:
             if ev.category != EventCategory.FILE:
                 continue
-            if ev.operation not in _WRITE_OPS:
-                continue
 
-            path  = ev.path
+            path  = ev.path or ""
             lower = path.lower()
-            ext   = _file_extension(path)
+            op    = ev.operation
 
-            if ext not in _DROPPED_EXTENSIONS:
+            # ── WriteFile: 실제 데이터 기록 ──────────────────────────────
+            if op == "WriteFile":
+                if ev.result != "SUCCESS":
+                    continue
+                ext = _file_extension(path)
+                if ext not in _DROPPED_EXTENSIONS:
+                    continue
+                if any(lower.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES_WRITE):
+                    continue
+                if any(frag in lower for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
+                    continue
+                report.dropped_files.append(path)
+
+            # ── CreateFile + OpenResult:Created: 신규 파일 생성 ──────────
+            # 기존 파일 열기(읽기/덮어쓰기)와 구분하기 위해 Detail 필드 확인.
+            # 메모리 맵 쓰기 등 WriteFile 이벤트가 없는 경우도 포착 가능.
+            elif op == "CreateFile":
+                if ev.result != "SUCCESS":
+                    continue
+                if "OpenResult: Created" not in (ev.detail or ""):
+                    continue
+                ext = _file_extension(path)
+                if ext not in _DROPPED_EXTENSIONS:
+                    continue
+                # 신규 파일 생성은 System32에서도 의심 (DLL 하이재킹 등)
+                # OS 내부 관리 경로만 제외
+                if any(lower.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES_CREATE):
+                    continue
+                if any(frag in lower for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
+                    continue
+                report.dropped_files.append(path)
+
+            # ── RenameFile: temp→exe rename 패턴 ─────────────────────────
+            # 악성코드가 .tmp/.dat 등으로 저장 후 실행 파일로 이름 변경.
+            # ProcMon Detail 예: "FileName: C:\...\evil.exe, Replace If Exists: ..."
+            elif op == "RenameFile":
+                if ev.result != "SUCCESS":
+                    continue
+                m = _RENAME_DEST_RE.search(ev.detail or "")
+                if not m:
+                    continue
+                dest = m.group(1).strip()
+                if not dest:
+                    continue
+                dest_lower = dest.lower()
+                ext = _file_extension(dest)
+                if ext not in _DROPPED_EXTENSIONS:
+                    continue
+                if any(frag in dest_lower for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
+                    continue
+                report.dropped_files.append(dest)
+
+        # injection_events: filter_events 이후 발견된 injection PID 이벤트
+        # (svchost·explorer 등 외부 프로세스가 드롭한 파일 보완)
+        for ev in (injection_events or []):
+            if ev.category != EventCategory.FILE:
                 continue
-
-            if any(lower.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES):
-                continue
-
-            # 분석 도구가 생성한 파일은 IOC에서 제외
-            if any(frag in lower for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
-                continue
-
-            report.dropped_files.append(path)
+            path  = ev.path or ""
+            lower = path.lower()
+            op    = ev.operation
+            if op == "WriteFile":
+                if ev.result != "SUCCESS":
+                    continue
+                ext = _file_extension(path)
+                if ext not in _DROPPED_EXTENSIONS:
+                    continue
+                if any(lower.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES_WRITE):
+                    continue
+                if any(frag in lower for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
+                    continue
+                report.dropped_files.append(path)
+            elif op == "CreateFile":
+                if ev.result != "SUCCESS":
+                    continue
+                if "OpenResult: Created" not in (ev.detail or ""):
+                    continue
+                ext = _file_extension(path)
+                if ext not in _DROPPED_EXTENSIONS:
+                    continue
+                if any(lower.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES_CREATE):
+                    continue
+                if any(frag in lower for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
+                    continue
+                report.dropped_files.append(path)
+            elif op == "RenameFile":
+                if ev.result != "SUCCESS":
+                    continue
+                m = _RENAME_DEST_RE.search(ev.detail or "")
+                if not m:
+                    continue
+                dest = m.group(1).strip()
+                if not dest:
+                    continue
+                ext = _file_extension(dest)
+                if ext not in _DROPPED_EXTENSIONS:
+                    continue
+                if any(frag in dest.lower() for frag in _ANALYSIS_TOOL_PATH_FRAGMENTS):
+                    continue
+                report.dropped_files.append(dest)
 
         report.dropped_files = list(dict.fromkeys(report.dropped_files))
     except Exception:

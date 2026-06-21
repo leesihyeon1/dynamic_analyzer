@@ -564,12 +564,14 @@ async function _huntFeodo(ip) {
 _PG_INIT = """<script>
 window.addEventListener('load', function() {
   var tbls = [
-    'tbl-mitre','tbl-process',
+    'tbl-mitre','tbl-process','tbl-process-all',
     'tbl-file',
     'tbl-reg-diff','tbl-reg-procmon',
     'tbl-net-beacon','tbl-net-tls','tbl-net-conn',
     'tbl-net-dga','tbl-net-dns','tbl-net-http',
     'tbl-net-smtp','tbl-net-ftp',
+    'tbl-net-dec',
+    'tbl-fn-dns','tbl-fn-http','tbl-fn-tcp',
     'tbl-ioc-ip','tbl-ioc-domain','tbl-ioc-file','tbl-ioc-reg','tbl-ioc-url'
   ];
   tbls.forEach(function(id) { setupTableControls(id, 100); });
@@ -945,22 +947,23 @@ def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
 
 def _network_html(result) -> str:
     pcap = result.pcap_result
-    if not pcap:
-        return "<p class='alert alert-info'>tshark 캡처 없음</p>"
 
-    # ── 공통 조회 테이블 (모든 섹션에서 공유) ─────────────────────
-    # DNS 응답 + TLS SNI → IP-to-domain 종합 매핑
+    # pcap이 없어도 decrypted_requests / fakenet_result는 렌더링해야 하므로
+    # 조기 리턴하지 않고 각 섹션을 독립적으로 처리한다.
+
+    # ── 공통 조회 테이블 (pcap 있을 때만 빌드) ────────────────────
     combined_domains: dict[str, list[str]] = {}
-    for _ip, _doms in pcap.ip_to_domain.items():
-        _lst = combined_domains.setdefault(_ip, [])
-        for _d in _doms:
-            if _d not in _lst:
-                _lst.append(_d)
-    for _t in getattr(pcap, "tls_info", []):
-        if _t.dst_ip and _t.sni:
-            _lst = combined_domains.setdefault(_t.dst_ip, [])
-            if _t.sni not in _lst:
-                _lst.append(_t.sni)
+    if pcap:
+        for _ip, _doms in pcap.ip_to_domain.items():
+            _lst = combined_domains.setdefault(_ip, [])
+            for _d in _doms:
+                if _d not in _lst:
+                    _lst.append(_d)
+        for _t in getattr(pcap, "tls_info", []):
+            if _t.dst_ip and _t.sni:
+                _lst = combined_domains.setdefault(_t.dst_ip, [])
+                if _t.sni not in _lst:
+                    _lst.append(_t.sni)
 
     # 호스트명 → IP 역매핑
     hostname_to_ips: dict[str, list[str]] = {}
@@ -969,7 +972,6 @@ def _network_html(result) -> str:
             hostname_to_ips.setdefault(_d.lower(), []).append(_ip)
 
     # 프로세스 매핑 룩업: (proto, dst_ip, dst_port) → 프로세스 목록
-    # ip_proc_lookup: ip → 프로세스 목록 (포트 무관 — HTTP 호스트명 매핑용)
     pnmap = getattr(result, "process_network_map", [])
     proc_lookup: dict[tuple, list[str]] = {}
     ip_proc_lookup: dict[str, list[str]] = {}
@@ -993,8 +995,13 @@ def _network_html(result) -> str:
 
     parts = []
 
-    # ── 프로세스 매핑 진단 패널 ──────────────────────────────────
-    parts.append(_pnmap_debug_panel(pnmap, ip_proc_lookup))
+    # pcap 없으면 기본 안내 배너만 추가 (decrypted/fakenet은 계속 처리)
+    if not pcap:
+        parts.append("<p class='alert alert-info'>tshark 캡처 없음 — PCAP 기반 섹션 생략</p>")
+
+    if pcap:
+        # ── 프로세스 매핑 진단 패널 ──────────────────────────────────
+        parts.append(_pnmap_debug_panel(pnmap, ip_proc_lookup))
 
     # ── 캡처 요약 ──────────────────────────────────────────────
     s = getattr(pcap, "summary", None)
@@ -1037,27 +1044,45 @@ def _network_html(result) -> str:
     # ── TLS SNI ────────────────────────────────────────────────
     tls_list = getattr(pcap, "tls_info", [])
     if tls_list:
-        seen = {}
+        # SNI 기준 dedup — 같은 SNI가 여러 연결에서 나오면 첫 번째 보존
+        seen: dict = {}
         for t in tls_list:
-            if t.sni not in seen:
-                seen[t.sni] = t
+            key = (t.sni, t.dst_ip, t.dst_port)
+            if key not in seen:
+                seen[key] = t
         _TLS_LIMIT = 500
         seen_vals  = list(seen.values())
         rows = []
         for t in seen_vals[:_TLS_LIMIT]:
             t_procs = proc_lookup.get(("TCP", t.dst_ip, t.dst_port), [])
+            # JA3 표시: 알려진 레이블이 있으면 붉은 배지, 없으면 해시 앞 12자
+            ja3_label = getattr(t, "ja3_label", "")
+            ja3_hash  = getattr(t, "ja3", "")
+            tls_ver   = getattr(t, "tls_version", "")
+            if ja3_label:
+                ja3_td = f"<td>{_b(ja3_label, 'red')}</td>"
+            elif ja3_hash:
+                ja3_td = (
+                    f"<td><span class='mono' style='font-size:.72rem;color:#8b949e' "
+                    f"title='{_e(ja3_hash)}'>{ja3_hash[:12]}…</span></td>"
+                )
+            else:
+                ja3_td = "<td style='color:#484f58'>-</td>"
             rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(t.sni)}</td>"
                 f"<td class='mono'>{_e(t.dst_ip)}</td>"
                 f"<td class='mono'>{t.dst_port}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:.78rem'>{_e(tls_ver) or '-'}</td>"
+                f"{ja3_td}"
                 + _proc_cell(t_procs) +
                 f"</tr>"
             )
         parts.append(
             "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
             + _trunc_notice(len(seen_vals), _TLS_LIMIT)
-            + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th><th>프로세스</th></tr>"
+            + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th>"
+            "<th>TLS 버전</th><th>JA3</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )
 
@@ -1083,7 +1108,7 @@ def _network_html(result) -> str:
         )
 
     # ── 연결 목록 ──────────────────────────────────────────────
-    if pcap.connections:
+    if pcap and pcap.connections:
         _CONN_LIMIT = 1000
         sorted_conns = sorted(pcap.connections, key=lambda x: -x.bytes_out)
         rows = []
@@ -1143,7 +1168,7 @@ def _network_html(result) -> str:
         )
 
     # ── DNS 쿼리 ───────────────────────────────────────────────
-    if pcap.dns_queries:
+    if pcap and pcap.dns_queries:
         _DNS_LIMIT   = 1000
         sorted_dns   = sorted(pcap.dns_queries, key=lambda x: -x.entropy)
         rows = []
@@ -1174,7 +1199,7 @@ def _network_html(result) -> str:
         )
 
     # ── HTTP 요청 ──────────────────────────────────────────────
-    if pcap.http_requests:
+    if pcap and pcap.http_requests:
         _HTTP_LIMIT = 500
         rows = []
         for r in pcap.http_requests[:_HTTP_LIMIT]:
@@ -1254,6 +1279,109 @@ def _network_html(result) -> str:
             "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )
+
+    # ── HTTPS 복호화 (SSLKEYLOGFILE) ─────────────────────────────
+    decrypted = getattr(result, "decrypted_requests", []) or []
+    if decrypted:
+        _DEC_LIMIT = 300
+        rows = []
+        for req in decrypted[:_DEC_LIMIT]:
+            method   = _e(getattr(req, "method", "") or "")
+            host     = _e(getattr(req, "host", "") or "")
+            path     = _e((getattr(req, "path", "") or "")[:80])
+            ua       = _e((getattr(req, "user_agent", "") or "")[:60])
+            status   = str(getattr(req, "resp_status", "") or "")
+            ct_resp  = _e(getattr(req, "resp_content_type", "") or "")
+            if status.startswith("2"):
+                st_color = "color:#56d364"
+            elif status.startswith("3"):
+                st_color = "color:#e3b341"
+            else:
+                st_color = "color:#ff7b72" if status else "color:#8b949e"
+            rows.append(
+                f"<tr>"
+                f"<td>{_b(method, 'orange')}</td>"
+                f"<td class='mono ev-network'>{host}</td>"
+                f"<td class='mono'>{path}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:.72rem'>{ua}</td>"
+                f"<td class='mono' style='{st_color}'>{status or '-'}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:.72rem'>{ct_resp}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            f"<h3>🔓 HTTPS 복호화 요청 ({len(decrypted)}건)</h3>"
+            f"<p style='color:#8b949e;font-size:.78rem;margin-bottom:.5rem'>"
+            f"SSLKEYLOGFILE 기반 TLS 복호화 — Python/Go/NSS TLS 구현에서만 작동 "
+            f"(Schannel/WinHTTP 기반 악성코드는 FakeNet-NG 사용)</p>"
+            + _trunc_notice(len(decrypted), _DEC_LIMIT)
+            + "<table id='tbl-net-dec'>"
+            "<tr><th>메서드</th><th>호스트</th><th>경로</th><th>User-Agent</th>"
+            "<th>응답 코드</th><th>응답 Content-Type</th></tr>"
+            + "".join(rows) + "</table>"
+        )
+
+    # ── FakeNet-NG 캡처 ──────────────────────────────────────────
+    fn = getattr(result, "fakenet_result", {}) or {}
+    fn_err   = fn.get("error", "")
+    fn_dns   = fn.get("dns_queries",   []) or []
+    fn_http  = fn.get("http_requests", []) or []
+    fn_tcp   = fn.get("tcp_sessions",  []) or []
+    if fn and (fn_dns or fn_http or fn_tcp):
+        fn_elapsed = fn.get("elapsed_sec", 0)
+        err_html = f'&nbsp;|&nbsp; <span style="color:#ff7b72">{_e(fn_err)}</span>' if fn_err else ''
+        fn_parts = [
+            f"<h3>🎭 FakeNet-NG 캡처</h3>"
+            f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
+            f"실행 {fn_elapsed}s &nbsp;|&nbsp; DNS {len(fn_dns)}건 &nbsp;|&nbsp; "
+            f"HTTP {len(fn_http)}건 &nbsp;|&nbsp; 바이너리 TCP {len(fn_tcp)}건"
+            f"{err_html}"
+            f"</p>"
+        ]
+        if fn_dns:
+            rows = "".join(
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(d.get('domain',''))}</td>"
+                f"<td class='mono' style='color:#56d364'>{_e(d.get('resolved','127.0.0.1'))}</td>"
+                f"</tr>"
+                for d in fn_dns[:200]
+            )
+            fn_parts.append(
+                "<h4>DNS 쿼리</h4>"
+                "<table id='tbl-fn-dns'><tr><th>쿼리 도메인</th><th>응답 IP</th></tr>"
+                + rows + "</table>"
+            )
+        if fn_http:
+            rows = "".join(
+                f"<tr>"
+                f"<td>{_b(h.get('proto','HTTP'), 'blue' if h.get('proto','HTTP') == 'HTTP' else 'orange')}</td>"
+                f"<td>{_b(h.get('method',''), 'orange')}</td>"
+                f"<td class='mono ev-network'>{_e(h.get('host',''))}</td>"
+                f"<td class='mono'>{_e((h.get('path','') or '')[:80])}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:.72rem'>{_e((h.get('user_agent','') or '')[:50])}</td>"
+                f"</tr>"
+                for h in fn_http[:300]
+            )
+            fn_parts.append(
+                "<h4>HTTP / HTTPS 요청 <span style='color:#8b949e;font-size:.78rem'>"
+                "(FakeNet-NG가 TLS 종단 — Schannel/WinHTTP 포함)</span></h4>"
+                "<table id='tbl-fn-http'><tr><th>프로토콜</th><th>메서드</th>"
+                "<th>호스트</th><th>경로</th><th>User-Agent</th></tr>"
+                + rows + "</table>"
+            )
+        if fn_tcp:
+            rows = "".join(
+                f"<tr>"
+                f"<td class='mono'>{_e(t.get('src_ip',''))}</td>"
+                f"<td class='mono'>{t.get('dst_port','')}</td>"
+                f"</tr>"
+                for t in fn_tcp[:100]
+            )
+            fn_parts.append(
+                "<h4>바이너리 TCP 세션 (C2 커스텀 프로토콜)</h4>"
+                "<table id='tbl-fn-tcp'><tr><th>출발지 IP</th><th>목적지 포트</th></tr>"
+                + rows + "</table>"
+            )
+        parts.append("".join(fn_parts))
 
     return "\n".join(parts) if parts else "<p class='alert alert-success'>외부 네트워크 활동 없음</p>"
 
@@ -2072,18 +2200,33 @@ def _ioc_html(result) -> str:
 </script>"""
         )
 
-    # WriteFile 이벤트 → 파일경로(소문자): 프로세스 매핑
+    # 파일 이벤트 → 파일경로(소문자): 프로세스 매핑
+    # WriteFile + CreateFile+Created + RenameFile(목적지) 모두 포함
     file_proc_map: dict[str, list[str]] = {}
     try:
         from parsers.procmon_csv import EventCategory as _EC
+        _RENAME_DEST_RE2 = __import__('re').compile(r'FileName:\s*([^,\r\n]+)', __import__('re').IGNORECASE)
         for _ev in getattr(result, "filtered_events", []):
-            if _ev.category != _EC.FILE or _ev.operation != "WriteFile":
+            if _ev.category != _EC.FILE:
                 continue
-            _lp    = _ev.path.lower()
             _label = f"{_ev.process} ({_ev.pid})"
-            _lst   = file_proc_map.setdefault(_lp, [])
-            if _label not in _lst:
-                _lst.append(_label)
+            if _ev.operation == "WriteFile" and _ev.result == "SUCCESS":
+                _lp = _ev.path.lower()
+                _lst = file_proc_map.setdefault(_lp, [])
+                if _label not in _lst:
+                    _lst.append(_label)
+            elif _ev.operation == "CreateFile" and _ev.result == "SUCCESS" and "OpenResult: Created" in (_ev.detail or ""):
+                _lp = _ev.path.lower()
+                _lst = file_proc_map.setdefault(_lp, [])
+                if _label not in _lst:
+                    _lst.append(_label)
+            elif _ev.operation == "RenameFile" and _ev.result == "SUCCESS":
+                _m = _RENAME_DEST_RE2.search(_ev.detail or "")
+                if _m:
+                    _lp = _m.group(1).strip().lower()
+                    _lst = file_proc_map.setdefault(_lp, [])
+                    if _label not in _lst:
+                        _lst.append(_label)
     except Exception:
         pass
 
@@ -2347,10 +2490,21 @@ def generate_html_report(result, output_path: str) -> None:
     threat_color = "red" if threat_score >= 3 else ("orange" if threat_score >= 1 else "green")
     threat_label = "HIGH" if threat_score >= 3 else ("MEDIUM" if threat_score >= 1 else "CLEAN")
 
-    tools_html = "  ".join(
-        f"{_b('✔ ' + k, 'green') if v else _b('✘ ' + k, 'gray')}"
-        for k, v in result.tools_used.items()
-    )
+    def _tool_badge(k: str, v) -> str:
+        """bool 또는 문자열 도구 상태를 배지로 변환."""
+        if isinstance(v, bool):
+            return _b("✔ " + k, "green") if v else _b("✘ " + k, "gray")
+        # 문자열 — 내용으로 성공/실패 판별
+        s = str(v)
+        _negative = ("비활성", "미설치", "없음", "오류", "건너뜀", "실패", "비PE")
+        if not s or any(n in s for n in _negative):
+            icon, color = "✘", "gray"
+        else:
+            icon, color = "✔", "green"
+        short = s[:28] + "…" if len(s) > 28 else s
+        return f"<span title='{_e(s)}'>{_b(f'{icon} {k}: {short}', color)}</span>"
+
+    tools_html = "  ".join(_tool_badge(k, v) for k, v in result.tools_used.items())
 
     # ── 샘플 SHA256 (Hunt 탭 빠른 조회용) ───────────────────────────
     sample_sha256 = ""
@@ -2436,6 +2590,9 @@ def generate_html_report(result, output_path: str) -> None:
   <button class="tab-btn" data-tab="tab-hunt">
     🕵️ Hunt
   </button>
+  <button class="tab-btn" data-tab="tab-ai">
+    🤖 AI 분석
+  </button>
 </div>
 
 <!-- ══════════ 탭 1: 기본 분석 ══════════ -->
@@ -2459,6 +2616,7 @@ def generate_html_report(result, output_path: str) -> None:
         <tr><td>레지스트리 변경</td><td>{reg_mod} <span style='color:#8b949e;font-size:.78rem'>(Regshot) / {procmon_reg_count:,} (ProcMon)</span></td></tr>
         <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
         <tr><td>DNS 쿼리</td><td>{dns_count}</td></tr>
+        <tr><td>TLS 세션 키</td><td>{getattr(result, 'tls_key_count', 0)} <span style='color:#8b949e;font-size:.78rem'>{"(복호화 " + str(len(getattr(result,'decrypted_requests',[]))) + "건)" if getattr(result,'decrypted_requests',None) else ""}</span></td></tr>
         <tr><td>인젝션·쉘코드 의심</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}개 프로세스</b>{"<span style='color:#8b949e;font-size:.78rem'>&nbsp;(오탐 " + str(shc_fp_excluded) + "개 제외)</span>" if shc_fp_excluded else ""}</td></tr>
       </table>
     </div>
@@ -2511,6 +2669,7 @@ def generate_html_report(result, output_path: str) -> None:
 
   <h2>🧠 메모리 인젝션 / 쉘코드 탐지</h2>
   {_shellcode_html(result)}
+  {_volatility_html(result)}
 
 </div>
 
@@ -2527,9 +2686,365 @@ def generate_html_report(result, output_path: str) -> None:
   {_hunt_html(sample_sha256, ioc)}
 </div>
 
+<!-- ══════════ 탭 8: AI 분석 ══════════ -->
+<div id="tab-ai" class="tab-panel">
+  {_ai_html(result)}
+</div>
+
 </div>
 {_PG_INIT}
 </body>
 </html>"""
 
     Path(output_path).write_text(body, encoding="utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Volatility3 메모리 포렌식 결과 렌더링
+# ══════════════════════════════════════════════════════════════════════
+
+def _volatility_html(result) -> str:
+    """Volatility3 메모리 포렌식 결과 섹션 렌더링."""
+    mf = getattr(result, "mem_forensics", None) or {}
+    if not mf:
+        return ""
+
+    err = mf.get("error", "")
+    if err:
+        return (
+            f"<div style='margin-top:1.5rem'>"
+            f"<h3>🔬 Volatility3 메모리 포렌식</h3>"
+            f"<p class='alert alert-warning'>{_e(err)}</p>"
+            f"</div>"
+        )
+
+    malfind       = mf.get("malfind") or []
+    pstree        = mf.get("pstree")  or []
+    netscan       = mf.get("netscan") or []
+    cmdline       = mf.get("cmdline") or []
+    handles       = mf.get("handles") or []
+    dlllist       = mf.get("dlllist") or []
+    dump_gb       = mf.get("dump_size_gb", 0)
+    vol_sec       = mf.get("vol_elapsed", 0)
+    plugin_errors = mf.get("plugin_errors") or {}
+
+    parts = [
+        f"<div style='margin-top:1.5rem'>",
+        f"<h3>🔬 Volatility3 메모리 포렌식</h3>",
+        f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
+        f"덤프 {dump_gb} GB &nbsp;|&nbsp; 분석 {vol_sec}s &nbsp;|&nbsp; "
+        f"malfind <strong style='color:{'#ff7b72' if malfind else 'inherit'}'>{len(malfind)}</strong>건 &nbsp;|&nbsp; "
+        f"netscan {len(netscan)}건 &nbsp;|&nbsp; "
+        f"handles(Mutant) {len(handles)}건</p>",
+    ]
+
+    # ── 플러그인 오류 표시 ────────────────────────────────────────────
+    if plugin_errors:
+        err_rows = "".join(
+            f"<tr>"
+            f"<td class='mono' style='color:#e3b341'>{_e(pname)}</td>"
+            f"<td style='font-size:.78rem;color:#8b949e;white-space:pre-wrap'>{_e(pmsg[:300])}</td>"
+            f"</tr>"
+            for pname, pmsg in plugin_errors.items()
+        )
+        parts.append(
+            f"<details style='margin-bottom:1rem'>"
+            f"<summary style='color:#e3b341;cursor:pointer;font-size:.83rem'>"
+            f"⚠ 플러그인 오류 {len(plugin_errors)}건 (클릭하여 확인)</summary>"
+            f"<div style='overflow-x:auto;margin-top:.5rem'>"
+            f"<table><tr><th>플러그인</th><th>오류 메시지</th></tr>{err_rows}</table>"
+            f"<p style='color:#8b949e;font-size:.76rem;margin-top:.5rem'>"
+            f"💡 심볼 파일 없음 오류 → "
+            f"<code>pip install volatility3</code> 후 "
+            f"<code>vol -f memory.raw windows.info</code> 로 심볼 자동 다운로드</p>"
+            f"</div></details>"
+        )
+
+    # 모든 플러그인 결과가 비어있으면 안내
+    has_any = any([malfind, pstree, netscan, cmdline, handles, dlllist])
+    if not has_any and not plugin_errors:
+        parts.append(
+            f"<p style='color:#8b949e;font-size:.83rem;margin-bottom:1rem'>"
+            f"분석 결과 없음 — 의심 항목이 탐지되지 않았거나 심볼 파일 미설치로 플러그인이 "
+            f"빈 결과를 반환했을 수 있습니다.<br>"
+            f"<code>vol -f {mf.get('dump_path','memory.raw')} windows.info</code> 로 덤프 유효성 확인 권장</p>"
+        )
+
+    # ── malfind ──────────────────────────────────────────────────────
+    if malfind:
+        rows = ""
+        for e in malfind[:50]:
+            prot = _e(e.get("protection", ""))
+            rw   = "PAGE_EXECUTE_READWRITE" in prot or "PAGE_EXECUTE_WRITECOPY" in prot
+            prot_cell = (f"<span style='color:#ff7b72'>{prot}</span>" if rw
+                         else f"<span style='color:#e3b341'>{prot}</span>")
+            rows += (
+                f"<tr>"
+                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono'>{_e(e.get('process',''))}</td>"
+                f"<td class='mono' style='font-size:.78rem'>{_e(e.get('start_vpn',''))}</td>"
+                f"<td>{prot_cell}</td>"
+                f"<td class='mono' style='font-size:.75rem;max-width:280px;overflow:hidden;white-space:nowrap'>"
+                f"{_e(e.get('disasm','')[:80])}</td>"
+                f"</tr>"
+            )
+        note = (f"<p style='color:#484f58;font-size:.78rem'>(전체 {len(malfind)}건 중 50건 표시)</p>"
+                if len(malfind) > 50 else "")
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='color:#ff7b72;margin-top:0'>⚠ malfind — 주입 코드 탐지</h4>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>PID</th><th>프로세스</th><th>주소</th><th>보호 속성</th><th>디스어셈블</th></tr>"
+            f"{rows}</table></div>{note}</div>"
+        )
+
+    # ── pstree (메모리 기준 프로세스 트리) ──────────────────────────
+    if pstree:
+        rows = ""
+        for e in pstree[:40]:
+            rows += (
+                f"<tr>"
+                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono' style='color:#484f58'>{e.get('ppid','')}</td>"
+                f"<td class='mono'>{_e(e.get('name',''))}</td>"
+                f"<td class='mono' style='font-size:.78rem;color:#8b949e'>{_e(e.get('create_time',''))}</td>"
+                f"<td class='mono' style='font-size:.75rem;max-width:260px;overflow:hidden;white-space:nowrap'>"
+                f"{_e(e.get('cmd',''))}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0'>프로세스 트리 (메모리 기준)</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>DKOM으로 숨겨진 프로세스가 있으면 여기에 표시됩니다.</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>PID</th><th>PPID</th><th>이름</th><th>생성 시각</th><th>커맨드라인</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    # ── netscan ───────────────────────────────────────────────────────
+    if netscan:
+        rows = ""
+        for e in netscan[:40]:
+            state = _e(e.get("state", ""))
+            state_style = "color:#ff7b72" if state == "ESTABLISHED" else "color:#8b949e"
+            rows += (
+                f"<tr>"
+                f"<td class='mono'>{_e(e.get('proto',''))}</td>"
+                f"<td class='mono'>{_e(e.get('local',''))}</td>"
+                f"<td class='mono' style='color:#e3b341'>{_e(e.get('foreign',''))}</td>"
+                f"<td style='{state_style}'>{state}</td>"
+                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono'>{_e(e.get('owner',''))}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0'>네트워크 아티팩트 (메모리 기준)</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>이미 종료된 연결 포함 — tshark 누락분 보완</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th><th>PID</th><th>프로세스</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    # ── handles (Mutant) ─────────────────────────────────────────────
+    mutants = [h for h in handles if h.get("type") == "Mutant"]
+    if mutants:
+        rows = "".join(
+            f"<tr>"
+            f"<td class='mono' style='color:#79c0ff'>{h.get('pid','')}</td>"
+            f"<td class='mono'>{_e(h.get('name',''))}</td>"
+            f"<td class='mono' style='color:#d2a8ff'>{_e(h.get('handle_name',''))}</td>"
+            f"</tr>"
+            for h in mutants[:30]
+        )
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0'>뮤텍스 (Mutant) 핸들</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>악성코드 패밀리 식별에 핵심 — "
+            f"알려진 뮤텍스 이름으로 VT/MISP 검색 권장</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>PID</th><th>프로세스</th><th>뮤텍스 이름</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    # ── cmdline (비교용) ──────────────────────────────────────────────
+    if cmdline:
+        rows = "".join(
+            f"<tr>"
+            f"<td class='mono' style='color:#79c0ff'>{c.get('pid','')}</td>"
+            f"<td class='mono'>{_e(c.get('name',''))}</td>"
+            f"<td class='mono' style='font-size:.78rem'>{_e(c.get('args',''))}</td>"
+            f"</tr>"
+            for c in cmdline[:20]
+        )
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0'>커맨드라인 (메모리 기준)</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>프로세스 홀로잉 탐지 — "
+            f"원본 EXE와 다른 커맨드라인은 위장 징후</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>PID</th><th>프로세스</th><th>커맨드라인</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    parts.append("</div>")
+    return "\n".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# AI 분석 탭 렌더링
+# ══════════════════════════════════════════════════════════════════════
+
+def _md_to_html(text: str) -> str:
+    """마크다운 → HTML 최소 변환 (헤딩·굵게·목록·코드·단락)."""
+    import re
+    lines = text.split("\n")
+    out: list[str] = []
+    in_ul = False
+    in_code = False
+
+    for line in lines:
+        # 펜스 코드 블록
+        if line.strip().startswith("```"):
+            if in_ul:
+                out.append("</ul>")
+                in_ul = False
+            if in_code:
+                out.append("</code></pre>")
+                in_code = False
+            else:
+                out.append("<pre><code>")
+                in_code = True
+            continue
+        if in_code:
+            out.append(_e(line))
+            continue
+
+        # 헤딩
+        h3 = re.match(r"^### (.+)", line)
+        h2 = re.match(r"^## (.+)", line)
+        h1 = re.match(r"^# (.+)", line)
+        if h1:
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h2 style='color:#58a6ff;margin-top:1.8rem'>{_e(h1.group(1))}</h2>")
+            continue
+        if h2:
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h3 style='color:#79c0ff;margin-top:1.4rem'>{_e(h2.group(1))}</h3>")
+            continue
+        if h3:
+            if in_ul: out.append("</ul>"); in_ul = False
+            out.append(f"<h4 style='color:#d2a8ff;margin-top:1rem'>{_e(h3.group(1))}</h4>")
+            continue
+
+        # 목록
+        li = re.match(r"^[-*•]\s+(.+)", line)
+        num = re.match(r"^\d+\.\s+(.+)", line)
+        if li or num:
+            item_text = (li or num).group(1)
+            item_text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>",
+                               _e(item_text))
+            if not in_ul:
+                out.append("<ul style='padding-left:1.4rem;margin:.3rem 0'>")
+                in_ul = True
+            out.append(f"<li style='margin:.18rem 0'>{item_text}</li>")
+            continue
+
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+
+        # 구분선
+        if re.match(r"^---+$", line.strip()):
+            out.append("<hr style='border-color:#30363d;margin:1rem 0'>")
+            continue
+
+        # 빈 줄
+        if not line.strip():
+            out.append("<p style='margin:.25rem 0'></p>")
+            continue
+
+        # 일반 텍스트 (굵게·코드 인라인)
+        rendered = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _e(line))
+        rendered = re.sub(r"`(.+?)`",
+                          r"<code style='background:#0d1117;padding:.1rem .3rem;"
+                          r"border-radius:3px;font-size:.8rem'>\1</code>",
+                          rendered)
+        out.append(f"<p style='margin:.25rem 0;line-height:1.7'>{rendered}</p>")
+
+    if in_ul:
+        out.append("</ul>")
+    if in_code:
+        out.append("</code></pre>")
+
+    return "\n".join(out)
+
+
+def _ai_html(result) -> str:
+    """AI 분석 결과 탭 렌더링."""
+    ai = getattr(result, "ai_analysis", None) or {}
+    model       = ai.get("model", "qwen2.5:7b")
+    response    = ai.get("response", "")
+    elapsed     = ai.get("elapsed_sec", 0)
+    prompt_ch   = ai.get("prompt_chars", 0)
+    error       = ai.get("error", "")
+
+    parts = ["<h2>🤖 AI 위협 분석</h2>"]
+
+    # 메타 정보
+    parts.append(
+        f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
+        f"모델: <code>{_e(model)}</code> &nbsp;|&nbsp; "
+        f"응답 시간: {elapsed}s &nbsp;|&nbsp; "
+        f"입력 길이: {prompt_ch:,}자"
+        f"</p>"
+    )
+
+    # Ollama 미실행 / 미사용
+    if not ai:
+        parts.append(
+            "<div class='alert alert-info'>"
+            "AI 분석 결과가 없습니다. Ollama가 실행 중이면 자동으로 분석됩니다.<br>"
+            "<code>ollama serve</code> 실행 후 재분석하거나 "
+            "<code>ollama pull qwen2.5:7b</code>로 모델을 먼저 설치하세요."
+            "</div>"
+        )
+        return "\n".join(parts)
+
+    # 오류
+    if error:
+        parts.append(
+            f"<div class='alert alert-warning'>"
+            f"<strong>AI 분석 오류</strong><br>{_e(error)}<br><br>"
+            f"<strong>해결 방법:</strong><br>"
+            f"1. <code>ollama serve</code> 실행 확인<br>"
+            f"2. <code>ollama pull {_e(model)}</code> 로 모델 다운로드<br>"
+            f"3. <code>--no-ai</code> 옵션으로 AI 분석 비활성화 가능"
+            f"</div>"
+        )
+        return "\n".join(parts)
+
+    # 응답 없음
+    if not response.strip():
+        parts.append("<div class='alert alert-warning'>AI 응답이 비어있습니다.</div>")
+        return "\n".join(parts)
+
+    # 응답 렌더링
+    parts.append(
+        "<div class='card' style='line-height:1.75;font-size:.88rem'>"
+        + _md_to_html(response)
+        + "</div>"
+    )
+
+    # 원문 접기
+    parts.append(
+        f"<details style='margin-top:1rem'>"
+        f"<summary style='cursor:pointer;color:#8b949e;font-size:.8rem'>"
+        f"▶ 원문 (Ollama raw 응답)</summary>"
+        f"<pre style='background:#0d1117;border:1px solid #30363d;border-radius:6px;"
+        f"padding:1rem;margin-top:.5rem;font-size:.76rem;overflow-x:auto;"
+        f"white-space:pre-wrap;color:#c9d1d9'>{_e(response)}</pre>"
+        f"</details>"
+    )
+
+    return "\n".join(parts)
