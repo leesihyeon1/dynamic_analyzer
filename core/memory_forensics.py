@@ -242,6 +242,110 @@ class MemForensicsResult:
     error:       str                 = ""
 
 
+# ── 메모리 획득 헬퍼 ─────────────────────────────────────────────────────
+
+def _get_ram_bytes() -> int:
+    """물리 RAM 크기 (바이트). 실패 시 0."""
+    try:
+        import ctypes
+        class _MEMSTATEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength",                ctypes.c_ulong),
+                ("dwMemoryLoad",            ctypes.c_ulong),
+                ("ullTotalPhys",            ctypes.c_ulonglong),
+                ("ullAvailPhys",            ctypes.c_ulonglong),
+                ("ullTotalPageFile",        ctypes.c_ulonglong),
+                ("ullAvailPageFile",        ctypes.c_ulonglong),
+                ("ullTotalVirtual",         ctypes.c_ulonglong),
+                ("ullAvailVirtual",         ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        ms = _MEMSTATEX()
+        ms.dwLength = ctypes.sizeof(ms)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+        return ms.ullTotalPhys
+    except Exception:
+        return 0
+
+
+def _decode_proc_output(b: bytes) -> str:
+    """subprocess 바이트 출력을 UTF-8 → CP949 → latin-1 순서로 디코딩."""
+    if not b:
+        return ""
+    for enc in ("utf-8", "cp949", "latin-1"):
+        try:
+            return b.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return b.decode("latin-1", errors="replace")
+
+
+def _prepare_dump_path(
+    output_path: Path,
+    ram_bytes: int,
+    on_status,
+) -> tuple[Optional[Path], str]:
+    """
+    덤프 파일 경로 사전 준비.
+    - 기존 덤프 삭제
+    - 디스크 여유 공간 확인 (RAM × 1.05 필요)
+    - 쓰기 권한 테스트
+    - 실패 시 C:\\mem_dump.raw 경로로 폴백
+
+    Returns: (usable_path, warn_msg)  — usable_path=None 이면 모두 실패
+    """
+    def _try(path: Path) -> tuple[bool, str]:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return False, f"디렉터리 생성 실패: {e}"
+
+        # 기존 파일 삭제 (이전 덤프가 디스크를 점유하는 경우)
+        if path.exists():
+            try:
+                path.unlink()
+                if on_status:
+                    on_status(f"      [정리] 기존 덤프 삭제: {path.name}")
+            except OSError as e:
+                return False, f"기존 덤프 삭제 실패 ({path}): {e}"
+
+        # 디스크 여유 공간 확인
+        if ram_bytes:
+            needed = int(ram_bytes * 1.05)
+            try:
+                free = shutil.disk_usage(path.parent).free
+            except OSError:
+                free = 0
+            if free and free < needed:
+                return False, (
+                    f"디스크 공간 부족 — 필요 {needed/1e9:.1f}GB, "
+                    f"여유 {free/1e9:.1f}GB ({path.parent})\n"
+                    f"  기존 덤프 파일을 삭제하거나 공간이 충분한 드라이브를 사용하세요."
+                )
+
+        # 쓰기 권한 테스트
+        test = path.parent / ".wmtest"
+        try:
+            test.write_bytes(b"\x00")
+            test.unlink()
+            return True, ""
+        except OSError as e:
+            return False, f"쓰기 권한 없음 ({path.parent}): {e}"
+
+    ok, msg = _try(output_path)
+    if ok:
+        return output_path, ""
+
+    # 폴백: C:\mem_dump.raw (ASCII 단순 경로)
+    alt = Path(r"C:\mem_dump.raw")
+    if on_status:
+        on_status(f"      [경고] 원래 경로 실패({msg}), 대체 경로 시도: {alt}")
+    ok2, msg2 = _try(alt)
+    if ok2:
+        return alt, f"대체 경로 사용: {alt}"
+    return None, f"덤프 경로 준비 실패\n  원래: {msg}\n  대체: {msg2}"
+
+
 # ── 메모리 획득 ───────────────────────────────────────────────────────────
 
 def acquire_memory(
@@ -249,41 +353,57 @@ def acquire_memory(
     tool_path: Optional[Path] = None,
     timeout: int = 600,
     on_status: Optional[object] = None,
-) -> tuple[bool, float, str]:
+) -> tuple[bool, float, str, Path]:
     """
     물리 메모리 덤프 획득.
 
-    Returns: (success, elapsed_sec, error_msg)
+    Returns: (success, elapsed_sec, error_msg, actual_dump_path)
+    actual_dump_path 는 성공 시 실제 파일 위치 (폴백 사용 시 output_path 와 다를 수 있음).
+    실패 시 output_path 를 그대로 반환.
     """
     tool = tool_path or find_winpmem()
     if not tool:
-        return False, 0.0, "winpmem / DumpIt 미설치"
+        return False, 0.0, "winpmem / DumpIt 미설치", output_path
+
+    # 사전 준비: 경로 점검 / 기존 덤프 정리 / 디스크 공간 확인
+    ram_bytes = _get_ram_bytes()
+    usable_path, warn = _prepare_dump_path(output_path, ram_bytes, on_status)
+    if usable_path is None:
+        return False, 0.0, warn, output_path
+    if warn and on_status:
+        on_status(f"      [정보] {warn}")
 
     tool_name = tool.name.lower()
     t0 = time.monotonic()
 
     if "dumpit" in tool_name:
-        cmd = [str(tool), f"/output", str(output_path), "/q", "/y"]
+        cmd = [str(tool), "/output", str(usable_path), "/q", "/y"]
     else:
-        # winpmem
-        cmd = [str(tool), str(output_path)]
+        cmd = [str(tool), str(usable_path)]
 
     try:
         if on_status:
-            on_status(f"      메모리 덤프 시작 ({tool.name}) → {output_path.name}")
-        proc = subprocess.run(
-            cmd, capture_output=True, timeout=timeout,
-            text=True, errors="replace",
-        )
+            on_status(f"      메모리 덤프 시작 ({tool.name}) → {usable_path}")
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
         elapsed = round(time.monotonic() - t0, 1)
-        if not output_path.exists() or output_path.stat().st_size < 1_000_000:
-            err = (proc.stderr or proc.stdout or "출력 파일 없음")[-500:]
-            return False, elapsed, f"덤프 실패 (exit={proc.returncode}): {err}"
-        return True, elapsed, ""
+        stdout = _decode_proc_output(proc.stdout)
+        stderr = _decode_proc_output(proc.stderr)
+        if not usable_path.exists() or usable_path.stat().st_size < 1_000_000:
+            err = (stderr or stdout or "출력 파일 없음")[-600:]
+            return False, elapsed, f"덤프 실패 (exit={proc.returncode}): {err}", output_path
+        # 폴백 경로를 사용한 경우 원래 위치로 이동 시도
+        if usable_path != output_path:
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(usable_path), str(output_path))
+                usable_path = output_path
+            except Exception:
+                pass  # 이동 실패 시 usable_path(폴백 경로) 그대로 사용
+        return True, elapsed, "", usable_path
     except subprocess.TimeoutExpired:
-        return False, round(time.monotonic() - t0, 1), f"덤프 시간 초과 ({timeout}s)"
+        return False, round(time.monotonic() - t0, 1), f"덤프 시간 초과 ({timeout}s)", output_path
     except Exception as e:
-        return False, round(time.monotonic() - t0, 1), str(e)
+        return False, round(time.monotonic() - t0, 1), str(e), output_path
 
 
 # ── Volatility3 플러그인 실행 ─────────────────────────────────────────────
@@ -646,7 +766,7 @@ def run_memory_forensics(
     else:
         dump_path = output_dir / "memory.raw"
         _st("[메모리] 물리 메모리 덤프 획득 중 (수분 소요)...")
-        ok, elapsed, err = acquire_memory(
+        ok, elapsed, err, dump_path = acquire_memory(
             dump_path,
             tool_path=winpmem_path or find_winpmem(),
             timeout=dump_timeout,
