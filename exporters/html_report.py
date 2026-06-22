@@ -983,6 +983,11 @@ def _network_html(result) -> str:
     pnmap = getattr(result, "process_network_map", [])
     proc_lookup: dict[tuple, list[str]] = {}
     ip_proc_lookup: dict[str, list[str]] = {}
+    # ① 로컬 포트 역추적: local_port → 프로세스 목록
+    local_port_lookup: dict[int, list[str]] = {}
+    # ② 음수 귀속: 프로세스별 알려진 remote_ip 집합
+    proc_known_ips: dict[str, set[str]] = {}
+
     for _pn in pnmap:
         _label = f"{_pn.process} ({_pn.pid})"
         _key   = (_pn.proto.upper(), _pn.remote_ip, _pn.remote_port)
@@ -992,6 +997,8 @@ def _network_html(result) -> str:
         _ip_lst = ip_proc_lookup.setdefault(_pn.remote_ip, [])
         if _label not in _ip_lst:
             _ip_lst.append(_label)
+
+        # ③ 호스트명 역매핑: ProcMon이 hostname으로 기록한 경우 IP로 확장
         for _mapped_ip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
             _ip_key = (_pn.proto.upper(), _mapped_ip, _pn.remote_port)
             proc_lookup.setdefault(_ip_key, [])
@@ -1000,6 +1007,19 @@ def _network_html(result) -> str:
             _ip2_lst = ip_proc_lookup.setdefault(_mapped_ip, [])
             if _label not in _ip2_lst:
                 _ip2_lst.append(_label)
+
+        # ① local_port 역추적 등록
+        _lp = getattr(_pn, "local_port", 0)
+        if _lp:
+            _lp_lst = local_port_lookup.setdefault(_lp, [])
+            if _label not in _lp_lst:
+                _lp_lst.append(_label)
+
+        # ② 음수 귀속용: 프로세스별 알려진 IP 수집
+        _proc_key = _pn.process.lower()
+        proc_known_ips.setdefault(_proc_key, set()).add(_pn.remote_ip)
+        for _mip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
+            proc_known_ips[_proc_key].add(_mip)
 
     parts = []
 
@@ -1142,23 +1162,44 @@ def _network_html(result) -> str:
             else:
                 dom_td = "<td style='color:#484f58'>-</td>"
 
-            # 프로세스 lookup: OUTBOUND는 dst_ip 기준, INBOUND(dst=VM 사설IP)는 src_ip 기준
+            # 프로세스 lookup — 3단계 순서로 시도
             if _is_private_ip_str(c.dst_ip):
-                _lookup_ip = c.src_ip
+                _lookup_ip  = c.src_ip
                 _conn_procs = ip_proc_lookup.get(c.src_ip, [])
             else:
-                _lookup_ip = c.dst_ip
-                _conn_procs = (
-                    proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
-                    or ip_proc_lookup.get(c.dst_ip, [])
-                )
+                _lookup_ip  = c.dst_ip
+                # 1단계: (proto, dst_ip, dst_port) 정확 매핑
+                _conn_procs = proc_lookup.get((c.proto.upper(), c.dst_ip, c.dst_port), [])
+                # 2단계: dst_ip 단독 매핑 (포트 불일치 허용)
+                if not _conn_procs:
+                    _conn_procs = ip_proc_lookup.get(c.dst_ip, [])
+                # 3단계: 로컬 포트 역추적 (src_port → ProcMon local_port 매핑)
+                _c_src_port = getattr(c, "src_port", 0)
+                if not _conn_procs and _c_src_port:
+                    _conn_procs = local_port_lookup.get(_c_src_port, [])
+
+            # 음수 귀속: 미확인이지만 어떤 알려진 프로세스가 아닌지 계산
+            _neg_hint = ""
+            if not _conn_procs and pnmap and not _is_private_ip_str(c.dst_ip):
+                _excluded = [
+                    proc for proc, known in proc_known_ips.items()
+                    if c.dst_ip not in known
+                ]
+                if _excluded and len(_excluded) < len(proc_known_ips):
+                    # 일부 프로세스에서 제외됨 → 나머지 프로세스 후보
+                    _candidates = [
+                        proc for proc, known in proc_known_ips.items()
+                        if c.dst_ip in known
+                    ]
+                    if not _candidates:
+                        _neg_hint = f" (알려진 프로세스 {len(proc_known_ips)}개 모두 아님)"
+
             if not _conn_procs:
                 if not pnmap:
                     _reason = "ProcMon Network 이벤트 없음 — ProcMon 필터에서 Network 카테고리 활성화 필요"
                 else:
-                    # PCAP에는 있지만 ProcMon에 없는 연결 — 주요 원인 안내
                     _reason = (
-                        f"ProcMon 미캡처 (pnmap={len(pnmap)}개)\n"
+                        f"ProcMon 미캡처{_neg_hint}\n"
                         "가능한 원인: ① 프로세스 인젝션 후 타 프로세스 명의로 통신 "
                         "② WMI/COM을 통한 우회 통신 ③ 원시 소켓(Raw socket) 사용 "
                         "④ ProcMon 시작 전 이미 연결 성립"

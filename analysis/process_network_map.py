@@ -32,6 +32,7 @@ class ProcNetConnection:
     remote_port: int
     direction:   str   # "outbound" | "inbound"
     event_count: int = 0
+    local_port:  int = 0   # 로컬 ephemeral 포트 (src_port) — 세션 역추적용
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +178,8 @@ def build_process_network_map(
             continue  # Disconnect 등 무시
 
         proto = "TCP" if op.startswith("TCP") else "UDP"
-        _, _, remote_ip, remote_port = _parse_path(ev.path)
+        src_ip, src_port, remote_ip, remote_port = _parse_path(ev.path)
+        local_port = src_port or 0
 
         if remote_ip is None or remote_port is None:
             continue
@@ -196,6 +198,7 @@ def build_process_network_map(
                 remote_port=remote_port,
                 direction=direction,
                 event_count=1,
+                local_port=local_port,
             )
 
     return sorted(

@@ -184,6 +184,7 @@ class NetworkConnection:
     first_seen: float = 0.0  # Unix timestamp
     last_seen:  float = 0.0
     suspicious_port: bool = False
+    src_port:   int   = 0    # 로컬 ephemeral 포트 — ProcMon local_port 역추적용
 
 
 @dataclass
@@ -797,6 +798,8 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         "tls.handshake.extensions_server_name",    # 10  SNI
         "tls.handshake.ja3",                       # 11  JA3 해시 (tshark 내장)
         "tls.record.version",                      # 12  TLS 레코드 버전
+        "tcp.srcport",                             # 13  로컬 포트 — ProcMon 역추적용
+        "udp.srcport",                             # 14
     ]
     for row in _run_tshark_fields(tshark_path, pcap_path, P1):
         packets_loaded += 1
@@ -818,8 +821,10 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
 
             if tcp_dp and tcp_dp.isdigit():
                 proto, dst_port = "TCP", int(tcp_dp)
+                src_port = int(_f(13)) if _f(13).isdigit() else 0
             elif udp_dp and udp_dp.isdigit():
                 proto, dst_port = "UDP", int(udp_dp)
+                src_port = int(_f(14)) if _f(14).isdigit() else 0
             else:
                 packets_skipped += 1
                 continue
@@ -838,6 +843,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
                     bytes_out=flen, bytes_in=0,
                     first_seen=ts, last_seen=ts,
                     suspicious_port=(dst_port in SUSPICIOUS_PORTS),
+                    src_port=src_port,
                 )
 
             if not _is_private_ip(dst_ip):
@@ -1076,6 +1082,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         bytes_out=pkt_len, bytes_in=0,
                         first_seen=ts, last_seen=ts,
                         suspicious_port=is_susp,
+                        src_port=src_port,
                     )
                 # 비콘 타임스탬프 기록 (외부 IP만)
                 if not _is_private_ip(dst_ip):
