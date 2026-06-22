@@ -277,7 +277,7 @@ class AnalysisConfig:
     existing_dump:    Optional[str] = None  # 기존 덤프 재사용
     # ── AI 분석 옵션 ─────────────────────────────────────────────────
     use_ai:       bool = True               # Ollama AI 분석 사용
-    ai_model:     str  = "qwen2.5:7b"      # Ollama 모델 이름
+    ai_model:     str  = "auto"            # Ollama 모델 이름 (auto: 실행 중인 모델 자동 감지)
     ollama_url:   str  = "http://localhost:11434"
     ai_timeout:   int  = 600               # AI 응답 타임아웃 (초)
 
@@ -355,7 +355,7 @@ def run_analysis(
     from core.tls_keylog              import TLSKeyLogger
     from core.fakenet_integrator      import FakeNetIntegrator, fakenet_result_to_dict
     from core.memory_forensics        import run_memory_forensics, memforensics_to_dict, find_winpmem, find_volatility3
-    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict
+    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict, detect_model
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     _early_cfg  = _load_cfg_early()
@@ -1205,24 +1205,32 @@ def run_analysis(
             status(f"      [오류] {_me}")
             result.mem_forensics = {"error": f"실행 예외: {_me}"}
 
-    # ── AI 분석 (Ollama qwen2.5:7b) ──────────────────────────────────
+    # ── AI 분석 (Ollama 자동 감지) ──────────────────────────────────
     if config.use_ai:
-        _az = OllamaAnalyzer(base_url=config.ollama_url, model=config.ai_model)
-        if _az.is_available():
-            status(f"[AI 분석] Ollama {config.ai_model} 호출 중…")
-            try:
-                _ai = _az.analyze(result, timeout=config.ai_timeout)
-                result.ai_analysis = ai_analysis_to_dict(_ai)
-                if _ai.error:
-                    status(f"      [오류] {_ai.error}")
-                    result.errors.append(f"AI 분석: {_ai.error}")
-                else:
-                    status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
-            except Exception as _ae:
-                result.errors.append(f"AI 분석 예외: {_ae}")
-                status(f"      [오류] {_ae}")
+        _ollama_url = config.ollama_url
+        # 모델 자동 감지: 사용자가 명시하지 않았거나 기본값이면 실행 중인 모델 우선
+        _ai_model = config.ai_model
+        if not _ai_model or _ai_model == "auto":
+            _ai_model = detect_model(_ollama_url) or ""
+        if not _ai_model:
+            status(f"[AI 분석] Ollama 모델 없음 — 건너뜀 (ollama list 로 모델 확인)")
         else:
-            status(f"[AI 분석] Ollama 서버 미실행 — 건너뜀 ({config.ollama_url})")
+            _az = OllamaAnalyzer(base_url=_ollama_url, model=_ai_model)
+            if _az.is_available():
+                status(f"[AI 분석] Ollama {_ai_model} 호출 중…")
+                try:
+                    _ai = _az.analyze(result, timeout=config.ai_timeout)
+                    result.ai_analysis = ai_analysis_to_dict(_ai)
+                    if _ai.error:
+                        status(f"      [오류] {_ai.error}")
+                        result.errors.append(f"AI 분석: {_ai.error}")
+                    else:
+                        status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
+                except Exception as _ae:
+                    result.errors.append(f"AI 분석 예외: {_ae}")
+                    status(f"      [오류] {_ae}")
+            else:
+                status(f"[AI 분석] Ollama 서버 미실행 — 건너뜀 ({_ollama_url})")
 
     result.end_time = time.time()
     elapsed_total = result.end_time - result.start_time

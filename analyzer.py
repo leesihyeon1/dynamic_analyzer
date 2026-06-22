@@ -234,11 +234,11 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--vol-timeout", type=int, default=300, metavar="SEC",
                     help="Volatility3 플러그인당 타임아웃 (기본 300초)")
 
-    ag = p.add_argument_group("AI 분석 (Ollama qwen2.5:7b)")
+    ag = p.add_argument_group("AI 분석 (Ollama 자동 감지)")
     ag.add_argument("--no-ai", action="store_true",
-                    help="AI 분석 비활성화 (Ollama 미설치 환경)")
-    ag.add_argument("--ai-model", metavar="MODEL", default="qwen2.5:7b",
-                    help="Ollama 모델 이름 (기본 qwen2.5:7b)")
+                    help="AI 분석 비활성화")
+    ag.add_argument("--ai-model", metavar="MODEL", default="auto",
+                    help="Ollama 모델 이름 (기본 auto: 실행 중인 모델 자동 감지)")
     ag.add_argument("--ollama-url", metavar="URL", default="http://localhost:11434",
                     help="Ollama 서버 URL (기본 http://localhost:11434)")
     ag.add_argument("--ai-timeout", type=int, default=600, metavar="SEC",
@@ -357,7 +357,7 @@ def main() -> None:
         vol_plugin_timeout= getattr(args, "vol_timeout", 300),
         existing_dump     = getattr(args, "dump", None),
         use_ai            = not getattr(args, "no_ai", False),
-        ai_model          = getattr(args, "ai_model", "qwen2.5:7b"),
+        ai_model          = getattr(args, "ai_model", "auto"),
         ollama_url        = getattr(args, "ollama_url", "http://localhost:11434"),
         ai_timeout        = getattr(args, "ai_timeout", 600),
     )

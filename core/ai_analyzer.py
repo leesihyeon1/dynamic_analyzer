@@ -49,6 +49,38 @@ def _is_ollama_running(base_url: str, timeout: int = 4) -> bool:
         return False
 
 
+def detect_model(base_url: str, timeout: int = 4) -> Optional[str]:
+    """현재 Ollama에 로드된 모델을 자동 감지한다.
+
+    1) /api/ps  → 메모리에 올라와 있는(실행 중인) 모델 우선
+    2) /api/tags → 설치된 모델 목록의 첫 번째
+    둘 다 없으면 None 반환.
+    """
+    # 1. 현재 실행 중인 모델 (/api/ps, Ollama 0.1.33+)
+    try:
+        req = urllib.request.Request(f"{base_url}/api/ps", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        models = data.get("models", [])
+        if models:
+            return models[0].get("name", "")
+    except Exception:
+        pass
+
+    # 2. 설치된 모델 목록의 첫 번째
+    try:
+        req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        models = data.get("models", [])
+        if models:
+            return models[0].get("name", "")
+    except Exception:
+        pass
+
+    return None
+
+
 def _is_model_available(base_url: str, model: str, timeout: int = 4) -> bool:
     try:
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
