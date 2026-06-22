@@ -1190,14 +1190,16 @@ def _network_html(result) -> str:
                 susp_badges += _b("DDNS", "orange")
             if getattr(q, "no_response", False):
                 susp_badges += _b("응답없음", "yellow")
+            _q_is_ddns = getattr(q, "is_ddns", False)
+            _q_cls  = "" if (q.suspicious or _q_is_ddns) else "ev-network"
+            _q_clr  = "color:#ff7b72" if q.suspicious else ("color:#ffa657" if _q_is_ddns else "")
+            _q_rips = _e(", ".join(q.response_ips[:3])) if q.response_ips else "<span style='color:#8b949e;font-size:.72rem'>—</span>"
             rows.append(
                 f"<tr>"
-                f"<td class='mono {'ev-network' if not (q.suspicious or getattr(q,'is_ddns',False)) else ''}"
-                f"' style='{'color:#ff7b72' if q.suspicious else ('color:#ffa657' if getattr(q,\"is_ddns\",False) else '')}'>{_e(q.name)}</td>"
+                f"<td class='mono {_q_cls}' style='{_q_clr}'>{_e(q.name)}</td>"
                 f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
                 f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
-                f"<td class='mono' style='color:#56d364;font-size:0.72rem'>"
-                f"{'<span style=\"color:#8b949e;font-size:.72rem\">—</span>' if not q.response_ips else _e(', '.join(q.response_ips[:3]))}</td>"
+                f"<td class='mono' style='color:#56d364;font-size:0.72rem'>{_q_rips}</td>"
                 f"<td>{susp_badges}</td>"
                 + _proc_cell(dns_procs) +
                 f"</tr>"
