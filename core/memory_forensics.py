@@ -227,19 +227,56 @@ class DllEntry:
 
 
 @dataclass
+class PsxviewEntry:
+    pid:     int
+    name:    str
+    offset:  str
+    pslist:  bool    # PsActiveProcessLinks 목록에 있음
+    psscan:  bool    # pool-tag 스캔에서 발견
+    csrss:   bool    # CSRSS 핸들 테이블에 있음
+    peb:     bool    # PEB 존재
+    hidden:  bool    # psscan에서 발견됐지만 pslist에 없음 = 은닉 의심
+
+
+@dataclass
+class ConnscanEntry:
+    proto:        str
+    local_addr:   str
+    local_port:   int
+    foreign_addr: str
+    foreign_port: int
+    state:        str
+    pid:          int
+    owner:        str
+    created:      str
+
+
+@dataclass
+class ProcDumpEntry:
+    pid:       int
+    name:      str
+    dump_path: str    # 추출된 PE 파일 경로
+    size:      int    # 바이트
+    reason:    str    # "malfind:PAGE_EXECUTE_READWRITE" 등
+
+
+@dataclass
 class MemForensicsResult:
-    dump_path:   Optional[Path]       = None
-    dump_size_gb: float               = 0.0
-    dump_elapsed: float               = 0.0
-    vol_elapsed:  float               = 0.0
-    malfind:     list[MalfindEntry]  = field(default_factory=list)
-    pstree:      list[PsTreeEntry]   = field(default_factory=list)
-    netscan:     list[NetScanEntry]  = field(default_factory=list)
-    cmdline:     list[CmdlineEntry]  = field(default_factory=list)
-    handles:     list[HandleEntry]   = field(default_factory=list)
-    dlllist:     list[DllEntry]      = field(default_factory=list)
-    plugin_errors: dict[str, str]    = field(default_factory=dict)
-    error:       str                 = ""
+    dump_path:    Optional[Path]        = None
+    dump_size_gb: float                 = 0.0
+    dump_elapsed: float                 = 0.0
+    vol_elapsed:  float                 = 0.0
+    malfind:      list[MalfindEntry]   = field(default_factory=list)
+    pstree:       list[PsTreeEntry]    = field(default_factory=list)
+    netscan:      list[NetScanEntry]   = field(default_factory=list)
+    connscan:     list[ConnscanEntry]  = field(default_factory=list)
+    psxview:      list[PsxviewEntry]   = field(default_factory=list)
+    cmdline:      list[CmdlineEntry]   = field(default_factory=list)
+    handles:      list[HandleEntry]    = field(default_factory=list)
+    dlllist:      list[DllEntry]       = field(default_factory=list)
+    procdumps:    list[ProcDumpEntry]  = field(default_factory=list)
+    plugin_errors: dict[str, str]      = field(default_factory=dict)
+    error:        str                  = ""
 
 
 # ── 메모리 획득 헬퍼 ─────────────────────────────────────────────────────
@@ -646,6 +683,96 @@ class VolatilityRunner:
             ))
         return results
 
+    def psxview(self) -> list[PsxviewEntry]:
+        """windows.psxview — EPROCESS 목록 교차 비교로 은닉 프로세스 탐지."""
+        data = self._run("windows.psxview")
+        results: list[PsxviewEntry] = []
+
+        def _b(val: str) -> bool:
+            return str(val).strip().lower() in ("true", "1", "yes")
+
+        for row in (data.get("rows") or []):
+            pid  = self._col_int(data, row, "PID") or self._col_int(data, row, "Pid")
+            name = (self._col(data, row, "ImageFileName")
+                    or self._col(data, row, "Name"))
+            offset = (self._col(data, row, "Offset(P)")
+                      or self._col(data, row, "Offset"))
+            # 컬럼 이름은 버전마다 "KO Pslist" 또는 "PsActiveProcessLinks" 등 다름
+            pslist = _b(self._col(data, row, "KO Pslist")
+                        or self._col(data, row, "PsActiveProcessLinks")
+                        or self._col(data, row, "Pslist"))
+            psscan = _b(self._col(data, row, "KO Psscan")
+                        or self._col(data, row, "Psscan"))
+            csrss  = _b(self._col(data, row, "KO Csrss")
+                        or self._col(data, row, "Csrss"))
+            peb    = _b(self._col(data, row, "KO Session")
+                        or self._col(data, row, "Session")
+                        or self._col(data, row, "PEB"))
+            # psscan에서 발견됐지만 pslist에 없음 = 가장 의심스러운 루트킷 패턴
+            hidden = psscan and not pslist
+            results.append(PsxviewEntry(
+                pid=pid, name=name, offset=offset,
+                pslist=pslist, psscan=psscan, csrss=csrss, peb=peb,
+                hidden=hidden,
+            ))
+        return results
+
+    def connscan(self) -> list[ConnscanEntry]:
+        """windows.connscan — 종료된 TCP 소켓 포함 연결 이력 스캔."""
+        data = self._run("windows.connscan")
+        results: list[ConnscanEntry] = []
+        for row in (data.get("rows") or []):
+            lport = self._col(data, row, "LocalPort")
+            fport = self._col(data, row, "ForeignPort")
+            results.append(ConnscanEntry(
+                proto       =self._col(data, row, "Proto") or "TCP",
+                local_addr  =self._col(data, row, "LocalAddr"),
+                local_port  =int(lport) if str(lport).isdigit() else 0,
+                foreign_addr=self._col(data, row, "ForeignAddr"),
+                foreign_port=int(fport) if str(fport).isdigit() else 0,
+                state       =self._col(data, row, "State"),
+                pid         =self._col_int(data, row, "PID") or self._col_int(data, row, "Pid"),
+                owner       =self._col(data, row, "Owner"),
+                created     =self._col(data, row, "Created"),
+            ))
+        return results
+
+    def procdump(
+        self,
+        pid_reasons: dict[int, str],
+        pid_name_map: dict[int, str],
+        output_dir: Path,
+    ) -> list[ProcDumpEntry]:
+        """의심 PID의 PE를 메모리에서 추출 (windows.procdump)."""
+        results: list[ProcDumpEntry] = []
+        if not pid_reasons:
+            return results
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for pid, reason in pid_reasons.items():
+            before = {p.name for p in output_dir.glob("*.dmp")}
+            cmd = self.vol_cmd + [
+                "-f", str(self.dump_path),
+                "-r", "json",
+                "-o", str(output_dir),
+            ]
+            if self.symbols_path:
+                cmd += ["-s", str(self.symbols_path)]
+            cmd += ["windows.procdump", "--pid", str(pid)]
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=self.timeout)
+            except Exception:
+                continue
+            for dp in sorted(output_dir.glob("*.dmp")):
+                if dp.name not in before:
+                    results.append(ProcDumpEntry(
+                        pid=pid,
+                        name=pid_name_map.get(pid, f"pid_{pid}"),
+                        dump_path=str(dp),
+                        size=dp.stat().st_size,
+                        reason=reason,
+                    ))
+        return results
+
     def warmup(self) -> tuple[bool, str]:
         """
         windows.info 실행으로 심볼 자동 다운로드 트리거 및 OS 정보 추출.
@@ -853,6 +980,8 @@ def run_memory_forensics(
         "malfind":  lambda: runner.malfind(pid_filter=sample_pids),
         "pstree":   lambda: runner.pstree(),
         "netscan":  lambda: runner.netscan(),
+        "connscan": lambda: runner.connscan(),
+        "psxview":  lambda: runner.psxview(),
         "cmdline":  lambda: runner.cmdline(pid_filter=sample_pids),
         "handles":  lambda: runner.handles(pid_filter=sample_pids),
         "dlllist":  lambda: runner.dlllist(pid_filter=sample_pids),
@@ -872,6 +1001,23 @@ def run_memory_forensics(
 
     result.vol_elapsed = round(time.monotonic() - t_vol, 1)
     _st(f"      Volatility3 완료: {result.vol_elapsed}s")
+
+    # ── 의심 프로세스 PE 추출 ─────────────────────────────────────────
+    # malfind RWX 영역 + psxview 은닉 프로세스를 대상으로 windows.procdump 실행
+    pid_reasons: dict[int, str] = {}
+    for e in result.malfind:
+        if e.protection in _SUSPICIOUS_PROTECTIONS and e.pid:
+            pid_reasons.setdefault(e.pid, f"malfind:{e.protection}")
+    for e in result.psxview:
+        if e.hidden and e.pid and e.pid not in pid_reasons:
+            pid_reasons[e.pid] = "psxview:hidden"
+
+    if pid_reasons:
+        pid_name_map = {e.pid: e.name for e in result.pstree}
+        dumps_dir = output_dir / "procdumps"
+        _st(f"[메모리] 의심 프로세스 PE 추출 중 ({len(pid_reasons)}개 PID)...")
+        result.procdumps = runner.procdump(pid_reasons, pid_name_map, dumps_dir)
+        _st(f"      추출 완료: {len(result.procdumps)}개 파일")
 
     return result
 
@@ -919,5 +1065,23 @@ def memforensics_to_dict(r: MemForensicsResult) -> dict:
             {"pid": e.pid, "name": e.name, "base": e.base,
              "dll": e.dll_name, "path": e.path}
             for e in r.dlllist
+        ],
+        "psxview": [
+            {"pid": e.pid, "name": e.name, "offset": e.offset,
+             "pslist": e.pslist, "psscan": e.psscan, "csrss": e.csrss,
+             "peb": e.peb, "hidden": e.hidden}
+            for e in r.psxview
+        ],
+        "connscan": [
+            {"proto": e.proto, "local": f"{e.local_addr}:{e.local_port}",
+             "foreign": f"{e.foreign_addr}:{e.foreign_port}",
+             "state": e.state, "pid": e.pid, "owner": e.owner,
+             "created": e.created}
+            for e in r.connscan
+        ],
+        "procdumps": [
+            {"pid": e.pid, "name": e.name, "dump_path": e.dump_path,
+             "size": e.size, "reason": e.reason}
+            for e in r.procdumps
         ],
     }

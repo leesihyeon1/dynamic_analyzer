@@ -2839,12 +2839,15 @@ def _volatility_html(result) -> str:
             f"</div>"
         )
 
-    malfind       = mf.get("malfind") or []
-    pstree        = mf.get("pstree")  or []
-    netscan       = mf.get("netscan") or []
-    cmdline       = mf.get("cmdline") or []
-    handles       = mf.get("handles") or []
-    dlllist       = mf.get("dlllist") or []
+    malfind    = mf.get("malfind")   or []
+    pstree     = mf.get("pstree")    or []
+    netscan    = mf.get("netscan")   or []
+    connscan   = mf.get("connscan")  or []
+    psxview    = mf.get("psxview")   or []
+    cmdline    = mf.get("cmdline")   or []
+    handles    = mf.get("handles")   or []
+    dlllist    = mf.get("dlllist")   or []
+    procdumps  = mf.get("procdumps") or []
     dump_gb       = mf.get("dump_size_gb", 0)
     vol_sec       = mf.get("vol_elapsed", 0)
     plugin_errors = mf.get("plugin_errors") or {}
@@ -2855,8 +2858,11 @@ def _volatility_html(result) -> str:
         f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
         f"덤프 {dump_gb} GB &nbsp;|&nbsp; 분석 {vol_sec}s &nbsp;|&nbsp; "
         f"malfind <strong style='color:{'#ff7b72' if malfind else 'inherit'}'>{len(malfind)}</strong>건 &nbsp;|&nbsp; "
-        f"netscan {len(netscan)}건 &nbsp;|&nbsp; "
-        f"handles(Mutant) {len(handles)}건</p>",
+        f"netscan {len(netscan)}건 &nbsp;|&nbsp; connscan {len(connscan)}건 &nbsp;|&nbsp; "
+        f"psxview 은닉 <strong style='color:{'#ff7b72' if any(e.get('hidden') for e in psxview) else 'inherit'}'>"
+        f"{sum(1 for e in psxview if e.get('hidden'))}</strong>건 &nbsp;|&nbsp; "
+        f"handles(Mutant) {len(handles)}건 &nbsp;|&nbsp; "
+        f"PE 추출 {len(procdumps)}건</p>",
     ]
 
     # ── 플러그인 오류 표시 ────────────────────────────────────────────
@@ -2882,7 +2888,7 @@ def _volatility_html(result) -> str:
         )
 
     # 모든 플러그인 결과가 비어있으면 안내
-    has_any = any([malfind, pstree, netscan, cmdline, handles, dlllist])
+    has_any = any([malfind, pstree, netscan, connscan, psxview, cmdline, handles, dlllist, procdumps])
     if not has_any and not plugin_errors:
         parts.append(
             f"<p style='color:#8b949e;font-size:.83rem;margin-bottom:1rem'>"
@@ -2964,6 +2970,99 @@ def _volatility_html(result) -> str:
             f"<p style='color:#8b949e;font-size:.78rem'>이미 종료된 연결 포함 — tshark 누락분 보완</p>"
             f"<div style='overflow-x:auto'><table>"
             f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th><th>PID</th><th>프로세스</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    # ── connscan ──────────────────────────────────────────────────────
+    if connscan:
+        rows = ""
+        for e in connscan[:40]:
+            state = _e(e.get("state", ""))
+            state_style = "color:#ff7b72" if state == "ESTABLISHED" else "color:#8b949e"
+            rows += (
+                f"<tr>"
+                f"<td class='mono'>{_e(e.get('proto',''))}</td>"
+                f"<td class='mono'>{_e(e.get('local',''))}</td>"
+                f"<td class='mono' style='color:#e3b341'>{_e(e.get('foreign',''))}</td>"
+                f"<td style='{state_style}'>{state or '(종료)'}</td>"
+                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono'>{_e(e.get('owner',''))}</td>"
+                f"</tr>"
+            )
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0'>연결 이력 (connscan — 종료 소켓 포함)</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>"
+            f"pool-tag 스캔으로 이미 닫힌 TCP 소켓 구조체까지 복원 — netscan 누락분 보완</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th><th>PID</th><th>프로세스</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    # ── psxview ───────────────────────────────────────────────────────
+    if psxview:
+        hidden_entries = [e for e in psxview if e.get("hidden")]
+        rows = ""
+        for e in psxview[:60]:
+            is_hidden = e.get("hidden", False)
+            row_style = "background:#3d1f1f" if is_hidden else ""
+            rows += (
+                f"<tr style='{row_style}'>"
+                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono'>{_e(e.get('name',''))}</td>"
+                f"<td style='text-align:center'>"
+                f"{'<span style=\"color:#ff7b72\">✗</span>' if not e.get('pslist') else '<span style=\"color:#3fb950\">✓</span>'}"
+                f"</td>"
+                f"<td style='text-align:center'>"
+                f"{'<span style=\"color:#3fb950\">✓</span>' if e.get('psscan') else '<span style=\"color:#484f58\">✗</span>'}"
+                f"</td>"
+                f"<td style='text-align:center'>"
+                f"{'<span style=\"color:#3fb950\">✓</span>' if e.get('csrss') else '<span style=\"color:#484f58\">✗</span>'}"
+                f"</td>"
+                f"<td style='color:{'#ff7b72' if is_hidden else '#8b949e'};font-weight:{'bold' if is_hidden else 'normal'}'>"
+                f"{'⚠ 은닉 의심' if is_hidden else '-'}</td>"
+                f"</tr>"
+            )
+        hidden_count = len(hidden_entries)
+        hdr_color = "#ff7b72" if hidden_count else "inherit"
+        hdr_badge = (f" — <strong>{hidden_count}개 은닉 의심</strong>"
+                     if hidden_count else "")
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0;color:{hdr_color}'>프로세스 은닉 탐지 (psxview){hdr_badge}</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>"
+            f"EPROCESS 목록(pslist)과 pool-tag 스캔(psscan)·CSRSS 목록 교차 비교 — "
+            f"pslist에 없지만 psscan에서 발견되면 루트킷 은닉 의심</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>PID</th><th>프로세스</th><th>Pslist</th><th>Psscan</th><th>Csrss</th><th>판정</th></tr>"
+            f"{rows}</table></div></div>"
+        )
+
+    # ── procdumps ─────────────────────────────────────────────────────
+    if procdumps:
+        def _sz(b):
+            if not b: return ""
+            if b < 1024 * 1024: return f"{b // 1024}KB"
+            return f"{b // (1024 * 1024)}MB"
+
+        rows = "".join(
+            f"<tr>"
+            f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+            f"<td class='mono'>{_e(e.get('name',''))}</td>"
+            f"<td class='mono' style='font-size:.75rem;color:#e3b341'>{_e(e.get('reason',''))}</td>"
+            f"<td class='mono' style='font-size:.75rem;word-break:break-all'>{_e(e.get('dump_path',''))}</td>"
+            f"<td class='mono' style='color:#8b949e'>{_sz(e.get('size',0))}</td>"
+            f"</tr>"
+            for e in procdumps
+        )
+        parts.append(
+            f"<div class='card' style='margin-bottom:1.2rem'>"
+            f"<h4 style='margin-top:0;color:#e3b341'>추출된 프로세스 PE ({len(procdumps)}개)</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>"
+            f"malfind RWX 영역·psxview 은닉 프로세스에서 추출 — "
+            f"VT 업로드·YARA 스캔·strings 분석 권장</p>"
+            f"<div style='overflow-x:auto'><table>"
+            f"<tr><th>PID</th><th>프로세스</th><th>추출 사유</th><th>파일 경로</th><th>크기</th></tr>"
             f"{rows}</table></div></div>"
         )
 
