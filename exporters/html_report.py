@@ -3151,8 +3151,9 @@ def _render_classification(body: str) -> str:
         threat_color = "#56d364"; threat_bg = "rgba(86,211,100,.10)"
 
     # 태그 파싱 (태그 및 해석 블록)
+    # 태그 블록이 섹션 끝에 있어도 캡처되도록 lookahead에 $ 별도 처리
     tag_block_m = _re.search(
-        r"(?:태그 및 해석|Tags & interpretation)[:\s]*\n([\s\S]+?)(?=\n(?:위협|주요|설명|$))",
+        r"(?:태그 및 해석|Tags & interpretation)[:\s]*\n([\s\S]+?)(?=\n(?:위협|주요|설명)|$)",
         body, _re.IGNORECASE,
     )
     tag_html = ""
@@ -3163,8 +3164,8 @@ def _render_classification(body: str) -> str:
             tl_line = tl_line.strip().lstrip("-•").strip()
             if not tl_line:
                 continue
-            # "tag: 설명" 형태
-            tm = _re.match(r"^([a-zA-Z가-힣/_\-]+):\s*(.+)", tl_line)
+            # "[tag]: 설명" 또는 "tag: 설명" 형태 모두 처리
+            tm = _re.match(r"^\[?([a-zA-Z가-힣/_\-]+)\]?:\s*(.+)", tl_line)
             if tm:
                 chip_label = _e(tm.group(1).strip())
                 chip_title = _e(tm.group(2).strip())
