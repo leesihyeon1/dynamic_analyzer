@@ -3056,27 +3056,236 @@ def _md_to_html(text: str) -> str:
     return "\n".join(out)
 
 
+def _parse_ai_sections(text: str) -> dict:
+    """any.run 포맷 텍스트 → 섹션별 dict 파싱."""
+    import re as _re
+
+    SECTION_TITLES = [
+        "분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "결론",
+        # 영문 fallback (모델이 영문으로 출력한 경우)
+        "Analytical classification", "Executive summary",
+        "Execution flow", "Behavioral analysis", "Conclusion",
+    ]
+    KO_MAP = {
+        "Analytical classification": "분석 분류",
+        "Executive summary": "핵심 요약",
+        "Execution flow": "실행 흐름",
+        "Behavioral analysis": "행위 분석",
+        "Conclusion": "결론",
+    }
+
+    # 섹션 경계 탐지
+    pattern = "|".join(_re.escape(t) for t in SECTION_TITLES)
+    splits = list(_re.finditer(rf"^({pattern})\s*$", text, _re.MULTILINE))
+
+    sections: dict[str, str] = {}
+    for i, m in enumerate(splits):
+        title = KO_MAP.get(m.group(1), m.group(1))
+        end   = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+        body  = text[m.end():end].strip()
+        sections[title] = body
+
+    return sections
+
+
+def _render_classification(body: str) -> str:
+    """분석 분류 섹션 → 카드 HTML."""
+    import re as _re
+
+    def _field(label: str) -> str:
+        m = _re.search(rf"^{_re.escape(label)}:\s*(.+)", body, _re.MULTILINE)
+        return m.group(1).strip() if m else ""
+
+    threat   = _field("위협 수준") or _field("Threat level")
+    obj      = _field("주요 분석 대상") or _field("Main analyzed object")
+    desc     = _field("설명") or _field("Description")
+
+    # 위협 수준 색상
+    tl = threat.lower()
+    if "악성" in tl or "malicious" in tl:
+        threat_color = "#ff7b72"; threat_bg = "rgba(255,123,114,.12)"
+    elif "의심" in tl or "suspicious" in tl:
+        threat_color = "#ffa657"; threat_bg = "rgba(255,166,87,.12)"
+    else:
+        threat_color = "#56d364"; threat_bg = "rgba(86,211,100,.10)"
+
+    # 태그 파싱 (태그 및 해석 블록)
+    tag_block_m = _re.search(
+        r"(?:태그 및 해석|Tags & interpretation)[:\s]*\n([\s\S]+?)(?=\n(?:위협|주요|설명|$))",
+        body, _re.IGNORECASE,
+    )
+    tag_html = ""
+    if tag_block_m:
+        tag_lines = tag_block_m.group(1).strip().splitlines()
+        chips = []
+        for tl_line in tag_lines:
+            tl_line = tl_line.strip().lstrip("-•").strip()
+            if not tl_line:
+                continue
+            # "tag: 설명" 형태
+            tm = _re.match(r"^([a-zA-Z가-힣/_\-]+):\s*(.+)", tl_line)
+            if tm:
+                chip_label = _e(tm.group(1).strip())
+                chip_title = _e(tm.group(2).strip())
+                chips.append(
+                    f"<span title='{chip_title}' style='display:inline-block;"
+                    f"background:#1f2d3d;border:1px solid #30363d;border-radius:12px;"
+                    f"padding:2px 10px;font-size:.75rem;color:#79c0ff;margin:2px 3px 2px 0;"
+                    f"cursor:help'>{chip_label}</span>"
+                )
+        if chips:
+            tag_html = (
+                "<div style='margin-top:.6rem'>"
+                "<span style='font-size:.75rem;color:#8b949e;margin-right:.4rem'>태그</span>"
+                + "".join(chips) + "</div>"
+            )
+
+    return (
+        f"<div class='card' style='margin-bottom:1rem'>"
+        f"<div style='display:flex;align-items:center;gap:.6rem;margin-bottom:.7rem'>"
+        f"<span style='background:{threat_bg};color:{threat_color};border:1px solid {threat_color};"
+        f"border-radius:4px;padding:3px 10px;font-size:.82rem;font-weight:600'>{_e(threat)}</span>"
+        f"<span style='color:#8b949e;font-size:.8rem'>위협 수준</span>"
+        f"</div>"
+        f"<table class='kv' style='margin-bottom:.4rem'>"
+        f"<tr><td style='width:130px;color:#8b949e'>주요 분석 대상</td>"
+        f"<td class='mono' style='font-size:.85rem'>{_e(obj)}</td></tr>"
+        f"<tr><td style='color:#8b949e'>설명</td>"
+        f"<td style='font-size:.85rem;line-height:1.6'>{_e(desc)}</td></tr>"
+        f"</table>"
+        f"{tag_html}"
+        f"</div>"
+    )
+
+
+def _render_summary(body: str) -> str:
+    return (
+        f"<div class='card' style='margin-bottom:1rem'>"
+        f"<p style='margin:0;line-height:1.8;font-size:.88rem'>{_e(body).replace(chr(10), '<br>')}</p>"
+        f"</div>"
+    )
+
+
+def _render_exec_flow(body: str) -> str:
+    import re as _re
+
+    LABEL_STYLES = {
+        "사용자 행위":  ("#79c0ff", "#1a2d3d"),
+        "User-driven":  ("#79c0ff", "#1a2d3d"),
+        "준비 단계":    ("#ffa657", "#2d1f0a"),
+        "Preparatory":  ("#ffa657", "#2d1f0a"),
+        "자율 실행":    ("#ff7b72", "#2d1117"),
+        "Autonomous":   ("#ff7b72", "#2d1117"),
+    }
+    DEFAULT_STYLE = ("#8b949e", "#161b22")
+
+    rows = []
+    for line in body.splitlines():
+        line = line.strip().lstrip("-•").strip()
+        if not line:
+            continue
+        m = _re.match(r"\[([^\]]+)\]\s*(.*)", line)
+        if m:
+            lbl   = m.group(1).strip()
+            desc  = m.group(2).strip()
+            color, bg = LABEL_STYLES.get(lbl, DEFAULT_STYLE)
+            rows.append(
+                f"<div style='display:flex;align-items:flex-start;gap:.6rem;"
+                f"padding:.45rem 0;border-bottom:1px solid #21262d'>"
+                f"<span style='flex-shrink:0;background:{bg};color:{color};"
+                f"border:1px solid {color};border-radius:4px;padding:1px 8px;"
+                f"font-size:.72rem;font-weight:600;margin-top:2px'>[{_e(lbl)}]</span>"
+                f"<span style='font-size:.85rem;line-height:1.6'>{_e(desc)}</span>"
+                f"</div>"
+            )
+        else:
+            rows.append(
+                f"<div style='padding:.4rem 0;border-bottom:1px solid #21262d;"
+                f"font-size:.85rem;color:#c9d1d9'>{_e(line)}</div>"
+            )
+
+    if not rows:
+        return ""
+    return (
+        "<div class='card' style='margin-bottom:1rem'>"
+        + "".join(rows)
+        + "</div>"
+    )
+
+
+def _render_behavioral(body: str) -> str:
+    import re as _re
+
+    FIELDS = [
+        ("로더 / 스테이징",                    "Loader / Staging"),
+        ("실행 및 피벗 (LOLBin / 인터프리터)",  "Execution & Pivots"),
+        ("지속성 (관찰된 경우)",                "Persistence"),
+        ("탐색 / 수집 (관찰된 경우)",           "Discovery / Collection"),
+        ("네트워크 / C2 또는 유출 (관찰된 경우)","Network / C2"),
+        ("오류 / 크래시 (관찰된 경우)",          "Errors / Crashes"),
+    ]
+
+    rows = []
+    for ko_label, en_label in FIELDS:
+        # 한/영 모두 시도
+        for label in (ko_label, en_label):
+            m = _re.search(
+                rf"^{_re.escape(label)}[^:\n]*:\s*(.+?)(?=\n[^\s]|$)",
+                body, _re.MULTILINE | _re.DOTALL,
+            )
+            if m:
+                val = m.group(1).strip()
+                break
+        else:
+            val = "관찰되지 않음"
+
+        absent = val in ("관찰되지 않음", "관찰 안됨", "없음", "Not observed", "활동 없음")
+        val_style = "color:#6e7681;font-style:italic" if absent else "color:#c9d1d9"
+        rows.append(
+            f"<tr>"
+            f"<td style='color:#8b949e;font-size:.8rem;width:220px;"
+            f"padding:.45rem .6rem;vertical-align:top;white-space:nowrap'>{_e(ko_label)}</td>"
+            f"<td style='{val_style};font-size:.85rem;padding:.45rem .6rem;"
+            f"line-height:1.6'>{_e(val)}</td>"
+            f"</tr>"
+        )
+
+    return (
+        "<div class='card' style='margin-bottom:1rem'>"
+        "<table style='width:100%;border-collapse:collapse'>"
+        + "".join(rows)
+        + "</table></div>"
+    )
+
+
+def _render_conclusion(body: str) -> str:
+    return (
+        f"<div class='card' style='margin-bottom:1rem;border-left:3px solid #58a6ff;"
+        f"padding-left:1rem'>"
+        f"<p style='margin:0;line-height:1.8;font-size:.88rem'>{_e(body).replace(chr(10), '<br>')}</p>"
+        f"</div>"
+    )
+
+
 def _ai_html(result) -> str:
-    """AI 분석 결과 탭 렌더링."""
+    """AI 분석 결과 탭 렌더링 (any.run 스타일)."""
     ai = getattr(result, "ai_analysis", None) or {}
-    model       = ai.get("model", "qwen2.5:7b")
-    response    = ai.get("response", "")
-    elapsed     = ai.get("elapsed_sec", 0)
-    prompt_ch   = ai.get("prompt_chars", 0)
-    error       = ai.get("error", "")
+    model     = ai.get("model", "")
+    response  = ai.get("response", "")
+    elapsed   = ai.get("elapsed_sec", 0)
+    prompt_ch = ai.get("prompt_chars", 0)
+    error     = ai.get("error", "")
 
     parts = ["<h2>🤖 AI 위협 분석</h2>"]
 
-    # 메타 정보
+    # 메타
     parts.append(
-        f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
+        f"<p style='color:#8b949e;font-size:.8rem;margin-bottom:1.2rem'>"
         f"모델: <code>{_e(model)}</code> &nbsp;|&nbsp; "
-        f"응답 시간: {elapsed}s &nbsp;|&nbsp; "
-        f"입력 길이: {prompt_ch:,}자"
+        f"응답 시간: {elapsed}s &nbsp;|&nbsp; 입력: {prompt_ch:,}자"
         f"</p>"
     )
 
-    # Ollama 미실행 / 미사용
     if not ai:
         parts.append(
             "<div class='alert alert-info'>"
@@ -3087,30 +3296,52 @@ def _ai_html(result) -> str:
         )
         return "\n".join(parts)
 
-    # 오류
     if error:
         parts.append(
             f"<div class='alert alert-warning'>"
             f"<strong>AI 분석 오류</strong><br>{_e(error)}<br><br>"
-            f"<strong>해결 방법:</strong><br>"
             f"1. <code>ollama serve</code> 실행 확인<br>"
             f"2. <code>ollama pull {_e(model)}</code> 로 모델 다운로드<br>"
-            f"3. <code>--no-ai</code> 옵션으로 AI 분석 비활성화 가능"
+            f"3. <code>--no-ai</code> 옵션으로 비활성화 가능"
             f"</div>"
         )
-        return "\n".join(parts)
+        if not response.strip():
+            return "\n".join(parts)
 
-    # 응답 없음
     if not response.strip():
         parts.append("<div class='alert alert-warning'>AI 응답이 비어있습니다.</div>")
         return "\n".join(parts)
 
-    # 응답 렌더링
-    parts.append(
-        "<div class='card' style='line-height:1.75;font-size:.88rem'>"
-        + _md_to_html(response)
-        + "</div>"
-    )
+    # 섹션 파싱 → 카드 렌더링
+    sections = _parse_ai_sections(response)
+
+    SECTION_ORDER = [
+        ("분석 분류",  _render_classification),
+        ("핵심 요약",  _render_summary),
+        ("실행 흐름",  _render_exec_flow),
+        ("행위 분석",  _render_behavioral),
+        ("결론",       _render_conclusion),
+    ]
+
+    rendered_any = False
+    for title, renderer in SECTION_ORDER:
+        body = sections.get(title, "")
+        if not body:
+            continue
+        parts.append(
+            f"<h3 style='color:#79c0ff;margin:1.4rem 0 .5rem;font-size:.95rem;"
+            f"letter-spacing:.02em'>{_e(title)}</h3>"
+        )
+        parts.append(renderer(body))
+        rendered_any = True
+
+    # 구조 파싱 실패 시 기존 마크다운 렌더링으로 fallback
+    if not rendered_any:
+        parts.append(
+            "<div class='card' style='line-height:1.75;font-size:.88rem'>"
+            + _md_to_html(response)
+            + "</div>"
+        )
 
     # 원문 접기
     parts.append(
