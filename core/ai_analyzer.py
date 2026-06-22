@@ -123,14 +123,102 @@ def _is_private_ip(ip: str) -> bool:
 _RENAME_DEST_RE = _re.compile(r'FileName:\s*([^,\r\n]+)', _re.IGNORECASE)
 
 
-# ── 프롬프트 빌더 ─────────────────────────────────────────────────────────────
+# ── 태그 사전 계산 ────────────────────────────────────────────────────────────
+
+_IP_CHECK_DOMAINS = frozenset({
+    "ip-api.com", "ipify.org", "api.ipify.org", "checkip.amazonaws.com",
+    "ipinfo.io", "myexternalip.com", "wtfismyip.com", "icanhazip.com",
+    "ipecho.net", "ifconfig.me", "api.myip.com",
+})
+
+_STEALER_IDS = frozenset({
+    "T1056", "T1539", "T1555", "T1552", "T1114", "T1113",
+})
+_EVASION_IDS = frozenset({
+    "T1497", "T1562", "T1036", "T1027", "T1070", "T1112",
+})
+_INJECT_IDS = frozenset({
+    "T1055", "T1055.001", "T1055.002", "T1055.003", "T1055.011", "T1055.012",
+})
+_PERSIST_IDS = frozenset({
+    "T1053", "T1547", "T1574", "T1543", "T1546", "T1505",
+})
+_EXFIL_IDS = frozenset({
+    "T1041", "T1048", "T1011", "T1020",
+})
+
+
+def _compute_tags(result) -> list[tuple[str, str]]:
+    """분석 결과에서 태그(tag, 근거) 목록을 사전 계산한다."""
+    tags: list[tuple[str, str]] = []
+    technique_ids: set[str] = set()
+
+    br = result.behavior_report
+    if br and getattr(br, "techniques", None):
+        for t in br.techniques:
+            tid = t.technique_id.split(".")[0]
+            technique_ids.add(t.technique_id)
+            technique_ids.add(tid)
+
+    # 실행 파일 언어/런타임 (프로세스명 기반)
+    new_procs = (result.process_diff or {}).get("new_processes", [])
+    proc_names = {getattr(p, "name", "").lower() for p in new_procs}
+    if any(n in proc_names for n in ("wscript.exe", "cscript.exe")):
+        tags.append(("vbs/js", "WScript 또는 CScript 실행 확인"))
+    if "powershell.exe" in proc_names or "pwsh.exe" in proc_names:
+        tags.append(("powershell", "PowerShell 실행 확인"))
+    if any(n in proc_names for n in ("msbuild.exe", "csc.exe")):
+        tags.append(("dotnet", ".NET 컴파일러/빌더 실행 확인"))
+
+    # 네트워크 기반
+    pcap = result.pcap_result
+    if pcap:
+        dns_names = {getattr(q, "name", "").lower() for q in getattr(pcap, "dns_queries", [])}
+        if dns_names & _IP_CHECK_DOMAINS:
+            matched = dns_names & _IP_CHECK_DOMAINS
+            tags.append(("ip-check", f"외부 IP 조회 도메인: {', '.join(sorted(matched)[:2])}"))
+        if getattr(pcap, "ftp_sessions", []):
+            tags.append(("ftp", f"FTP 세션 {len(pcap.ftp_sessions)}개 감지"))
+        if getattr(pcap, "smtp_sessions", []):
+            tags.append(("smtp", f"SMTP 세션 {len(pcap.smtp_sessions)}개 감지"))
+
+    # MITRE 기반
+    if technique_ids & _STEALER_IDS:
+        matched_ids = technique_ids & _STEALER_IDS
+        tags.append(("stealer", f"자격증명·데이터 탈취 기법: {', '.join(sorted(matched_ids)[:3])}"))
+    if technique_ids & _EVASION_IDS:
+        matched_ids = technique_ids & _EVASION_IDS
+        tags.append(("evasion", f"방어 회피 기법: {', '.join(sorted(matched_ids)[:3])}"))
+    if technique_ids & _INJECT_IDS:
+        matched_ids = technique_ids & _INJECT_IDS
+        tags.append(("injection", f"프로세스 인젝션 기법: {', '.join(sorted(matched_ids)[:3])}"))
+    if technique_ids & _PERSIST_IDS:
+        matched_ids = technique_ids & _PERSIST_IDS
+        tags.append(("persistence", f"지속성 기법: {', '.join(sorted(matched_ids)[:2])}"))
+    if technique_ids & _EXFIL_IDS:
+        matched_ids = technique_ids & _EXFIL_IDS
+        tags.append(("exfiltration", f"데이터 유출 기법: {', '.join(sorted(matched_ids)[:2])}"))
+
+    # 드롭 파일
+    ioc = result.ioc_report
+    if ioc and ioc.dropped_files:
+        tags.append(("dropper", f"파일 드롭 {len(ioc.dropped_files)}개"))
+
+    # 이메일/피싱 컨텍스트 (T1221 템플릿 인젝션 = 문서 기반 배포)
+    if "T1221" in technique_ids:
+        tags.append(("phishing", "문서 템플릿 인젝션 (T1221) — 이메일 기반 배포 가능성"))
+
+    return tags
+
+
+# ── 프롬프트 빌더 ────────────────────────────────────────────────────────────
 
 def _build_prompt(result) -> str:
-    """AnalysisResult → 행위 중심 분석 프롬프트."""
+    """AnalysisResult → 구조화된 위협 분석 프롬프트 (any.run 스타일)."""
     lines: list[str] = [
         "당신은 악성코드 동적 분석 전문가입니다.",
-        "아래 동적 분석 데이터를 바탕으로 **한국어**로 행위 기반 위협 분석을 수행하세요.",
-        "대응 권고는 작성하지 않습니다.",
+        "아래 동적 분석 데이터를 바탕으로 **한국어**로 구조화된 위협 분석 보고서를 작성하세요.",
+        "대응 권고는 절대 작성하지 않습니다. 확인된 사실만 기술하고 추측은 '추정' 표현을 사용하세요.",
         "",
     ]
 
@@ -466,38 +554,60 @@ def _build_prompt(result) -> str:
                         )
             lines.append("")
 
+    # ── 사전 계산 태그 힌트 ─────────────────────────────────────────────
+    computed_tags = _compute_tags(result)
+    if computed_tags:
+        lines.append("## 데이터 기반 탐지 태그 (힌트 — 보고서에 반영하세요)")
+        for tag, reason in computed_tags:
+            lines.append(f"- `{tag}`: {reason}")
+        lines.append("")
+
     # ── 분석 지시 ───────────────────────────────────────────────────────
     lines += [
         "---",
-        "위 분석 데이터를 바탕으로 **아래 4개 항목만** 한국어로 작성하세요.",
-        "각 항목은 마크다운 헤더(##)로 구분합니다. 대응 권고는 작성하지 않습니다.",
+        "위 분석 데이터를 바탕으로 **아래 5개 섹션**을 한국어로 작성하세요.",
+        "각 섹션은 ## 헤더로 구분하며, 확인된 사실만 기술합니다. 대응 권고는 포함하지 않습니다.",
         "",
-        "## 1. 악성코드 패밀리 추정",
-        "탐지 기법·네트워크 패턴·행동 특성을 근거로 패밀리 또는 악성 유형을 추정하세요.",
+        "## 분석 분류",
+        "- **위협 수준**: 악성 활동 / 의심 활동 / 정상 중 하나 + 한 줄 근거",
+        "- **주요 분석 대상**: 파일명과 실행 맥락 (예: 이메일 첨부, Temp 디렉토리 실행)",
+        "- **설명**: 한 문장 — 악성코드 패밀리명(추정), 핵심 기능, C2/유출 방식",
+        "- **태그 및 해석**: 위 힌트 태그를 포함하여 적합한 태그를 나열하고 각 태그의 근거를 한 줄로 설명",
+        "  (사용 가능 태그: golang / dotnet / vbs / js / powershell / ip-check / stealer /",
+        "  evasion / ftp / smtp / http / exfiltration / phishing / ransomware / rat /",
+        "  dropper / loader / persistence / injection)",
         "",
-        "## 2. 위협 수준 평가",
-        "**심각 / 높음 / 중간 / 낮음** 중 하나를 선택하고 핵심 근거를 2~3문장으로 서술하세요.",
+        "## 핵심 요약",
+        "2~3문장. 악성코드 패밀리(추정), 감염/실행 경로, 핵심 악성 행위를 간결하게 서술.",
         "",
-        "## 3. 행위 분석",
-        "프로세스·파일·레지스트리·네트워크 각 영역에서 확인된 핵심 악성 행위를",
-        "MITRE ATT&CK 기법(ID 포함)과 연결하여 설명하세요.",
-        "- **프로세스 행위:** (어떤 프로세스가 무엇을 실행했는지)",
-        "- **파일 행위:** (드롭·수정된 파일과 악성 의도)",
-        "- **레지스트리 행위:** (영속성·방어 회피·설정 변조 목적)",
-        "- **네트워크 행위:** (C2 통신·데이터 유출·정찰 패턴)",
+        "## 실행 흐름",
+        "확인된 행위를 단계별로 나열하세요. 각 단계 앞에 아래 레이블 중 하나를 붙이세요:",
+        "- [사용자 행위]: 사용자가 직접 유발한 단계 (파일 실행, 문서 열기 등)",
+        "- [준비 단계]: 악성코드 자체 스테이징 (파일 드롭, 환경 확인 등)",
+        "- [자율 실행]: 자동화된 악성 행위 (C2 통신, 데이터 유출, 인젝션 등)",
+        "단계가 명확하지 않으면 레이블 없이 '-' 항목으로 기술하세요.",
         "",
-        "## 4. C2 통신 패턴",
-        "확인된 외부 통신의 프로토콜·대상 주소·식별된 C2 인프라를 기술하세요.",
-        "해당 없으면 '활동 없음'으로 기재하세요.",
+        "## 행위 분석",
+        "아래 항목별로 분석하세요. 해당 행위가 관찰되지 않으면 '관찰되지 않음'으로 기재.",
+        "- **로더 / 스테이징**: 초기 실행 파일의 역할, 스테이징된 페이로드",
+        "- **실행 및 피벗 (LOLBin / 인터프리터)**: 시스템 도구 악용, 프로세스 체인",
+        "- **지속성**: 레지스트리·서비스·작업 스케줄러 기반 지속성",
+        "- **탐색 / 수집**: 시스템 정보·자격증명·파일 수집 행위",
+        "- **네트워크 / C2 / 유출**: C2 인프라, 프로토콜, 유출 데이터 유형",
+        "- **오류 / 크래시**: 실행 중 관찰된 예외 또는 실패",
+        "",
+        "## 결론",
+        "1~2문장. 최종 위협 판단, 공격자 의도, 잠재적 피해 범위.",
     ]
 
     prompt = "\n".join(lines)
     if len(prompt) > _MAX_PROMPT_CHARS:
-        cutoff = _MAX_PROMPT_CHARS - 300
+        cutoff = _MAX_PROMPT_CHARS - 400
         prompt = (
             prompt[:cutoff]
             + "\n\n(데이터 초과로 일부 생략됨)\n\n---\n"
-            "위 4개 항목만 한국어로 작성하세요. 대응 권고는 포함하지 마세요."
+            "위 5개 섹션(분석 분류 / 핵심 요약 / 실행 흐름 / 행위 분석 / 결론)을 "
+            "한국어로 작성하세요. 대응 권고는 포함하지 마세요."
         )
     return prompt
 
