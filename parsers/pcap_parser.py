@@ -206,6 +206,12 @@ class HTTPRequest:
     content_length: int  = 0
     referer:        str  = ""
     has_cookie:     bool = False
+    dst_ip:         str  = ""
+    dst_port:       int  = 80
+    content_type:   str  = ""    # 요청 Content-Type
+    authorization:  str  = ""    # Authorization 헤더 (토큰 유출 탐지)
+    extra_headers:  str  = ""    # 기타 주목할 헤더 (콤마 구분)
+    body_preview:   str  = ""    # 요청 바디 앞 512자
 
 
 @dataclass
@@ -630,9 +636,20 @@ _UA_RE        = re.compile(rb"^User-Agent:\s*(?P<v>[^\r\n]+)",     re.MULTILINE 
 _CL_RE        = re.compile(rb"^Content-Length:\s*(?P<v>\d+)",      re.MULTILINE | re.IGNORECASE)
 _REF_RE       = re.compile(rb"^Referer:\s*(?P<v>[^\r\n]+)",        re.MULTILINE | re.IGNORECASE)
 _COOKIE_RE    = re.compile(rb"^Cookie:\s*",                        re.MULTILINE | re.IGNORECASE)
+_CT_RE        = re.compile(rb"^Content-Type:\s*(?P<v>[^\r\n]+)",   re.MULTILINE | re.IGNORECASE)
+_AUTH_RE      = re.compile(rb"^Authorization:\s*(?P<v>[^\r\n]+)",  re.MULTILINE | re.IGNORECASE)
+_EXTRA_HDRS   = [
+    (re.compile(rb"^X-Forwarded-For:\s*(?P<v>[^\r\n]+)",  re.MULTILINE | re.IGNORECASE), "X-Forwarded-For"),
+    (re.compile(rb"^Accept-Language:\s*(?P<v>[^\r\n]+)",  re.MULTILINE | re.IGNORECASE), "Accept-Language"),
+    (re.compile(rb"^X-Api-Key:\s*(?P<v>[^\r\n]+)",        re.MULTILINE | re.IGNORECASE), "X-Api-Key"),
+]
 
 
-def _parse_http_raw(raw_bytes: bytes) -> Optional[HTTPRequest]:
+def _parse_http_raw(
+    raw_bytes: bytes,
+    dst_ip: str = "",
+    dst_port: int = 80,
+) -> Optional[HTTPRequest]:
     m = _HTTP_REQ_RE.search(raw_bytes)
     if not m:
         return None
@@ -649,11 +666,32 @@ def _parse_http_raw(raw_bytes: bytes) -> Optional[HTTPRequest]:
     cl_str  = _get(_CL_RE)
     cl      = int(cl_str) if cl_str.isdigit() else 0
     cookie  = bool(_COOKIE_RE.search(raw_bytes))
+    ct      = _get(_CT_RE)
+    auth    = _get(_AUTH_RE)
+
+    # 바디: 헤더 끝(\r\n\r\n 또는 \n\n) 이후
+    body_preview = ""
+    sep = raw_bytes.find(b"\r\n\r\n")
+    if sep == -1:
+        sep = raw_bytes.find(b"\n\n")
+    if sep != -1:
+        body_raw = raw_bytes[sep + 4:sep + 516]
+        body_preview = body_raw.decode(errors="replace").strip()[:512]
+
+    extra_parts = []
+    for pat, name in _EXTRA_HDRS:
+        v = _get(pat)
+        if v:
+            extra_parts.append(f"{name}: {v[:60]}")
 
     return HTTPRequest(
         method=method, host=host, path=path,
         user_agent=ua, content_length=cl,
         referer=referer, has_cookie=cookie,
+        dst_ip=dst_ip, dst_port=dst_port,
+        content_type=ct, authorization=auth,
+        extra_headers=", ".join(extra_parts),
+        body_preview=body_preview,
     )
 
 
@@ -859,10 +897,13 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
             continue
 
     # ── Pass 3: HTTP 요청 ─────────────────────────────────────────────
+    # display_filter 없이 tcp.dstport==80 전체를 가져와 HTTP 레이어 유무와 무관하게 파싱
     P3 = [
-        "ip.dst", "http.host", "http.request.method",
+        "ip.dst", "tcp.dstport",
+        "http.host", "http.request.method",
         "http.request.uri", "http.user_agent",
         "http.content_length", "http.referer",
+        "http.cookie", "http.content_type", "http.authorization",
     ]
     for row in _run_tshark_fields(
         tshark_path, pcap_path, P3, display_filter="http.request",
@@ -870,17 +911,23 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         try:
             def _h(i: int) -> str:
                 return row[i].strip() if i < len(row) else ""
-            method = _h(2)
+            method = _h(3)
             if not method:
                 continue
-            cl_str = _h(5)
+            cl_str = _h(6)
+            port_str = _h(1)
             http_list.append(HTTPRequest(
+                dst_ip=_h(0),
+                dst_port=int(port_str) if port_str.isdigit() else 80,
+                host=_h(2),
                 method=method,
-                host=_h(1),
-                path=_h(3),
-                user_agent=_h(4),
+                path=_h(4),
+                user_agent=_h(5),
                 content_length=int(cl_str) if cl_str.isdigit() else 0,
-                referer=_h(6),
+                referer=_h(7),
+                has_cookie=bool(_h(8)),
+                content_type=_h(9),
+                authorization=_h(10),
             ))
         except Exception:
             continue
@@ -1123,16 +1170,25 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         path   = (hl.Path   or b"").decode(errors="replace")
                         ua     = (hl.User_Agent or b"").decode(errors="replace")
                         cl     = int((hl.Content_Length or b"0").decode(errors="replace") or 0)
+                        ct     = (getattr(hl, "Content_Type", None) or b"").decode(errors="replace")
+                        auth   = (getattr(hl, "Authorization", None) or b"").decode(errors="replace")
+                        cookie = bool(getattr(hl, "Cookie", None))
+                        # 바디
+                        body_raw = bytes(pkt[Raw])[raw_bytes.find(b"\r\n\r\n") + 4:]
+                        body_preview = body_raw[:512].decode(errors="replace").strip()
                         http_list.append(HTTPRequest(
                             method=method, host=host, path=path,
                             user_agent=ua, content_length=cl,
+                            has_cookie=cookie, content_type=ct, authorization=auth,
+                            body_preview=body_preview,
+                            dst_ip=dst_ip, dst_port=dst_port,
                         ))
                     except Exception:
-                        req = _parse_http_raw(raw_bytes)
+                        req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
                         if req:
                             http_list.append(req)
                 else:
-                    req = _parse_http_raw(raw_bytes)
+                    req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
                     if req:
                         http_list.append(req)
 

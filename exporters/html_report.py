@@ -893,14 +893,22 @@ def _fmt_bytes(n: int) -> str:
 
 
 def _proc_cell(procs: list[str], reason: str = "") -> str:
-    """프로세스 목록 → <td> HTML. 빈 경우 회색 '-' 반환."""
+    """프로세스 목록 → <td> HTML. 빈 경우 미확인 배지 반환."""
     if procs:
         return "<td>" + "<br>".join(
             f"<span class='ev-process mono' style='font-size:0.72rem'>{_e(p)}</span>"
             for p in procs[:3]
         ) + "</td>"
-    title = f" title='{_e(reason)}'" if reason else ""
-    return f"<td style='color:#484f58;cursor:default'{title}>-</td>"
+    if reason:
+        # tooltip에 개행 표시를 위해 &#10; 사용
+        _tip = _e(reason).replace("\n", "&#10;")
+        return (
+            f"<td title='{_tip}' style='cursor:help'>"
+            f"<span style='color:#6e7681;font-size:.7rem;border:1px solid #30363d;"
+            f"border-radius:3px;padding:1px 4px'>미확인</span>"
+            f"</td>"
+        )
+    return "<td style='color:#484f58'>-</td>"
 
 
 def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
@@ -1146,9 +1154,15 @@ def _network_html(result) -> str:
                 )
             if not _conn_procs:
                 if not pnmap:
-                    _reason = "process_network_map 비어있음 (ProcMon Network 이벤트 없음)"
+                    _reason = "ProcMon Network 이벤트 없음 — ProcMon 필터에서 Network 카테고리 활성화 필요"
                 else:
-                    _reason = f"ip_proc_lookup에 '{_lookup_ip}' 없음 (pnmap={len(pnmap)}개)"
+                    # PCAP에는 있지만 ProcMon에 없는 연결 — 주요 원인 안내
+                    _reason = (
+                        f"ProcMon 미캡처 (pnmap={len(pnmap)}개)\n"
+                        "가능한 원인: ① 프로세스 인젝션 후 타 프로세스 명의로 통신 "
+                        "② WMI/COM을 통한 우회 통신 ③ 원시 소켓(Raw socket) 사용 "
+                        "④ ProcMon 시작 전 이미 연결 성립"
+                    )
             else:
                 _reason = ""
             rows.append(
@@ -1216,17 +1230,65 @@ def _network_html(result) -> str:
     if pcap and pcap.http_requests:
         _HTTP_LIMIT = 500
         rows = []
-        for r in pcap.http_requests[:_HTTP_LIMIT]:
+        for _hi, r in enumerate(pcap.http_requests[:_HTTP_LIMIT]):
+            # 프로세스 룩업: dst_ip 직접 사용 → hostname 역매핑 순서로 시도
             h_procs: list[str] = []
-            for hname in hostname_to_ips.get(r.host.lower(), []):
-                for p in ip_proc_lookup.get(hname, []):
-                    if p not in h_procs:
-                        h_procs.append(p)
+            _r_dst_ip = getattr(r, "dst_ip", "")
+            _r_dst_port = getattr(r, "dst_port", 80)
+            if _r_dst_ip:
+                h_procs = (
+                    proc_lookup.get(("TCP", _r_dst_ip, _r_dst_port), [])
+                    or ip_proc_lookup.get(_r_dst_ip, [])
+                )
+            if not h_procs:
+                for hname in hostname_to_ips.get(r.host.lower(), []):
+                    for p in ip_proc_lookup.get(hname, []):
+                        if p not in h_procs:
+                            h_procs.append(p)
+
+            # 상세 패널 (헤더 + 바디)
+            _detail_rows = []
+            if _r_dst_ip:
+                _detail_rows.append(f"<b>목적지</b> {_e(_r_dst_ip)}:{_r_dst_port}")
+            if r.referer:
+                _detail_rows.append(f"<b>Referer</b> {_e(r.referer[:120])}")
+            _r_ct = getattr(r, "content_type", "")
+            if _r_ct:
+                _detail_rows.append(f"<b>Content-Type</b> {_e(_r_ct)}")
+            _r_auth = getattr(r, "authorization", "")
+            if _r_auth:
+                _detail_rows.append(
+                    f"<b style='color:#ff7b72'>Authorization</b> "
+                    f"<span style='color:#ffa657'>{_e(_r_auth[:80])}</span>"
+                )
+            _r_extra = getattr(r, "extra_headers", "")
+            if _r_extra:
+                _detail_rows.append(f"<b>기타헤더</b> {_e(_r_extra[:120])}")
+            _r_body = getattr(r, "body_preview", "")
+            if _r_body:
+                _detail_rows.append(
+                    f"<b>Body</b><br><pre style='margin:.2rem 0 0;font-size:.72rem;"
+                    f"background:#0d1117;padding:.4rem;border-radius:4px;overflow-x:auto;"
+                    f"max-width:600px;white-space:pre-wrap'>{_e(_r_body[:512])}</pre>"
+                )
+
+            _detail_html = ""
+            if _detail_rows:
+                _detail_id = f"hreq-{_hi}"
+                _detail_html = (
+                    f"<details id='{_detail_id}' style='margin:.1rem 0'>"
+                    f"<summary style='font-size:.72rem;color:#8b949e;cursor:pointer'>상세 보기</summary>"
+                    f"<div style='font-size:.75rem;padding:.3rem .5rem;line-height:1.6'>"
+                    + "<br>".join(_detail_rows)
+                    + "</div></details>"
+                )
+
             rows.append(
                 f"<tr>"
                 f"<td>{_b(r.method,'orange')}</td>"
                 f"<td class='mono'>{_e(r.host)}</td>"
-                f"<td class='mono ev-network'>{_e(r.path[:80])}</td>"
+                f"<td class='mono ev-network' style='max-width:260px;word-break:break-all'>"
+                f"{_e(r.path[:100])}{_detail_html}</td>"
                 f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:60])}</td>"
                 f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
                 f"<td>{'🍪' if r.has_cookie else ''}</td>"
@@ -1236,8 +1298,8 @@ def _network_html(result) -> str:
         parts.append(
             "<h3>HTTP 요청</h3>"
             + _trunc_notice(len(pcap.http_requests), _HTTP_LIMIT)
-            + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
-            "<th>User-Agent</th><th>Body</th><th>Cookie</th><th>프로세스</th></tr>"
+            + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로 / 상세</th>"
+            "<th>User-Agent</th><th>Body크기</th><th>Cookie</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )
 
