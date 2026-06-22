@@ -24,7 +24,7 @@ from pathlib import Path
 OLLAMA_BASE_URL  = "http://localhost:11434"
 DEFAULT_MODEL    = "qwen2.5:7b"
 # qwen2.5:7b num_ctx=8192, num_predict=2048 → 입력 여유 ~6000토큰 ≈ 12000 한국어 자
-_MAX_PROMPT_CHARS = 10000
+_MAX_PROMPT_CHARS = 6000
 
 
 # ── 결과 ─────────────────────────────────────────────────────────────────────
@@ -522,7 +522,7 @@ def _call_ollama(
         "options": {
             "temperature": 0.2,
             "num_ctx":     8192,
-            "num_predict": 2048,
+            "num_predict": 1024,   # CPU 환경에서 완료 가능한 길이
         },
     }).encode("utf-8")
 
@@ -532,23 +532,30 @@ def _call_ollama(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    # chunk_timeout: 토큰 간 최대 대기 시간 (전체 timeout과 별개)
-    chunk_timeout = min(timeout, 120)
+    # timeout: prefill(입력처리) + 생성 전 구간 모두 포함한 소켓 대기
+    # CPU 추론 시 prefill이 120s를 초과할 수 있으므로 전체 timeout 적용
     parts: list[str] = []
-    with urllib.request.urlopen(req, timeout=chunk_timeout) as resp:
-        for raw_line in resp:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                chunk = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            token = chunk.get("response", "")
-            if token:
-                parts.append(token)
-            if chunk.get("done"):
-                break
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                token = chunk.get("response", "")
+                if token:
+                    parts.append(token)
+                if chunk.get("done"):
+                    break
+    except TimeoutError:
+        if parts:
+            # 부분 응답이 있으면 그대로 반환 (타임아웃 주석 추가)
+            parts.append("\n\n*(타임아웃으로 분석이 중단되었습니다)*")
+        else:
+            raise
     return "".join(parts)
 
 
