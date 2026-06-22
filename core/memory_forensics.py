@@ -363,17 +363,25 @@ class VolatilityRunner:
         # JSON은 stdout에 있고 진행/오류 로그는 stderr에 출력됨
         out = r.stdout.strip()
         if not out:
-            stderr_tail = (r.stderr or "")[-600:].strip()
-            _sym_kws = ("symbol", "could not find", "isf", "unsatisfied", "automagic", "no module")
-            if stderr_tail and any(k in stderr_tail.lower() for k in _sym_kws):
+            stderr_tail = (r.stderr or "")[-800:].strip()
+            # Volatility3가 "다운로드 실패"로 확정되는 패턴만 감지
+            # "automagic" 등 정상 로그 키워드는 포함하지 않음
+            _hard_fail_kws = (
+                "unsatisfied requirement",
+                "requirements are not satisfied",
+                "could not find a pdb",
+                "no suitable address space mapping",
+                "failed to download",
+            )
+            if stderr_tail and any(k in stderr_tail.lower() for k in _hard_fail_kws):
                 raise RuntimeError(
                     f"{plugin}: 심볼 파일 없음 — "
-                    "`vol -f memory.raw windows.info` 로 심볼 자동 다운로드\n"
-                    + stderr_tail[-300:]
+                    "`vol -f <dump> windows.info` 실행 시 자동 다운로드\n"
+                    + stderr_tail[-400:]
                 )
             raise RuntimeError(
                 f"{plugin}: 출력 없음"
-                + (f"\n[stderr] {stderr_tail}" if stderr_tail else "")
+                + (f"\n[stderr] {stderr_tail[-400:]}" if stderr_tail else "")
             )
 
         # stdout에서 첫 번째 유효한 JSON 위치 탐색
@@ -388,17 +396,24 @@ class VolatilityRunner:
             return self._normalize(parsed)
 
         # 어떤 위치에서도 유효한 JSON 없음 → stderr 에서 원인 추출
-        stderr_tail = (r.stderr or "")[-600:].strip()
-        _sym_kws = ("symbol", "could not find", "isf", "unsatisfied", "automagic", "no module")
-        if stderr_tail and any(k in stderr_tail.lower() for k in _sym_kws):
+        stderr_tail = (r.stderr or "")[-800:].strip()
+        _hard_fail_kws = (
+            "unsatisfied requirement",
+            "requirements are not satisfied",
+            "could not find a pdb",
+            "no suitable address space mapping",
+            "failed to download",
+        )
+        if stderr_tail and any(k in stderr_tail.lower() for k in _hard_fail_kws):
             raise RuntimeError(
                 f"{plugin}: 심볼 파일 없음 — "
-                "`vol -f memory.raw windows.info` 로 심볼 자동 다운로드\n"
-                + stderr_tail[-300:]
+                "`vol -f <dump> windows.info` 실행 시 자동 다운로드\n"
+                + stderr_tail[-400:]
             )
         raise RuntimeError(
-            f"{plugin}: stdout에 JSON 없음 ({out[:120]})"
-            + (f"\n[stderr] {stderr_tail[:300]}" if stderr_tail else "")
+            f"{plugin}: stdout에 JSON 없음\n"
+            f"  stdout: {out[:200]}\n"
+            f"  stderr: {stderr_tail[-300:]}"
         )
 
     def _col(self, data: dict, row: list, col_name: str, default="") -> str:
@@ -669,21 +684,35 @@ def run_memory_forensics(
     )
 
     # 심볼 사전 확인 — 첫 실행 시 kernel PDB를 자동 다운로드.
+    # 다운로드 시간을 고려해 plugin_timeout보다 긴 타임아웃 사용.
     # 병렬 플러그인 실행 전에 완료해야 심볼 다운로드 경합이 없다.
-    _st("[메모리] 심볼 파일 확인 중 (첫 실행 시 자동 다운로드, 최대 5분)...")
+    _warmup_timeout = max(plugin_timeout, dump_timeout, 600)
+    runner.timeout = _warmup_timeout
+    _st(f"[메모리] 심볼 파일 확인 중 (자동 다운로드 포함, 최대 {_warmup_timeout}s)...")
     _sym_ok, _sym_info = runner.warmup()
+    runner.timeout = plugin_timeout   # 이후 플러그인은 원래 타임아웃 복원
+
     if _sym_ok:
         _st(f"      OS: {_sym_info}")
     else:
-        _sym_kws = ("심볼", "symbol", "isf", "could not find",
-                    "unsatisfied", "automagic", "no module")
-        if any(k in _sym_info.lower() for k in _sym_kws):
-            # 심볼 설치 경로 안내
-            _install_hint = str(_sym_path or (
+        # 실제 원인을 보여줘서 진단 가능하게 함
+        _st(f"      [경고] windows.info 실패: {_sym_info[:300]}")
+        result.plugin_errors["windows.info"] = _sym_info
+
+        # 심볼 파일 완전 부재가 확실한 경우만 조기 종료
+        # ("automagic" 등 정상 로그 키워드로 오탐하지 않음)
+        _hard_fail = (
+            "unsatisfied requirement" in _sym_info.lower()
+            or "requirements are not satisfied" in _sym_info.lower()
+            or "could not find a pdb" in _sym_info.lower()
+            or "no suitable address space mapping" in _sym_info.lower()
+        )
+        if _hard_fail and not _sym_path:
+            _install_hint = str(
                 Path(vol_cmd[-1]).parent / "volatility3" / "symbols"
                 if vol_cmd and Path(vol_cmd[-1]).suffix == ".py"
                 else Path(r"C:\Tools\volatility3\volatility3\symbols")
-            ))
+            )
             result.error = (
                 "Volatility3 심볼 파일 없음\n"
                 "해결 방법:\n"
@@ -692,11 +721,10 @@ def run_memory_forensics(
                 f"  → 압축 해제한 windows/ 폴더를 {_install_hint}\\windows\\ 에 복사\n"
                 "  또는: python analyzer.py ... --vol-symbols <압축해제경로>"
             )
-            result.plugin_errors["windows.info"] = _sym_info
-            _st(f"      [오류] 심볼 파일 없음 — {_install_hint}\\windows\\ 에 심볼 복사 필요")
+            _st(f"      [오류] 심볼 파일 없음 (확정) — 플러그인 실행 건너뜀")
             return result
-        # 심볼 문제가 아닌 경미한 오류 → 경고만 하고 계속 진행
-        _st(f"      [경고] windows.info: {_sym_info[:120]}")
+        # 불확실한 오류(타임아웃, 기타) → 플러그인 계속 시도
+        _st("      플러그인 실행을 계속 시도합니다...")
 
     _st("[메모리] Volatility3 플러그인 실행 중 (병렬)...")
     t_vol = time.monotonic()
