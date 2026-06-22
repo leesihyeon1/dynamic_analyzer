@@ -1324,13 +1324,17 @@ def _network_html(result) -> str:
                     + "</div></details>"
                 )
 
+            # 호버시 전체 URL 복사가 가능하도록 title 속성에 full URL 포함
+            _full_url = f"http://{r.host}{r.path}"
+            _path_display = _e(r.path[:300]) or "/"
             rows.append(
                 f"<tr>"
                 f"<td>{_b(r.method,'orange')}</td>"
                 f"<td class='mono'>{_e(r.host)}</td>"
-                f"<td class='mono ev-network' style='max-width:260px;word-break:break-all'>"
-                f"{_e(r.path[:100])}{_detail_html}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:60])}</td>"
+                f"<td class='mono ev-network' style='word-break:break-all;min-width:180px'>"
+                f"<span title='{_e(_full_url)}'>{_path_display}</span>"
+                f"{_detail_html}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:80])}</td>"
                 f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
                 f"<td>{'🍪' if r.has_cookie else ''}</td>"
                 + _proc_cell(h_procs) +
@@ -1339,7 +1343,7 @@ def _network_html(result) -> str:
         parts.append(
             "<h3>HTTP 요청</h3>"
             + _trunc_notice(len(pcap.http_requests), _HTTP_LIMIT)
-            + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로 / 상세</th>"
+            + "<table id='tbl-net-http'><tr><th>메서드</th><th>호스트</th><th>경로</th>"
             "<th>User-Agent</th><th>Body크기</th><th>Cookie</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )

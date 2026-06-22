@@ -264,6 +264,26 @@ def _build_prompt(result) -> str:
             lines.append(f"- {name} (PID {pid}): {_trunc(cmd, 120)}")
         lines.append("")
 
+    # ── 지속성/실행 아티팩트 ─────────────────────────────────────────────
+    # schtasks, sc, reg 등의 전체 명령줄을 별도 섹션으로 표시
+    # → AI가 /tn, /tr, /sc 등 지속성 파라미터를 직접 인용할 수 있도록
+    _PERSIST_NAMES = frozenset({
+        "schtasks.exe", "sc.exe", "reg.exe", "at.exe",
+        "regsvr32.exe", "mshta.exe",
+    })
+    persist_procs = [
+        p for p in new_procs
+        if getattr(p, "name", "").lower() in _PERSIST_NAMES
+    ]
+    if persist_procs:
+        lines.append(f"## 지속성/실행 아티팩트 ({len(persist_procs)}건)")
+        for p in persist_procs:
+            pname = getattr(p, "name", "?")
+            ppid  = getattr(p, "pid", "?")
+            cmd   = " ".join(getattr(p, "cmdline", []) or []) or getattr(p, "exe", "")
+            lines.append(f"- {pname} (PID {ppid}): {_trunc(cmd, 220)}")
+        lines.append("")
+
     # pe-sieve / hollows-hunter 인젝션
     pe_list = getattr(result, "pe_sieve_results", []) or []
     pe_susp = [r for r in pe_list if not getattr(r, "error", "") and getattr(r, "suspicious", 0) > 0]
@@ -446,13 +466,23 @@ def _build_prompt(result) -> str:
         http = getattr(pcap, "http_requests", []) or []
         if http:
             net_lines.append(f"### HTTP 요청 ({len(http)}건)")
-            for h in http[:10]:
-                method = getattr(h, "method", "")
-                host   = getattr(h, "host", "")
-                path   = getattr(h, "path", "/")
-                ua     = getattr(h, "user_agent", "")
-                ua_str = f" (UA: {_trunc(ua, 40)})" if ua else ""
-                net_lines.append(f"- {method} http://{host}{_trunc(path, 60)}{ua_str}")
+            for h in http[:15]:
+                method   = getattr(h, "method", "")
+                host     = getattr(h, "host", "")
+                path     = getattr(h, "path", "/")
+                ua       = getattr(h, "user_agent", "")
+                dst_ip   = getattr(h, "dst_ip", "")
+                body_len = getattr(h, "content_length", 0)
+                # 프로세스 귀속: dst_ip → pnmap 역조회
+                h_procs  = ip_proc.get(dst_ip, [])
+                proc_str = f" [{', '.join(h_procs[:2])}]" if h_procs else ""
+                ua_str   = f" UA:{_trunc(ua, 35)}" if ua else ""
+                # POST body 크기 표시 (C2 유출 크기 파악)
+                body_str = f" body:{_fmt_bytes(body_len)}" if (method == "POST" and body_len) else ""
+                net_lines.append(
+                    f"- {method} http://{host}{_trunc(path, 120)}"
+                    f"{body_str}{ua_str}{proc_str}"
+                )
 
         smtp_sessions = getattr(pcap, "smtp_sessions", []) or []
         if smtp_sessions:
