@@ -247,7 +247,7 @@ class VolatilityRunner:
         """플러그인 실행 → JSON dict 반환. 실패 시 RuntimeError 발생."""
         cmd = self.vol_cmd + [
             "-f", str(self.dump_path),
-            "--output", "json",
+            "-r", "json",   # Volatility3 렌더러 플래그 (--output은 출력 파일 경로로 해석됨)
             plugin,
         ]
         if extra:
@@ -271,17 +271,17 @@ class VolatilityRunner:
         # JSON은 stdout에 있고 진행/오류 로그는 stderr에 출력됨
         out = r.stdout.strip()
         if not out:
-            stderr_tail = (r.stderr or "")[-400:].strip()
-            # 심볼 파일 없음 메시지를 특별 처리
-            if stderr_tail and ("symbol" in stderr_tail.lower()
-                                or "Could not find" in stderr_tail
-                                or "ISF" in stderr_tail):
+            stderr_tail = (r.stderr or "")[-600:].strip()
+            _sym_kws = ("symbol", "could not find", "isf", "unsatisfied", "automagic", "no module")
+            if stderr_tail and any(k in stderr_tail.lower() for k in _sym_kws):
                 raise RuntimeError(
-                    f"{plugin}: 심볼 파일 없음 — Volatility3 ISF 설치 필요\n{stderr_tail[-200:]}"
+                    f"{plugin}: 심볼 파일 없음 — "
+                    "`vol -f memory.raw windows.info` 로 심볼 자동 다운로드\n"
+                    + stderr_tail[-300:]
                 )
             raise RuntimeError(
                 f"{plugin}: 출력 없음"
-                + (f"\n{stderr_tail}" if stderr_tail else "")
+                + (f"\n[stderr] {stderr_tail}" if stderr_tail else "")
             )
 
         # 첫 번째 '{' 또는 '[' 위치 찾기 (앞에 로그 라인이 섞일 수 있음)
@@ -291,7 +291,20 @@ class VolatilityRunner:
                     return json.loads(out[i:])
                 except json.JSONDecodeError as e:
                     raise RuntimeError(f"{plugin}: JSON 파싱 오류 — {e}")
-        raise RuntimeError(f"{plugin}: stdout에 JSON 없음 ({out[:80]}…)")
+
+        # JSON 없음 — stderr에서 실제 원인 추출
+        stderr_tail = (r.stderr or "")[-600:].strip()
+        _sym_kws = ("symbol", "could not find", "isf", "unsatisfied", "automagic", "no module")
+        if stderr_tail and any(k in stderr_tail.lower() for k in _sym_kws):
+            raise RuntimeError(
+                f"{plugin}: 심볼 파일 없음 — "
+                "`vol -f memory.raw windows.info` 로 심볼 자동 다운로드\n"
+                + stderr_tail[-300:]
+            )
+        raise RuntimeError(
+            f"{plugin}: stdout에 JSON 없음 ({out[:120]})"
+            + (f"\n[stderr] {stderr_tail[:300]}" if stderr_tail else "")
+        )
 
     def _col(self, data: dict, row: list, col_name: str, default="") -> str:
         """컬럼 이름으로 row 값 조회."""
