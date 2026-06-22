@@ -1182,15 +1182,23 @@ def _network_html(result) -> str:
                 for p in ip_proc_lookup.get(rip, []):
                     if p not in dns_procs:
                         dns_procs.append(p)
+            # 의심 배지 조합
+            susp_badges = ""
+            if q.suspicious:
+                susp_badges += _b("DGA?", "red")
+            if getattr(q, "is_ddns", False):
+                susp_badges += _b("DDNS", "orange")
+            if getattr(q, "no_response", False):
+                susp_badges += _b("응답없음", "yellow")
             rows.append(
                 f"<tr>"
-                f"<td class='mono {'ev-network' if not q.suspicious else ''}"
-                f"' style='{'color:#ff7b72' if q.suspicious else ''}'>{_e(q.name)}</td>"
+                f"<td class='mono {'ev-network' if not (q.suspicious or getattr(q,'is_ddns',False)) else ''}"
+                f"' style='{'color:#ff7b72' if q.suspicious else ('color:#ffa657' if getattr(q,\"is_ddns\",False) else '')}'>{_e(q.name)}</td>"
                 f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
                 f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
                 f"<td class='mono' style='color:#56d364;font-size:0.72rem'>"
-                f"{_e(', '.join(q.response_ips[:3]))}</td>"
-                f"{'<td>' + _b('DGA?','red') + '</td>' if q.suspicious else '<td></td>'}"
+                f"{'<span style=\"color:#8b949e;font-size:.72rem\">—</span>' if not q.response_ips else _e(', '.join(q.response_ips[:3]))}</td>"
+                f"<td>{susp_badges}</td>"
                 + _proc_cell(dns_procs) +
                 f"</tr>"
             )

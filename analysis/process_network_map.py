@@ -47,6 +47,18 @@ _ARROW_RE = re.compile(
 # 단독 "host:port" 형태 파싱
 _SINGLE_RE = re.compile(r'([\w\.\-\:\[\]]+):(\d+)')
 
+# 분석 환경 도구 — process_network_map에서 제외하여 노이즈 방지
+_ANALYSIS_TOOL_PROCESSES: frozenset[str] = frozenset({
+    "procmon.exe", "procmon64.exe", "procmon64a.exe",
+    "systeminformer.exe", "processhacker.exe", "procexp.exe", "procexp64.exe",
+    "hollows_hunter.exe", "pe-sieve64.exe", "pe-sieve32.exe",
+    "wireshark.exe", "tshark.exe", "dumpcap.exe",
+    "fakenet.exe", "fakenet-ng.exe",
+    "x64dbg.exe", "x32dbg.exe", "windbg.exe", "ollydbg.exe",
+    "picpick.exe", "greenshot.exe", "sharex.exe",
+    "ida.exe", "ida64.exe", "idaq.exe", "idaq64.exe",
+})
+
 # 아웃바운드 판정 오퍼레이션
 _OUTBOUND_OPS: frozenset[str] = frozenset({
     "TCP Connect", "TCP Send", "TCP Reconnect",
@@ -77,8 +89,36 @@ def _parse_path(path: str) -> tuple[str | None, int | None, str | None, int | No
     return None, None, None, None
 
 
+_LOCAL_HOSTNAME_SUFFIXES = (".local", ".localdomain", ".lan", ".internal", ".home", ".corp")
+_LOCAL_HOSTNAME_EXACT   = frozenset({"localhost", "::1", "broadcasthost"})
+
+def _is_local_hostname(s: str) -> bool:
+    """ProcMon이 로컬 IP를 호스트명으로 해석한 경우를 탐지한다.
+
+    예: DESKTOP-T7RA2LH.localdomain, WIN-ABC.local, localhost 등
+    """
+    if not s:
+        return False
+    sl = s.lower()
+    if sl in _LOCAL_HOSTNAME_EXACT:
+        return True
+    for sfx in _LOCAL_HOSTNAME_SUFFIXES:
+        if sl.endswith(sfx):
+            return True
+    # 점 없는 단일 레이블이면 로컬 hostname (예: DESKTOP-T7RA2LH)
+    if "." not in sl:
+        try:
+            int(sl)   # 숫자만이면 IP 단편 → 로컬 아님
+            return False
+        except ValueError:
+            return True  # 문자 단일레이블 = 로컬 hostname
+    return False
+
+
 def _is_private(ip: str) -> bool:
-    """RFC1918 / 루프백 / 링크로컬 주소 여부 판별."""
+    """RFC1918 / 루프백 / 링크로컬 / 로컬 호스트명 여부 판별."""
+    if _is_local_hostname(ip):
+        return True
     try:
         parts = ip.split(".")
         if len(parts) != 4:
@@ -125,6 +165,8 @@ def build_process_network_map(
     for ev in events:
         if ev.category != EventCategory.NETWORK:
             continue
+        if ev.process.lower() in _ANALYSIS_TOOL_PROCESSES:
+            continue  # 분석 도구 자체 네트워크 활동 제외
 
         op = ev.operation
         if op in _OUTBOUND_OPS:

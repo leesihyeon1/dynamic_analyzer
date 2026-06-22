@@ -150,6 +150,24 @@ _QTYPE_MAP: dict[int, str] = {
     33: "SRV", 255: "ANY",
 }
 
+# 동적 DNS(DDNS) 서비스 suffix — C2 인프라로 자주 악용됨
+_DDNS_SUFFIXES: tuple[str, ...] = (
+    ".dynamic-dns.net", ".no-ip.org", ".no-ip.com", ".no-ip.biz",
+    ".no-ip.info", ".ddns.net", ".ddns.org", ".dyndns.org",
+    ".dyndns.com", ".dyndns.tv", ".dyndns.info", ".duckdns.org",
+    ".changeip.com", ".changeip.net", ".dnsdynamic.org",
+    ".hopto.org", ".zapto.org", ".sytes.net", ".bounceme.net",
+    ".redirectme.net", ".servebeer.com", ".serveblog.net",
+    ".myddns.me", ".myftp.org", ".myftp.biz", ".serveftp.com",
+    ".3utilities.com", ".blogdns.com", ".gotdns.ch",
+    ".mooo.com", ".freedns.afraid.org",
+)
+
+
+def _is_ddns_domain(domain: str) -> bool:
+    d = domain.lower().rstrip(".")
+    return any(d.endswith(s) for s in _DDNS_SUFFIXES)
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -175,6 +193,8 @@ class DNSQuery:
     response_ips: list[str] = field(default_factory=list)  # A/AAAA 응답 IP
     entropy:      float = 0.0    # 서브도메인 Shannon 엔트로피
     suspicious:   bool  = False  # DGA 의심 or 터널링 의심
+    is_ddns:      bool  = False  # DDNS 서비스 도메인 여부
+    no_response:  bool  = False  # DNS 응답 없음 (C2 오프라인 등)
 
 
 @dataclass
@@ -800,6 +820,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
                     ent    = _subdomain_entropy(dns_name)
                     dns_seen[dns_name] = DNSQuery(
                         name=dns_name, qtype=qtype, entropy=round(ent, 3),
+                        is_ddns=_is_ddns_domain(dns_name),
                     )
 
             # TLS SNI + JA3 (tshark 내장 계산값 사용)
@@ -865,6 +886,11 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
             continue
 
     # ── 공통 후처리 ──────────────────────────────────────────────────
+    # no_response 플래그: A/AAAA 쿼리인데 응답 IP가 없는 경우
+    for q in dns_seen.values():
+        if q.qtype in ("A", "AAAA") and not q.response_ips:
+            q.no_response = True
+
     suspicious_domains: list[str] = []
     for name, q in dns_seen.items():
         if (q.entropy >= DGA_ENTROPY_THRESHOLD
@@ -1036,6 +1062,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                                 dns_seen[name] = DNSQuery(
                                     name=name, qtype=qtype_str,
                                     entropy=round(ent, 3),
+                                    is_ddns=_is_ddns_domain(name),
                                 )
                     except Exception:
                         pass
@@ -1128,6 +1155,11 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     # --- DNS 응답 IP 병합 ---
     for name, q in dns_seen.items():
         q.response_ips = list(set(dns_responses.get(name, [])))
+
+    # --- no_response 플래그: A/AAAA 쿼리인데 응답 없음 (C2 오프라인 등) ---
+    for q in dns_seen.values():
+        if q.qtype in ("A", "AAAA") and not q.response_ips:
+            q.no_response = True
 
     # --- DGA / 의심 도메인 판정 ---
     suspicious_domains = []

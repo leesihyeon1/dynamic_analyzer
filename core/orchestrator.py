@@ -161,6 +161,7 @@ def _scan_procmon_once(
     from analysis.process_network_map import (
         ProcNetConnection,
         _OUTBOUND_OPS, _INBOUND_OPS, _parse_path, _is_private,
+        _ANALYSIS_TOOL_PROCESSES,
     )
 
     inject_pids: set[int] = set()
@@ -178,6 +179,8 @@ def _scan_procmon_once(
 
         # ── 네트워크 맵 (TCP/UDP outbound/inbound) ───────────────────
         elif cat == EventCategory.NETWORK:
+            if ev.process.lower() in _ANALYSIS_TOOL_PROCESSES:
+                continue
             op = ev.operation
             if op in _OUTBOUND_OPS:
                 direction = "outbound"
