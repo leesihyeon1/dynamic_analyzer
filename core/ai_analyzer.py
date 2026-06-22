@@ -510,13 +510,17 @@ def _call_ollama(
     model:    str,
     timeout:  int,
 ) -> str:
-    """Ollama /api/generate (non-streaming) 호출 → 응답 텍스트."""
+    """Ollama /api/generate 스트리밍 호출 → 응답 텍스트.
+
+    stream=True 로 토큰을 하나씩 수신하므로 소켓 타임아웃(per-read)에
+    영향받지 않아 대형 모델(14b+)에서도 타임아웃이 발생하지 않는다.
+    """
     payload = json.dumps({
         "model":  model,
         "prompt": prompt,
-        "stream": False,
+        "stream": True,
         "options": {
-            "temperature": 0.2,   # 낮은 온도 → 사실 기반 일관된 분석
+            "temperature": 0.2,
             "num_ctx":     8192,
             "num_predict": 2048,
         },
@@ -528,11 +532,24 @@ def _call_ollama(
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8")
-
-    data = json.loads(body)
-    return data.get("response", "")
+    # chunk_timeout: 토큰 간 최대 대기 시간 (전체 timeout과 별개)
+    chunk_timeout = min(timeout, 120)
+    parts: list[str] = []
+    with urllib.request.urlopen(req, timeout=chunk_timeout) as resp:
+        for raw_line in resp:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            token = chunk.get("response", "")
+            if token:
+                parts.append(token)
+            if chunk.get("done"):
+                break
+    return "".join(parts)
 
 
 # ── 공개 API ─────────────────────────────────────────────────────────────────
