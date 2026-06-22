@@ -279,7 +279,7 @@ class AnalysisConfig:
     use_ai:       bool = True               # Ollama AI 분석 사용
     ai_model:     str  = "qwen2.5:7b"      # Ollama 모델 이름
     ollama_url:   str  = "http://localhost:11434"
-    ai_timeout:   int  = 300               # AI 응답 타임아웃 (초)
+    ai_timeout:   int  = 600               # AI 응답 타임아웃 (초)
 
 
 @dataclass

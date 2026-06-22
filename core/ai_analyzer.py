@@ -525,7 +525,7 @@ class OllamaAnalyzer:
     def analyze(
         self,
         result,
-        timeout: int = 300,
+        timeout: int = 600,
     ) -> AiAnalysisResult:
         """AnalysisResult → AiAnalysisResult."""
         ai = AiAnalysisResult(model=self.model)

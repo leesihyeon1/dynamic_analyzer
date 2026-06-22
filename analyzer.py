@@ -241,8 +241,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Ollama 모델 이름 (기본 qwen2.5:7b)")
     ag.add_argument("--ollama-url", metavar="URL", default="http://localhost:11434",
                     help="Ollama 서버 URL (기본 http://localhost:11434)")
-    ag.add_argument("--ai-timeout", type=int, default=300, metavar="SEC",
-                    help="AI 응답 타임아웃 초 (기본 300)")
+    ag.add_argument("--ai-timeout", type=int, default=600, metavar="SEC",
+                    help="AI 응답 타임아웃 초 (기본 600)")
 
     # 유틸리티
     p.add_argument("--check-tools",      action="store_true", help="도구 설치 상태 확인 후 종료")
@@ -359,7 +359,7 @@ def main() -> None:
         use_ai            = not getattr(args, "no_ai", False),
         ai_model          = getattr(args, "ai_model", "qwen2.5:7b"),
         ollama_url        = getattr(args, "ollama_url", "http://localhost:11434"),
-        ai_timeout        = getattr(args, "ai_timeout", 300),
+        ai_timeout        = getattr(args, "ai_timeout", 600),
     )
 
     def on_status(msg: str) -> None:
