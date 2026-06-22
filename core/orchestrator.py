@@ -275,6 +275,7 @@ class AnalysisConfig:
     use_memdump:      bool = False        # 물리 메모리 덤프 + Volatility3 실행
     winpmem_path:     Optional[str] = None
     volatility_path:  Optional[str] = None
+    vol_symbols_path: Optional[str] = None   # Volatility3 심볼 디렉터리 (오프라인용)
     dump_timeout:     int  = 600          # 메모리 덤프 타임아웃 (초)
     vol_plugin_timeout: int = 300         # 플러그인당 타임아웃 (초)
     existing_dump:    Optional[str] = None  # 기존 덤프 재사용
@@ -1190,6 +1191,7 @@ def run_analysis(
                 on_status=status,
                 skip_dump=bool(_mem_dump),
                 existing_dump=_mem_dump,
+                symbols_path=getattr(config, "vol_symbols_path", None),
             )
             result.mem_forensics = memforensics_to_dict(mem_result)
             if mem_result.error:

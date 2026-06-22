@@ -57,6 +57,14 @@ _VOL3_CANDIDATES: list[Path] = [
 
 _VOL3_SCRIPT_NAMES = ("vol", "vol.exe", "vol3", "vol3.exe", "vol.py")
 
+# Volatility3 심볼 디렉터리 고정 후보 경로 (windows/ 하위 폴더가 존재해야 함)
+_SYMBOLS_DIR_CANDIDATES: list[Path] = [
+    Path(r"C:\Tools\volatility3\volatility3\symbols"),
+    Path(r"C:\Tools\volatility3\symbols"),
+    Path(r"C:\volatility3\volatility3\symbols"),
+    Path(r"C:\volatility3\symbols"),
+]
+
 
 # ── 도구 탐색 ─────────────────────────────────────────────────────────────
 
@@ -75,6 +83,53 @@ def find_winpmem() -> Optional[Path]:
             return c
     found = shutil.which("DumpIt.exe") or shutil.which("DumpIt")
     return Path(found) if found else None
+
+
+def find_local_symbols(vol_cmd: list[str]) -> Optional[Path]:
+    """
+    Volatility3 심볼 디렉터리 자동 탐색.
+
+    반환값: ``windows/`` 하위 폴더에 ``*.json.xz`` 또는 ``*.json`` 파일이
+    있는 심볼 루트 디렉터리(``windows/``의 부모).  없으면 None.
+
+    탐색 순서:
+      1. VOLATILITY_SYMBOLS 환경변수
+      2. vol.py 위치 기반 (volatility3/symbols 또는 symbols)
+      3. 알려진 고정 경로
+      4. pip 설치 패키지 내 symbols
+    """
+    candidates: list[Path] = []
+
+    # 1. 환경변수
+    env_sym = os.environ.get("VOLATILITY_SYMBOLS")
+    if env_sym:
+        candidates.append(Path(env_sym))
+
+    # 2. vol.py / vol.exe 경로 기반
+    for c in vol_cmd:
+        p = Path(c)
+        if p.suffix in (".py",) or p.stem in ("vol", "vol3"):
+            candidates.append(p.parent / "volatility3" / "symbols")
+            candidates.append(p.parent / "symbols")
+
+    # 3. 고정 경로
+    candidates.extend(_SYMBOLS_DIR_CANDIDATES)
+
+    # 4. pip 설치 패키지
+    try:
+        import volatility3 as _v3
+        candidates.append(Path(_v3.__file__).parent / "symbols")
+    except Exception:
+        pass
+
+    for sym_dir in candidates:
+        win_dir = sym_dir / "windows"
+        if win_dir.is_dir() and (
+            any(win_dir.glob("*.json.xz")) or any(win_dir.glob("*.json"))
+        ):
+            return sym_dir
+
+    return None
 
 
 def find_volatility3() -> Optional[tuple[list[str], str]]:
@@ -239,10 +294,12 @@ class VolatilityRunner:
         dump_path: Path,
         vol_cmd: list[str],
         timeout_per_plugin: int = 300,
+        symbols_path: Optional[Path] = None,
     ) -> None:
-        self.dump_path = dump_path
-        self.vol_cmd   = vol_cmd
-        self.timeout   = timeout_per_plugin
+        self.dump_path    = dump_path
+        self.vol_cmd      = vol_cmd
+        self.timeout      = timeout_per_plugin
+        self.symbols_path = symbols_path   # None → Volatility3 기본 탐색 경로 사용
 
     @staticmethod
     def _normalize(parsed) -> dict:
@@ -281,8 +338,10 @@ class VolatilityRunner:
         cmd = self.vol_cmd + [
             "-f", str(self.dump_path),
             "-r", "json",   # Volatility3 렌더러 플래그 (-r / --renderer)
-            plugin,
         ]
+        if self.symbols_path:
+            cmd += ["-s", str(self.symbols_path)]
+        cmd.append(plugin)
         if extra:
             cmd.extend(extra)
         try:
@@ -532,6 +591,7 @@ def run_memory_forensics(
     on_status: Optional[object] = None,
     skip_dump: bool = False,
     existing_dump: Optional[Path] = None,
+    symbols_path: Optional[str] = None,
 ) -> MemForensicsResult:
     """
     메모리 덤프 획득 + Volatility3 분석 통합 실행.
@@ -541,6 +601,7 @@ def run_memory_forensics(
     sample_pids:    분석 대상 PID 집합 (None이면 전체 결과 반환)
     skip_dump:      True면 덤프 없이 existing_dump 사용
     existing_dump:  이미 있는 덤프 파일 경로
+    symbols_path:   Volatility3 심볼 디렉터리 (None이면 자동 탐색)
     """
     def _st(msg: str) -> None:
         if on_status:
@@ -589,10 +650,25 @@ def run_memory_forensics(
     except Exception:
         pass
 
-    # ── Volatility3 플러그인 병렬 실행 ───────────────────────────────
-    runner = VolatilityRunner(dump_path, vol_cmd, timeout_per_plugin=plugin_timeout)
+    # ── 심볼 경로 결정 ────────────────────────────────────────────────
+    # 명시적 지정 > 로컬 자동 탐색 > None (Volatility3 기본값 / 인터넷 다운로드)
+    _sym_path: Optional[Path] = None
+    if symbols_path:
+        _sym_path = Path(symbols_path)
+        _st(f"      심볼 경로 (지정): {_sym_path}")
+    else:
+        _sym_path = find_local_symbols(vol_cmd)
+        if _sym_path:
+            _st(f"      심볼 경로 (자동): {_sym_path}")
 
-    # 심볼 사전 확인 — 첫 실행 시 kernel PDB를 인터넷에서 자동 다운로드.
+    # ── Volatility3 플러그인 병렬 실행 ───────────────────────────────
+    runner = VolatilityRunner(
+        dump_path, vol_cmd,
+        timeout_per_plugin=plugin_timeout,
+        symbols_path=_sym_path,
+    )
+
+    # 심볼 사전 확인 — 첫 실행 시 kernel PDB를 자동 다운로드.
     # 병렬 플러그인 실행 전에 완료해야 심볼 다운로드 경합이 없다.
     _st("[메모리] 심볼 파일 확인 중 (첫 실행 시 자동 다운로드, 최대 5분)...")
     _sym_ok, _sym_info = runner.warmup()
@@ -602,12 +678,22 @@ def run_memory_forensics(
         _sym_kws = ("심볼", "symbol", "isf", "could not find",
                     "unsatisfied", "automagic", "no module")
         if any(k in _sym_info.lower() for k in _sym_kws):
+            # 심볼 설치 경로 안내
+            _install_hint = str(_sym_path or (
+                Path(vol_cmd[-1]).parent / "volatility3" / "symbols"
+                if vol_cmd and Path(vol_cmd[-1]).suffix == ".py"
+                else Path(r"C:\Tools\volatility3\volatility3\symbols")
+            ))
             result.error = (
-                "Volatility3 심볼 파일 없음 (인터넷 연결 필요)\n"
-                "수동 다운로드: vol -f <dump> windows.info"
+                "Volatility3 심볼 파일 없음\n"
+                "해결 방법:\n"
+                "  [온라인] 인터넷이 되는 환경에서 한 번 실행하면 자동 다운로드\n"
+                "  [오프라인] Volatility Foundation 사이트에서 windows.zip 다운로드 후\n"
+                f"  → 압축 해제한 windows/ 폴더를 {_install_hint}\\windows\\ 에 복사\n"
+                "  또는: python analyzer.py ... --vol-symbols <압축해제경로>"
             )
             result.plugin_errors["windows.info"] = _sym_info
-            _st(f"      [오류] 심볼 다운로드 실패 — 인터넷 연결 확인 후 재시도")
+            _st(f"      [오류] 심볼 파일 없음 — {_install_hint}\\windows\\ 에 심볼 복사 필요")
             return result
         # 심볼 문제가 아닌 경미한 오류 → 경고만 하고 계속 진행
         _st(f"      [경고] windows.info: {_sym_info[:120]}")

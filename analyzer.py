@@ -229,6 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="winpmem / DumpIt 실행파일 경로 명시")
     mg.add_argument("--vol-path", metavar="FILE",
                     help="vol.py 또는 vol3 경로 명시")
+    mg.add_argument("--vol-symbols", metavar="DIR",
+                    help="Volatility3 심볼 디렉터리 경로 (오프라인 환경용). "
+                         "windows/ 하위 폴더가 있는 상위 디렉터리를 지정. "
+                         "예: C:\\Tools\\volatility3\\volatility3\\symbols")
     mg.add_argument("--dump-timeout", type=int, default=600, metavar="SEC",
                     help="메모리 덤프 타임아웃 (기본 600초)")
     mg.add_argument("--vol-timeout", type=int, default=300, metavar="SEC",
@@ -353,6 +357,7 @@ def main() -> None:
         use_memdump       = getattr(args, "memdump", False) or bool(getattr(args, "dump", None)),
         winpmem_path      = getattr(args, "winpmem_path", None),
         volatility_path   = getattr(args, "vol_path", None),
+        vol_symbols_path  = getattr(args, "vol_symbols", None),
         dump_timeout      = getattr(args, "dump_timeout", 600),
         vol_plugin_timeout= getattr(args, "vol_timeout", 300),
         existing_dump     = getattr(args, "dump", None),
