@@ -23,8 +23,9 @@ from pathlib import Path
 
 OLLAMA_BASE_URL  = "http://localhost:11434"
 DEFAULT_MODEL    = "qwen2.5:7b"
-# qwen2.5:7b num_ctx=8192, num_predict=2048 → 입력 여유 ~6000토큰 ≈ 12000 한국어 자
-_MAX_PROMPT_CHARS = 6000
+# qwen2.5:7b num_ctx=8192, num_predict=1024 → 입력 여유 ~7168 토큰
+# 한국어 평균 1.3 chars/token → 안전 상한 약 10,000 자
+_MAX_PROMPT_CHARS = 10_000
 
 
 # ── 결과 ─────────────────────────────────────────────────────────────────────
@@ -230,7 +231,7 @@ def _build_prompt(result) -> str:
     all_pids = sorted(result.all_pids) if result.all_pids else []
 
     lines.append("## 분석 대상")
-    lines.append(f"- 파일명: {sample_name}{pid_str}")
+    lines.append(f"- 파일명: {sample_name}{pid_str}  ← 분석 진입점 (이 파일 자체가 로더/드롭퍼)")
     if all_pids:
         lines.append(f"- 추적 PID: {', '.join(str(p) for p in all_pids[:20])}")
     lines.append("")
@@ -569,12 +570,13 @@ def _build_prompt(result) -> str:
 - 대괄호 [ ] 안 내용만 실제 분석 내용으로 교체하세요.
 - 마크다운(##, **, - 등) 사용 금지. 순수 텍스트로 출력하세요.
 - 대응 권고는 절대 포함하지 마세요.
+- 구체적 파일명, IP 주소, 프로세스명을 반드시 인용하세요. "다수의 IP", "시스템 도구" 같은 추상 표현 금지.
 
 {tag_section}
 
 분석 분류
 위협 수준: [악성 활동 / 의심 활동 / 정상 중 하나]
-주요 분석 대상: [파일명] ([실행 맥락 — 예: 이메일 첨부, Temp 디렉토리 실행])
+주요 분석 대상: {sample_name} ([실행 맥락 — 예: 사용자 직접 실행, 이메일 첨부])
 설명: [한 문장 — 악성코드 유형 또는 패밀리(추정), 핵심 기능, C2/유출 방식]
 태그 및 해석:
 [tag]: [탐지 근거 한 줄]
@@ -589,7 +591,7 @@ def _build_prompt(result) -> str:
 [자율 실행] [자동화된 악성 행위 — C2, 유출, 인젝션 등]
 
 행위 분석
-로더 / 스테이징: [초기 실행 파일 역할 및 스테이징 페이로드, 없으면 관찰되지 않음]
+로더 / 스테이징: [{sample_name} 자체가 로더. 드롭 또는 메모리 로드한 페이로드 기술]
 실행 및 피벗 (LOLBin / 인터프리터): [시스템 도구 악용 또는 프로세스 체인, 없으면 관찰되지 않음]
 지속성 (관찰된 경우): [레지스트리·서비스·스케줄러 기반 지속성, 없으면 관찰되지 않음]
 탐색 / 수집 (관찰된 경우): [시스템 정보·자격증명·파일 수집 행위, 없으면 관찰되지 않음]
@@ -606,16 +608,19 @@ def _build_prompt(result) -> str:
             + tag_hint
         )
 
-    lines.append(template.format(tag_section=tag_section))
+    lines.append(template.format(tag_section=tag_section, sample_name=sample_name))
 
     prompt = "\n".join(lines)
+    # 데이터가 초과되면 중간 데이터를 잘라내되 템플릿(지시)은 항상 보존
     if len(prompt) > _MAX_PROMPT_CHARS:
-        cutoff = _MAX_PROMPT_CHARS - 500
-        prompt = (
-            prompt[:cutoff]
-            + "\n\n(데이터 초과로 일부 생략됨)\n\n---\n"
-            + template.format(tag_section=tag_section)
-        )
+        divider = "\n---\n"
+        if divider in prompt:
+            data_part, instr_part = prompt.split(divider, 1)
+            cutoff = _MAX_PROMPT_CHARS - len(instr_part) - len(divider) - 60
+            data_part = data_part[:max(cutoff, 500)]
+            prompt = data_part + "\n\n(데이터 초과로 일부 생략됨)" + divider + instr_part
+        else:
+            prompt = prompt[:_MAX_PROMPT_CHARS]
     return prompt
 
 
