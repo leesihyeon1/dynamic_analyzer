@@ -55,7 +55,7 @@ _VOL3_CANDIDATES: list[Path] = [
     Path(r"C:\volatility3\vol.py"),
 ]
 
-_VOL3_SCRIPT_NAMES = ("vol3", "vol3.exe", "vol.py")
+_VOL3_SCRIPT_NAMES = ("vol", "vol.exe", "vol3", "vol3.exe", "vol.py")
 
 
 # ── 도구 탐색 ─────────────────────────────────────────────────────────────
@@ -93,16 +93,17 @@ def find_volatility3() -> Optional[tuple[list[str], str]]:
         if c.is_file():
             return ([sys.executable, str(c)], "script")
 
-    # 3. Python 모듈로 설치된 경우
-    try:
-        r = subprocess.run(
-            [sys.executable, "-m", "volatility3", "--version"],
-            capture_output=True, timeout=10,
-        )
-        if r.returncode == 0:
-            return ([sys.executable, "-m", "volatility3"], "module")
-    except Exception:
-        pass
+    # 3. Python 모듈로 설치된 경우 (pip install volatility3)
+    for mod in ("volatility3.cli", "volatility3"):
+        try:
+            r = subprocess.run(
+                [sys.executable, "-m", mod, "--version"],
+                capture_output=True, timeout=10,
+            )
+            if r.returncode == 0:
+                return ([sys.executable, "-m", mod], "module")
+        except Exception:
+            pass
 
     return None
 
@@ -416,6 +417,44 @@ class VolatilityRunner:
             ))
         return results
 
+    def warmup(self) -> tuple[bool, str]:
+        """
+        windows.info 실행으로 심볼 자동 다운로드 트리거 및 OS 정보 추출.
+
+        Volatility3는 첫 실행 시 메모리 덤프에 맞는 kernel PDB 심볼을
+        인터넷에서 자동 다운로드한다. 이 메서드를 병렬 플러그인 실행 전에
+        먼저 호출해 심볼을 캐시에 확보한다.
+
+        Returns: (success, os_info_or_error_str)
+        """
+        try:
+            data = self._run("windows.info")
+            cols = data.get("columns", [])
+            rows = data.get("rows") or []
+            key_i = val_i = -1
+            for i, c in enumerate(cols):
+                cl = c.lower()
+                if cl in ("key", "variable"):
+                    key_i = i
+                elif cl == "value":
+                    val_i = i
+            kv: dict[str, str] = {}
+            if key_i >= 0 and val_i >= 0:
+                for r in rows:
+                    if len(r) > max(key_i, val_i):
+                        kv[str(r[key_i])] = str(r[val_i])
+            major   = kv.get("NtMajorVersion", "")
+            minor   = kv.get("NtMinorVersion", "")
+            build   = kv.get("NtBuildLab", kv.get("NtBuildLabEx", ""))
+            product = kv.get("NtProductType", "")
+            os_str  = (
+                f"Windows {major}.{minor} build {build} ({product})"
+                if major else "(버전 미확인)"
+            )
+            return True, os_str
+        except RuntimeError as e:
+            return False, str(e)
+
     def dlllist(self, pid_filter: set[int] | None = None) -> list[DllEntry]:
         data = self._run("windows.dlllist")
         results = []
@@ -517,6 +556,26 @@ def run_memory_forensics(
 
     # ── Volatility3 플러그인 병렬 실행 ───────────────────────────────
     runner = VolatilityRunner(dump_path, vol_cmd, timeout_per_plugin=plugin_timeout)
+
+    # 심볼 사전 확인 — 첫 실행 시 kernel PDB를 인터넷에서 자동 다운로드.
+    # 병렬 플러그인 실행 전에 완료해야 심볼 다운로드 경합이 없다.
+    _st("[메모리] 심볼 파일 확인 중 (첫 실행 시 자동 다운로드, 최대 5분)...")
+    _sym_ok, _sym_info = runner.warmup()
+    if _sym_ok:
+        _st(f"      OS: {_sym_info}")
+    else:
+        _sym_kws = ("심볼", "symbol", "isf", "could not find",
+                    "unsatisfied", "automagic", "no module")
+        if any(k in _sym_info.lower() for k in _sym_kws):
+            result.error = (
+                "Volatility3 심볼 파일 없음 (인터넷 연결 필요)\n"
+                "수동 다운로드: vol -f <dump> windows.info"
+            )
+            result.plugin_errors["windows.info"] = _sym_info
+            _st(f"      [오류] 심볼 다운로드 실패 — 인터넷 연결 확인 후 재시도")
+            return result
+        # 심볼 문제가 아닌 경미한 오류 → 경고만 하고 계속 진행
+        _st(f"      [경고] windows.info: {_sym_info[:120]}")
 
     _st("[메모리] Volatility3 플러그인 실행 중 (병렬)...")
     t_vol = time.monotonic()
