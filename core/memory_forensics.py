@@ -244,11 +244,43 @@ class VolatilityRunner:
         self.vol_cmd   = vol_cmd
         self.timeout   = timeout_per_plugin
 
+    @staticmethod
+    def _normalize(parsed) -> dict:
+        """
+        Volatility3 JSON 출력 → {"columns": [...], "rows": [...]} 정규화.
+
+        Volatility3 버전에 따라 출력 형식이 다름:
+          - dict {"columns":…,"rows":…}   → 그대로
+          - [{"columns":…,"rows":…}]      → 첫 원소 unwrap
+          - [{"col1":v1,"col2":v2},…]     → list-of-dicts → 키를 컬럼으로
+          - [["col1","col2"],[v1,v2],…]   → 첫 행이 헤더
+        """
+        if isinstance(parsed, dict):
+            return parsed
+        if not isinstance(parsed, list) or not parsed:
+            return {"columns": [], "rows": []}
+        first = parsed[0]
+        # [{"columns":…,"rows":…}] — dict 하나를 배열로 감싼 경우
+        if isinstance(first, dict) and "columns" in first and "rows" in first:
+            return first
+        # list-of-dicts: [{"Variable":"Kernel Base","Value":"0x…"},…]
+        if isinstance(first, dict):
+            cols = list(first.keys())
+            rows = [
+                [str(row.get(c, "")) for c in cols]
+                for row in parsed if isinstance(row, dict)
+            ]
+            return {"columns": cols, "rows": rows}
+        # list-of-lists: 첫 행이 컬럼 헤더
+        if isinstance(first, list):
+            return {"columns": [str(c) for c in first], "rows": parsed[1:]}
+        return {"columns": [], "rows": parsed}
+
     def _run(self, plugin: str, extra: list[str] | None = None) -> dict:
         """플러그인 실행 → JSON dict 반환. 실패 시 RuntimeError 발생."""
         cmd = self.vol_cmd + [
             "-f", str(self.dump_path),
-            "-r", "json",   # Volatility3 렌더러 플래그 (--output은 출력 파일 경로로 해석됨)
+            "-r", "json",   # Volatility3 렌더러 플래그 (-r / --renderer)
             plugin,
         ]
         if extra:
@@ -285,15 +317,18 @@ class VolatilityRunner:
                 + (f"\n[stderr] {stderr_tail}" if stderr_tail else "")
             )
 
-        # 첫 번째 '{' 또는 '[' 위치 찾기 (앞에 로그 라인이 섞일 수 있음)
+        # stdout에서 첫 번째 유효한 JSON 위치 탐색
+        # (앞에 로그/배너 라인이 섞일 수 있음 → 파싱 실패 시 continue로 다음 위치 시도)
         for i, ch in enumerate(out):
-            if ch in ('{', '['):
-                try:
-                    return json.loads(out[i:])
-                except json.JSONDecodeError as e:
-                    raise RuntimeError(f"{plugin}: JSON 파싱 오류 — {e}")
+            if ch not in ('{', '['):
+                continue
+            try:
+                parsed = json.loads(out[i:])
+            except json.JSONDecodeError:
+                continue   # 이 위치는 JSON 아님 → 다음 위치 계속 탐색
+            return self._normalize(parsed)
 
-        # JSON 없음 — stderr에서 실제 원인 추출
+        # 어떤 위치에서도 유효한 JSON 없음 → stderr 에서 원인 추출
         stderr_tail = (r.stderr or "")[-600:].strip()
         _sym_kws = ("symbol", "could not find", "isf", "unsatisfied", "automagic", "no module")
         if stderr_tail and any(k in stderr_tail.lower() for k in _sym_kws):
