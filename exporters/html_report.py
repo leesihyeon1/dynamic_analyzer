@@ -2031,15 +2031,18 @@ def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
             reqs = _hbc.get((ip, port), [])
             if reqs:
                 # HTTP 요청 상세: 메서드+경로 표시 (최대 5건)
-                req_lines = "".join(
-                    f"<div style='font-size:.70rem;color:#79c0ff;padding-left:.8rem'>"
-                    f"{_e(r.method)} "
-                    f"<span title='{_e(f\"http://{r.host}{r.path}\")}'>"
-                    f"{_e(r.path[:120] or '/')}</span>"
-                    + (f" <span style='color:#6e7681'>({_fmt_bytes(r.content_length)})</span>" if r.content_length else "")
-                    + "</div>"
-                    for r in reqs[:5]
-                )
+                _req_parts = []
+                for r in reqs[:5]:
+                    _full = "http://" + (r.host or "") + (r.path or "/")
+                    _size = (f" <span style='color:#6e7681'>({_fmt_bytes(r.content_length)})</span>"
+                             if r.content_length else "")
+                    _req_parts.append(
+                        f"<div style='font-size:.70rem;color:#79c0ff;padding-left:.8rem'>"
+                        f"{_e(r.method)} "
+                        f"<span title='{_e(_full)}'>"
+                        f"{_e(r.path[:120] or '/')}</span>{_size}</div>"
+                    )
+                req_lines = "".join(_req_parts)
                 item_parts.append(
                     f"<li>{_e(ip)}:{port}"
                     f"<span style='font-size:.70rem;color:#56d364'> HTTP</span>"
