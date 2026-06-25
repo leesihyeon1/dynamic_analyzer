@@ -324,6 +324,100 @@ class AnalysisResult:
     ai_analysis:        dict  = field(default_factory=dict)   # AiAnalysisResult dict
     # ── 프로세스 행위 역색인 ─────────────────────────────────────────
     process_behaviors:  dict  = field(default_factory=dict)   # dict[int, ProcessBehavior]
+    # ── 샘플 활성 여부 판정 ──────────────────────────────────────────
+    sample_active:      bool  = True                           # False = 비활성/미실행 추정
+    inactivity_signals: list  = field(default_factory=list)    # 비활성 근거 목록
+
+
+def _compute_activity_verdict(result: "AnalysisResult") -> "tuple[bool, list[str]]":
+    """분석 결과 데이터를 종합해 샘플 활성 여부를 판정한다.
+
+    Returns
+    -------
+    (is_active, signals)
+        is_active: True = 유의미한 활동 관찰됨, False = 비활성/미실행 추정
+        signals:   비활성 근거 메시지 목록 (활성이면 빈 리스트)
+    """
+    # ── 각 데이터 소스에서 활동 수치 추출 ─────────────────────────────
+    n_events   = len(result.filtered_events)
+
+    new_procs  = result.process_diff.get("new_processes", [])
+    _sname     = (result.config.sample_path.name.lower()
+                  if result.config.sample_path else "")
+    n_children = sum(
+        1 for p in new_procs
+        if getattr(p, "category", "") != "BROWSER_INFRA"
+        and p.name.lower() != _sname
+    )
+
+    n_net_proc = len(result.process_network_map)
+
+    pcap       = result.pcap_result
+    n_dns      = len(pcap.dns_queries)   if pcap else 0
+    n_http     = len(pcap.http_requests) if pcap else 0
+    n_conns    = len(pcap.connections)   if pcap else 0
+
+    hh         = result.hh_result
+    n_hh_susp  = sum(
+        1 for r in (getattr(hh, "process_results", []) or [])
+        if getattr(r, "suspicious", 0) > 0
+    ) if hh else 0
+    n_pe_susp  = sum(
+        1 for r in result.pe_sieve_results
+        if getattr(r, "suspicious", 0) > 0
+    )
+
+    ioc        = result.ioc_report
+    n_dropped  = len(getattr(ioc, "dropped_files",  []) or []) if ioc else 0
+
+    reg        = result.registry_diff or {}
+    n_reg      = len(reg.get("added_keys",    [])) + len(reg.get("modified_keys", []))
+
+    fn         = result.fakenet_result or {}
+    n_fakenet  = len(fn.get("dns_queries", [])) + len(fn.get("http_requests", []))
+
+    tls_keys   = result.tls_key_count or 0
+
+    # ── 활성 판정: 하나라도 해당하면 유의미한 활동으로 판단 ─────────────
+    if any([
+        n_events   >= 5,    # ProcMon 필터 통과 이벤트
+        n_children >= 1,    # 자식 프로세스 생성
+        n_net_proc >= 1,    # 프로세스↔IP 매핑 연결
+        n_dns      >= 1,    # DNS 쿼리
+        n_http     >= 1,    # HTTP 요청
+        n_conns    >= 1,    # TCP/UDP 연결
+        n_hh_susp  >= 1,    # hollows-hunter 탐지
+        n_pe_susp  >= 1,    # pe-sieve 탐지
+        n_dropped  >= 1,    # 드롭 파일
+        n_reg      >= 3,    # 레지스트리 변경 (3 이상 = 노이즈 초과)
+        n_fakenet  >= 1,    # FakeNet 활동
+        tls_keys   >= 1,    # TLS 세션 키 기록
+    ]):
+        return True, []
+
+    # ── 비활성 근거 수집 ──────────────────────────────────────────────
+    signals: list[str] = []
+    if n_events == 0:
+        signals.append("ProcMon 이벤트 없음 (필터 후 0개)")
+    elif n_events < 5:
+        signals.append(f"ProcMon 이벤트 극소 (필터 후 {n_events}개)")
+
+    if n_children == 0:
+        signals.append("자식 프로세스 생성 없음")
+
+    if n_dns == 0 and n_http == 0 and n_conns == 0 and n_net_proc == 0 and n_fakenet == 0:
+        signals.append("네트워크 활동 없음 (TCP·DNS·HTTP 0건)")
+
+    if n_hh_susp == 0 and n_pe_susp == 0:
+        signals.append("메모리 인젝션 탐지 없음")
+
+    if n_dropped == 0:
+        signals.append("드롭 파일 없음")
+
+    if n_reg < 3:
+        signals.append(f"레지스트리 변경 {n_reg}건 (시스템 노이즈 수준)")
+
+    return False, signals
 
 
 def run_analysis(
@@ -351,6 +445,7 @@ def run_analysis(
         take_process_snapshot, diff_process_snapshots,
         find_process_hacker, launch_process_hacker,
         _ANALYSIS_TOOL_PROC_NAMES,
+        classify_browser_subproc,
     )
     from parsers.procmon_csv   import parse_csv, get_child_pids as pm_child_pids
     from parsers.pcap_parser   import parse_pcap, PcapResult
@@ -888,6 +983,22 @@ def run_analysis(
         if _added:
             status(f"      [ProcMon] 단명 프로세스 {_added}개 보완 (스냅샷 누락)")
 
+        # ── 브라우저 서브프로세스 분류 ────────────────────────────────────
+        # proc_after 스냅샷으로 pid→name 역색인을 만들어 부모 이름을 조회한다.
+        # new_processes 자신도 포함해야 단명 프로세스의 부모 관계가 올바르게 반영된다.
+        _pid_to_name: dict[int, str] = {
+            pid: s.name for pid, s in proc_after.items()
+        }
+        for _p in result.process_diff.get("new_processes", []):
+            _pid_to_name[_p.pid] = _p.name
+        _infra_cnt = 0
+        for _p in result.process_diff.get("new_processes", []):
+            _p.category = classify_browser_subproc(_p, _pid_to_name)
+            if _p.category == "BROWSER_INFRA":
+                _infra_cnt += 1
+        if _infra_cnt:
+            status(f"      브라우저 인프라 서브프로세스 {_infra_cnt}개 분류 (리포트 기본 접힘)")
+
         # 포커스 PID 기반 필터 (단명 프로세스 보완 후 실행)
         result.filtered_events = filter_events(
             result.procmon_events,
@@ -1268,6 +1379,14 @@ def run_analysis(
                     status(f"      [오류] {_ae}")
             else:
                 status(f"[AI 분석] Ollama 서버 미실행 — 건너뜀 ({_ollama_url})")
+
+    # ── 샘플 활성 여부 최종 판정 ────────────────────────────────────────
+    result.sample_active, result.inactivity_signals = _compute_activity_verdict(result)
+    if not result.sample_active:
+        _sig_str = " / ".join(result.inactivity_signals[:4])
+        status(f"[!] 샘플 비활성 추정 — 유의미한 행위 미관찰 ({_sig_str})")
+    else:
+        status("[활성 확인] 유의미한 행위 관찰됨")
 
     result.end_time = time.time()
     elapsed_total = result.end_time - result.start_time

@@ -998,11 +998,73 @@ def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# CDN 도메인 suffix 정의 (네트워크 탭 de-emphasis 용)
+# 반드시 BROWSER_INFRA 프로세스에서 발생한 연결에만 적용한다.
+# 샘플 체인 프로세스 → CDN 연결은 Domain Fronting C2 가능성이 있으므로 항상 표시.
+# ---------------------------------------------------------------------------
+_CDN_DOMAIN_SUFFIXES: tuple[str, ...] = (
+    # Akamai
+    ".akamai.net", ".akamaiedge.net", ".akamaized.net",
+    ".akamaitechnologies.com", ".akadns.net", ".edgekey.net", ".edgesuite.net",
+    # Cloudflare
+    ".cloudflare.com", ".cloudflare-dns.com", ".cf-ipfs.com",
+    # AWS CloudFront / S3
+    ".cloudfront.net", ".amazonaws.com", ".awsstatic.com",
+    # Azure CDN
+    ".azureedge.net", ".azurefd.net", ".msecnd.net", ".aspnetcdn.com",
+    # Google
+    ".gstatic.com", ".googleapis.com", ".googlevideo.com", ".ggpht.com",
+    ".googleusercontent.com",
+    # Fastly
+    ".fastly.net", ".fastlylb.net",
+    # Windows Update / NCSI (항상 OS 노이즈)
+    ".windowsupdate.com", ".update.microsoft.com",
+    ".msftconnecttest.com", ".msftncsi.com",
+    # Microsoft CDN / Office
+    ".office.com", ".office365.com", ".live.com", ".bing.com",
+    ".msn.com", ".skype.com",
+    # Meta / Twitter / YouTube (브라우저 미디어)
+    ".fbcdn.net", ".twimg.com", ".ytimg.com",
+)
+
+
+def _is_cdn_domain(domains: list[str]) -> bool:
+    """도메인 목록 중 하나라도 CDN suffix 이면 True."""
+    for d in domains:
+        d_low = d.lower()
+        if any(d_low == s.lstrip(".") or d_low.endswith(s)
+               for s in _CDN_DOMAIN_SUFFIXES):
+            return True
+    return False
+
+
+def _extract_pids_from_labels(labels: list[str]) -> set[int]:
+    """'process_name (PID)' 형식 레이블에서 PID 집합을 추출."""
+    pids: set[int] = set()
+    for lbl in labels:
+        _p = lbl.rfind("(")
+        if _p != -1:
+            try:
+                pids.add(int(lbl[_p + 1:].rstrip(")").strip()))
+            except ValueError:
+                pass
+    return pids
+
+
 def _network_html(result) -> str:
     pcap = result.pcap_result
 
     # pcap이 없어도 decrypted_requests / fakenet_result는 렌더링해야 하므로
     # 조기 리턴하지 않고 각 섹션을 독립적으로 처리한다.
+
+    # ── 브라우저 인프라 PID 집합 ──────────────────────────────────
+    # CDN 연결 de-emphasis 판정에 사용 — 이 PID 에서 발생한 CDN 연결만 접힘 처리.
+    _infra_pids: set[int] = {
+        p.pid
+        for p in result.process_diff.get("new_processes", [])
+        if getattr(p, "category", "") == "BROWSER_INFRA"
+    }
 
     # ── 공통 조회 테이블 (pcap 있을 때만 빌드) ────────────────────
     combined_domains: dict[str, list[str]] = {}
@@ -1194,7 +1256,8 @@ def _network_html(result) -> str:
     if pcap and pcap.connections:
         _CONN_LIMIT = 1000
         sorted_conns = sorted(pcap.connections, key=lambda x: -x.bytes_out)
-        rows = []
+        rows: list[str] = []
+        cdn_rows: list[str] = []   # BROWSER_INFRA + CDN → 별도 접힘 섹션
         for c in sorted_conns[:_CONN_LIMIT]:
             ext = not _is_private_ip_str(c.dst_ip)
             ip_color = "ev-network" if ext else ""
@@ -1261,7 +1324,7 @@ def _network_html(result) -> str:
                     )
             else:
                 _reason = ""
-            rows.append(
+            _row_html = (
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
                 f"<td class='mono'>{_e(c.src_ip)}</td>"
@@ -1273,13 +1336,55 @@ def _network_html(result) -> str:
                 + _proc_cell(_conn_procs, _reason) +
                 f"</tr>"
             )
+
+            # ── CDN + BROWSER_INFRA 판정: 두 조건 모두 충족해야 접힘 처리 ──
+            # 조건 1: 귀속된 프로세스가 모두 BROWSER_INFRA PID 집합에 포함
+            # 조건 2: 목적지 도메인이 CDN suffix 에 해당
+            # → 둘 중 하나라도 불충족이면 주 테이블 유지 (C2 over CDN 놓침 방지)
+            _is_cdn_infra = False
+            if _conn_procs and _infra_pids:
+                _conn_pids = _extract_pids_from_labels(_conn_procs)
+                if _conn_pids and _conn_pids.issubset(_infra_pids):
+                    _conn_doms = combined_domains.get(c.dst_ip, [])
+                    if _conn_doms and _is_cdn_domain(_conn_doms):
+                        _is_cdn_infra = True
+
+            if _is_cdn_infra:
+                cdn_rows.append(_row_html)
+            else:
+                rows.append(_row_html)
+
+        _tbl_header = (
+            "<table id='tbl-net-conn'>"
+            "<tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
+            "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
+        )
         parts.append(
             "<h3>네트워크 연결 (송신량 순)</h3>"
             + _trunc_notice(len(pcap.connections), _CONN_LIMIT)
-            + "<table id='tbl-net-conn'><tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
-            "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
-            + "".join(rows) + "</table>"
+            + _tbl_header + "".join(rows) + "</table>"
         )
+
+        # ── 브라우저 CDN 인프라 연결 — 기본 접힘 ────────────────────────
+        if cdn_rows:
+            _cdn_tbl_header = (
+                "<table style='width:100%;border-collapse:collapse;opacity:.65'>"
+                "<tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
+                "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
+            )
+            parts.append(
+                f"<details style='margin-top:.6rem;border:1px solid #30363d;"
+                f"border-radius:6px;padding:.4rem .7rem'>"
+                f"<summary style='cursor:pointer;color:#6e7681;font-size:.80rem;"
+                f"user-select:none;list-style:none'>"
+                f"&#9654; 브라우저 CDN 인프라 연결 {len(cdn_rows)}개"
+                f" (BROWSER_INFRA 프로세스 + CDN 도메인 — 기본 접힘, C2 연결 아님)</summary>"
+                f"<p style='font-size:.74rem;color:#484f58;margin:.3rem 0'>"
+                f"&#9888; 샘플 체인 프로세스 → CDN 연결은 Domain Fronting C2 가능성이 있어 위 주 테이블에 표시됩니다."
+                f"</p>"
+                f"{_cdn_tbl_header}{''.join(cdn_rows)}</table>"
+                f"</details>"
+            )
 
     # ── DNS 쿼리 ───────────────────────────────────────────────
     if pcap and pcap.dns_queries:
@@ -1932,7 +2037,13 @@ def _process_html(result) -> str:
     if not all_new:
         return "<p class='alert alert-success'>신규 프로세스 없음</p>"
 
+    # ── 브라우저 인프라 서브프로세스 분리 (GPU·Renderer·Crashpad 등) ──
+    infra_procs = [p for p in all_new if getattr(p, "category", "") == "BROWSER_INFRA"]
+    infra_pids: set[int] = {p.pid for p in infra_procs}
+
     new_procs, excl_count = _compute_display_procs(result)
+    # BROWSER_INFRA는 별도 접힘 섹션으로 표시 — 주 테이블에서 제외
+    new_procs = [p for p in new_procs if p.pid not in infra_pids]
 
     # ── 프로세스 트리 ────────────────────────────────────────────────
     tree_html = _process_tree_html(result)
@@ -1979,7 +2090,53 @@ def _process_html(result) -> str:
     # ── 전체 프로세스 기록 (화이트리스트 오탐만 제외) ────────────────
     all_procs_html = _all_procs_html(result, chain_pids={p.pid for p in new_procs})
 
-    return tree_html + excl_note + table_html + all_procs_html
+    # ── 브라우저 인프라 서브프로세스 접힘 섹션 ──────────────────────
+    # GPU·Renderer·Crashpad 등 브라우저가 자식으로 생성한 노이즈 프로세스.
+    # 부모 PID + --type 플래그 기반으로 분류, 기본 접힘 처리.
+    infra_html = ""
+    if infra_procs:
+        _infra_rows: list[str] = []
+        for _p in infra_procs:
+            _cmd = " ".join(_p.cmdline) if _p.cmdline else ""
+            # --type= 값만 추출해 요약 표시 (명령줄이 길어도 핵심만)
+            _type_val = ""
+            _cmd_lower = _cmd.lower()
+            _t_idx = _cmd_lower.find("--type=")
+            if _t_idx != -1:
+                _t_end = _cmd.find(" ", _t_idx)
+                _type_val = _cmd[_t_idx: _t_end if _t_end != -1 else None]
+            _infra_rows.append(
+                f"<tr>"
+                f"<td class='mono' style='color:#484f58;padding:.15rem .4rem'>{_p.pid}</td>"
+                f"<td class='mono' style='color:#6e7681;padding:.15rem .4rem'>{_e(_p.name)}</td>"
+                f"<td class='mono' style='color:#484f58;font-size:.70rem;padding:.15rem .4rem'>"
+                f"{_e(_type_val or _cmd[:80])}</td>"
+                f"<td class='mono' style='color:#484f58;font-size:.70rem;padding:.15rem .4rem'>"
+                f"{_e(_p.exe or '')}</td>"
+                f"</tr>"
+            )
+        _infra_table = (
+            "<table style='width:100%;border-collapse:collapse;font-size:.78rem'>"
+            "<tr style='color:#6e7681'>"
+            "<th style='padding:.15rem .4rem;text-align:left'>PID</th>"
+            "<th style='padding:.15rem .4rem;text-align:left'>프로세스</th>"
+            "<th style='padding:.15rem .4rem;text-align:left'>--type 플래그</th>"
+            "<th style='padding:.15rem .4rem;text-align:left'>경로</th></tr>"
+            + "".join(_infra_rows) + "</table>"
+        )
+        infra_html = (
+            f"<details style='margin-top:.8rem;border:1px solid #30363d;"
+            f"border-radius:6px;padding:.4rem .7rem'>"
+            f"<summary style='cursor:pointer;color:#6e7681;font-size:.80rem;"
+            f"user-select:none;list-style:none'>"
+            f"&#9654; 브라우저 인프라 서브프로세스 {len(infra_procs)}개"
+            f" (GPU·Renderer·Crashpad 등 — 악성 행위 아님, 기본 접힘)"
+            f"</summary>"
+            f"<div style='margin-top:.4rem'>{_infra_table}</div>"
+            f"</details>"
+        )
+
+    return tree_html + excl_note + table_html + all_procs_html + infra_html
 
 
 def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
@@ -2972,8 +3129,14 @@ def generate_html_report(result, output_path: str) -> None:
 
     # ── 위협 수준 ────────────────────────────────────────────────
     threat_score = tech_count + (1 if shc_total else 0)
-    threat_color = "red" if threat_score >= 3 else ("orange" if threat_score >= 1 else "green")
-    threat_label = "HIGH" if threat_score >= 3 else ("MEDIUM" if threat_score >= 1 else "CLEAN")
+    _sample_active = getattr(result, "sample_active", True)
+    if not _sample_active and threat_score == 0:
+        # 비활성 + 탐지 없음 → 판정 불가로 표시
+        threat_color = "gray"
+        threat_label = "UNKNOWN (비활성)"
+    else:
+        threat_color = "red" if threat_score >= 3 else ("orange" if threat_score >= 1 else "green")
+        threat_label = "HIGH" if threat_score >= 3 else ("MEDIUM" if threat_score >= 1 else "CLEAN")
 
     def _tool_badge(k: str, v) -> str:
         """bool 또는 문자열 도구 상태를 배지로 변환."""
@@ -3013,6 +3176,38 @@ def generate_html_report(result, output_path: str) -> None:
     tab_mem_b = _tb(shc_total,  "red"    if shc_total   else "gray") if shc_total   else ""
     tab5_b    = _tb(ioc_total,  "orange" if ioc_total   else "gray") if ioc_total   else ""
 
+    # ── 샘플 비활성 경고 배너 (pre-compute, f-string 밖에서) ─────────────
+    _is_active = getattr(result, "sample_active", True)
+    _inact_signals = getattr(result, "inactivity_signals", []) or []
+    if not _is_active and _inact_signals:
+        _sig_items = "".join(
+            f"<li style='margin:.2rem 0'>{_e(s)}</li>"
+            for s in _inact_signals
+        )
+        _inactivity_banner = (
+            "<div style='"
+            "margin:1rem 0 1.2rem;"
+            "padding:.8rem 1rem;"
+            "border:1.5px solid #d29922;"
+            "border-radius:8px;"
+            "background:#272115;"
+            "'>"
+            "<div style='font-size:1rem;font-weight:700;color:#e3b341;margin-bottom:.4rem'>"
+            "&#9888; 샘플 비활성 추정 — 유의미한 행위 미관찰"
+            "</div>"
+            "<ul style='margin:.3rem 0 .5rem 1.2rem;padding:0;color:#8b949e;font-size:.82rem'>"
+            + _sig_items +
+            "</ul>"
+            "<div style='font-size:.78rem;color:#6e7681'>"
+            "가능한 원인: 분석 환경 감지(안티-샌드박스) · 네트워크/C2 의존 실패 · "
+            "비활성 샘플 · 실행 조건 미충족. "
+            "상용 샌드박스(Any.run, JoeSandbox) 결과와 교차 확인 권장."
+            "</div>"
+            "</div>"
+        )
+    else:
+        _inactivity_banner = ""
+
     _hunt_cfg_js = _build_hunt_cfg_js()
     body = f"""<!DOCTYPE html>
 <html lang="ko">
@@ -3045,6 +3240,8 @@ def generate_html_report(result, output_path: str) -> None:
 <p style="margin-bottom:1.5rem">{tools_html}</p>
 
 {"".join(f'<p class="alert alert-warning">⚠ {_e(e)}</p>' for e in result.errors) if result.errors else ""}
+
+{_inactivity_banner}
 
 <!-- ── 탭 네비게이션 ── -->
 <div class="tabs">

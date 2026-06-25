@@ -115,6 +115,7 @@ def _classify_file_events(
                     tactic="Persistence",
                     evidence=path,
                     reference="https://attack.mitre.org/techniques/T1547/001/",
+                    process=ev.process,
                 )
                 report.suspicious_files.append(path)
 
@@ -130,6 +131,7 @@ def _classify_file_events(
                     tactic="Defense Evasion",
                     evidence=path,
                     reference="https://attack.mitre.org/techniques/T1027/",
+                    process=ev.process,
                 )
                 report.suspicious_files.append(path)
 
@@ -142,6 +144,7 @@ def _classify_file_events(
                 tactic="Impact",
                 evidence=path,
                 reference="https://attack.mitre.org/techniques/T1486/",
+                process=ev.process,
             )
             report.suspicious_files.append(path)
 
@@ -157,6 +160,7 @@ def _classify_file_events(
                     tactic="Defense Evasion",
                     evidence=path,
                     reference="https://attack.mitre.org/techniques/T1070/004/",
+                    process=ev.process,
                 )
                 report.suspicious_files.append(path)
 
@@ -179,7 +183,7 @@ def _classify_registry_events(
 ) -> None:
     """Detect registry-based persistence techniques from events and reg_diff."""
 
-    def _check_reg_path(path: str, detail: str = "") -> None:
+    def _check_reg_path(path: str, detail: str = "", process: str = "") -> None:
         lower = path.lower()
         det   = detail.lower()
 
@@ -191,6 +195,7 @@ def _classify_registry_events(
                 "Persistence",
                 evidence=path,
                 reference="https://attack.mitre.org/techniques/T1547/001/",
+                process=process,
             )
             report.suspicious_registry.append(path)
 
@@ -202,6 +207,7 @@ def _classify_registry_events(
                 "Persistence",
                 evidence=path,
                 reference="https://attack.mitre.org/techniques/T1543/003/",
+                process=process,
             )
             report.suspicious_registry.append(path)
 
@@ -213,6 +219,7 @@ def _classify_registry_events(
                 "Persistence",
                 evidence=path,
                 reference="https://attack.mitre.org/techniques/T1547/004/",
+                process=process,
             )
             report.suspicious_registry.append(path)
 
@@ -224,6 +231,7 @@ def _classify_registry_events(
                 "Persistence",
                 evidence=path,
                 reference="https://attack.mitre.org/techniques/T1546/010/",
+                process=process,
             )
             report.suspicious_registry.append(path)
 
@@ -235,15 +243,16 @@ def _classify_registry_events(
                 "Persistence",
                 evidence=path,
                 reference="https://attack.mitre.org/techniques/T1546/012/",
+                process=process,
             )
             report.suspicious_registry.append(path)
 
-    # Events
+    # Events — ev.process 를 _check_reg_path 에 전달
     for ev in events:
         if ev.category == EventCategory.REGISTRY and ev.operation == "RegSetValue":
-            _check_reg_path(ev.path, ev.detail)
+            _check_reg_path(ev.path, ev.detail, process=ev.process)
 
-    # reg_diff["added"]
+    # reg_diff["added"] — 프로세스 정보 없음 (Regshot 스냅샷 기반)
     for entry in reg_diff.get("added", []):
         try:
             if isinstance(entry, dict):
@@ -316,6 +325,7 @@ def _classify_process_events(
                 "Impact",
                 evidence=ev.detail,
                 reference="https://attack.mitre.org/techniques/T1490/",
+                process=ev.process,
             )
             report.suspicious_processes.append(ev.detail)
 
@@ -327,6 +337,7 @@ def _classify_process_events(
                     tid, tname, tactic,
                     evidence=ev.detail or ev.path,
                     reference=ref,
+                    process=ev.process,
                 )
                 report.suspicious_processes.append(ev.detail or ev.path)
                 break  # only match the first pattern per event
@@ -340,6 +351,7 @@ def _classify_process_events(
                 "Execution",
                 evidence=ev.detail,
                 reference="https://attack.mitre.org/techniques/T1059/",
+                process=ev.process,
             )
             report.suspicious_processes.append(ev.detail)
 
@@ -536,8 +548,13 @@ def _add_evidence(
     evidence: str,
     reference: str = "",
     source: str = "로컬룰",
+    process: str = "",  # 발생 프로세스 이름 — 제공 시 "[process] evidence" 형식으로 기록
 ) -> None:
     """Insert or update a technique in *technique_map*, appending *evidence* and *source*."""
+    # 프로세스 이름을 증거 문자열 앞에 태그로 붙여 분석가가 어느 프로세스가
+    # 해당 기법을 유발했는지 바로 알 수 있도록 한다.
+    if process and evidence:
+        evidence = f"[{process}] {evidence}"
     if technique_id in technique_map:
         existing = technique_map[technique_id]
         if evidence and evidence not in existing.evidence:
