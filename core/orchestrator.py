@@ -322,6 +322,8 @@ class AnalysisResult:
     dns_attributed:     list  = field(default_factory=list)   # list[AttributedDnsQuery]
     # ── AI 분석 결과 ─────────────────────────────────────────────────
     ai_analysis:        dict  = field(default_factory=dict)   # AiAnalysisResult dict
+    # ── 프로세스 행위 역색인 ─────────────────────────────────────────
+    process_behaviors:  dict  = field(default_factory=dict)   # dict[int, ProcessBehavior]
 
 
 def run_analysis(
@@ -1068,6 +1070,18 @@ def run_analysis(
         result.process_diff,
         injection_events=_injection_events or None,
     )
+
+    # ── 프로세스 행위 역색인 (HTML expand 패널용) ────────────────────
+    try:
+        from analysis.process_behavior_map import build_process_behavior_map as _bpm
+        result.process_behaviors = _bpm(
+            result.filtered_events,
+            result.dns_attributed,
+            result.process_network_map,
+            result.process_diff.get("new_processes", []),
+        )
+    except Exception as _bpe:
+        result.errors.append(f"프로세스 행위 맵 실패: {_bpe}")
 
     # ── CAPA 정적 분석 (선택적) ──────────────────────────────────────
     from core.config_loader import load_config as _load_cfg

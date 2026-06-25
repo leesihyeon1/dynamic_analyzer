@@ -148,6 +148,20 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .pt-legend{display:flex;gap:1.2rem;font-size:.74rem;color:#8b949e;
            margin-bottom:.75rem;flex-wrap:wrap}
 .pt-legend span{display:flex;align-items:center;gap:.3rem}
+.proc-exp-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:0 .3rem;font-size:.72rem;line-height:1}
+.proc-exp-btn:hover{color:#c9d1d9}
+.beh-row td{padding:0!important;border-bottom:1px solid #30363d}
+.beh-panel{padding:.55rem .9rem .75rem;background:#0d1117}
+.beh-tabs{display:flex;gap:.22rem;margin-bottom:.45rem;flex-wrap:wrap}
+.beh-tab{background:#21262d;border:1px solid #30363d;color:#8b949e;padding:.15rem .5rem;border-radius:.22rem;cursor:pointer;font-size:.7rem}
+.beh-tab.beh-on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.beh-pane{display:none}
+.beh-pane.beh-on{display:block}
+.beh-list{list-style:none;padding:0;margin:0}
+.beh-list li{font-family:monospace;font-size:.7rem;color:#c9d1d9;padding:.1rem 0;border-bottom:1px solid #161b22;word-break:break-all}
+.beh-list li:last-child{border-bottom:none}
+.beh-sub{font-size:.68rem;font-weight:600;margin:.3rem 0 .1rem;text-transform:uppercase;letter-spacing:.04em}
+.beh-empty{color:#484f58;font-size:.72rem;font-style:italic}
 """
 
 _JS = """
@@ -168,10 +182,31 @@ function collapseAllPT() {
   document.querySelectorAll('.pt-arr').forEach(function(el){el.textContent='▶'});
 }
 
+function toggleProcBeh(pid) {
+  var row = document.getElementById('beh-row-' + pid);
+  var btn = document.getElementById('beh-btn-' + pid);
+  if (!row) return;
+  var opening = (row.style.display === 'none' || row.style.display === '');
+  row.style.display = opening ? 'table-row' : 'none';
+  if (btn) btn.textContent = opening ? '▼' : '▶';
+}
+
+function switchBeh(btn, prefix, tab) {
+  var panel = btn.closest ? btn.closest('.beh-panel') : btn.parentNode.parentNode;
+  if (!panel) return;
+  panel.querySelectorAll('.beh-tab').forEach(function(b){ b.classList.remove('beh-on'); });
+  panel.querySelectorAll('.beh-pane').forEach(function(p){ p.classList.remove('beh-on'); });
+  btn.classList.add('beh-on');
+  var pane = document.getElementById(prefix + '-' + tab);
+  if (pane) pane.classList.add('beh-on');
+}
+
 function setupTableControls(tableId, rowsPerPage) {
     var table = document.getElementById(tableId);
     if (!table) return;
-    var allRows = Array.prototype.slice.call(table.rows, 1);
+    var allRows = Array.prototype.slice.call(table.rows, 1).filter(function(r){
+        return !r.classList.contains('beh-row');
+    });
     if (allRows.length === 0) return;
 
     // 검색바 삽입
@@ -199,7 +234,11 @@ function setupTableControls(tableId, rowsPerPage) {
         var totalPages = Math.max(1, Math.ceil(total / rpp));
         if (cur > totalPages) cur = totalPages;
 
-        allRows.forEach(function(r) { r.style.display = 'none'; });
+        allRows.forEach(function(r) {
+            r.style.display = 'none';
+            var bid = r.getAttribute('data-behrow');
+            if (bid) { var brow = document.getElementById(bid); if (brow) brow.style.display = 'none'; }
+        });
         var start = (cur - 1) * rpp;
         filtered.slice(start, start + rpp).forEach(function(r) { r.style.display = ''; });
 
@@ -1901,19 +1940,26 @@ def _process_html(result) -> str:
             f"(화이트리스트 시스템 프로세스 또는 ProcMon 활동 없는 프로세스, 의심 탐지 없음)</p>"
         )
 
+    behaviors = getattr(result, "process_behaviors", {}) or {}
+
     rows = []
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
+        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors)
+        tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
+        exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
+                  if beh_btn else "<td style='width:26px'></td>")
         rows.append(
-            f"<tr>"
+            f"<tr{tr_behrow}>"
+            f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
             f"<td class='mono ev-process'>{_e(p.name)}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
-            f"</tr>"
+            f"</tr>{beh_detail_row}"
         )
     table_html = (
-        "<table id='tbl-process'><tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
+        "<table id='tbl-process'><tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
         + "".join(rows) + "</table>"
     )
 
@@ -1921,6 +1967,94 @@ def _process_html(result) -> str:
     all_procs_html = _all_procs_html(result, chain_pids={p.pid for p in new_procs})
 
     return tree_html + excl_note + table_html + all_procs_html
+
+
+def _behavior_panel_html(b, pid: int) -> str:
+    """ProcessBehavior → expand 패널 HTML."""
+    prefix = f"beh-{pid}"
+    tabs: list[tuple[str, str]] = []
+    panes: list[tuple[str, str]] = []
+
+    if b.children:
+        items = "".join(
+            f"<li>{_e(nm)} <span style='color:#484f58'>(PID {cp})</span></li>"
+            for cp, nm in b.children[:50]
+        )
+        tabs.append((f"자식 {len(b.children)}", "ch"))
+        panes.append(("ch", f"<ul class='beh-list'>{items}</ul>"))
+
+    nf = len(b.files_written) + len(b.files_deleted)
+    if nf:
+        html = ""
+        if b.files_written:
+            html += f"<p class='beh-sub' style='color:#56d364'>쓰기 ({len(b.files_written)})</p>"
+            html += "<ul class='beh-list'>" + "".join(
+                f"<li>{_e(p[:160])}</li>" for p in b.files_written[:50]) + "</ul>"
+        if b.files_deleted:
+            html += f"<p class='beh-sub' style='color:#ff7b72'>삭제 ({len(b.files_deleted)})</p>"
+            html += "<ul class='beh-list'>" + "".join(
+                f"<li>{_e(p[:160])}</li>" for p in b.files_deleted[:50]) + "</ul>"
+        tabs.append((f"파일 {nf}", "fi"))
+        panes.append(("fi", html))
+
+    nr = len(b.reg_written) + len(b.reg_deleted)
+    if nr:
+        html = ""
+        if b.reg_written:
+            html += f"<p class='beh-sub' style='color:#56d364'>쓰기 ({len(b.reg_written)})</p>"
+            html += "<ul class='beh-list'>" + "".join(
+                f"<li>{_e(p[:160])}</li>" for p in b.reg_written[:50]) + "</ul>"
+        if b.reg_deleted:
+            html += f"<p class='beh-sub' style='color:#ff7b72'>삭제 ({len(b.reg_deleted)})</p>"
+            html += "<ul class='beh-list'>" + "".join(
+                f"<li>{_e(p[:160])}</li>" for p in b.reg_deleted[:50]) + "</ul>"
+        tabs.append((f"레지스트리 {nr}", "re"))
+        panes.append(("re", html))
+
+    if b.tcp_conns:
+        items = "".join(f"<li>{_e(ip)}:{port}</li>" for ip, port in b.tcp_conns[:50])
+        tabs.append((f"네트워크 {len(b.tcp_conns)}", "ne"))
+        panes.append(("ne", f"<ul class='beh-list'>{items}</ul>"))
+
+    if b.dns_queries:
+        items = "".join(f"<li>{_e(d)}</li>" for d in b.dns_queries[:50])
+        tabs.append((f"DNS {len(b.dns_queries)}", "dn"))
+        panes.append(("dn", f"<ul class='beh-list'>{items}</ul>"))
+
+    if not tabs:
+        return "<div class='beh-panel'><span class='beh-empty'>행위 데이터 없음</span></div>"
+
+    first = tabs[0][1]
+    tabs_html = "".join(
+        f"<button onclick=\"switchBeh(this,'{prefix}','{key}')\" "
+        f"class='beh-tab{' beh-on' if key == first else ''}'>{_e(label)}</button>"
+        for label, key in tabs
+    )
+    panes_html = "".join(
+        f"<div class='beh-pane{' beh-on' if key == first else ''}' id='{prefix}-{key}'>{content}</div>"
+        for key, content in panes
+    )
+    return f"<div class='beh-panel'><div class='beh-tabs'>{tabs_html}</div>{panes_html}</div>"
+
+
+def _beh_cells(pid: int, behaviors: dict) -> tuple[str, str]:
+    """▶ 버튼 HTML + detail <tr> HTML을 반환합니다. 행위 없으면 빈 문자열 쌍."""
+    b = behaviors.get(pid)
+    if not b:
+        return "", ""
+    has_data = bool(b.files_written or b.files_deleted or b.reg_written
+                    or b.reg_deleted or b.tcp_conns or b.dns_queries or b.children)
+    if not has_data:
+        return "", ""
+    btn = (f"<button id='beh-btn-{pid}' class='proc-exp-btn' "
+           f"onclick='toggleProcBeh({pid})'>▶</button>")
+    panel = _behavior_panel_html(b, pid)
+    detail_row = (
+        f"<tr class='beh-row' id='beh-row-{pid}' style='display:none'>"
+        f"<td colspan='5' style='padding:0'>{panel}</td>"
+        f"</tr>"
+    )
+    return btn, detail_row
 
 
 def _all_procs_html(result, chain_pids: set) -> str:
@@ -1937,23 +2071,30 @@ def _all_procs_html(result, chain_pids: set) -> str:
         f"&nbsp;·&nbsp;<span style='opacity:.5'>흐린 행</span> = 악성 체인 외부</p>"
     )
 
+    behaviors = getattr(result, "process_behaviors", {}) or {}
+
     rows = []
     for p in table_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
-        tr_open = "<tr>" if p.pid in chain_pids else "<tr style='opacity:.45'>"
+        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors)
+        style = "" if p.pid in chain_pids else " style='opacity:.45'"
+        tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
+        exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
+                  if beh_btn else "<td style='width:26px'></td>")
         rows.append(
-            f"{tr_open}"
+            f"<tr{style}{tr_behrow}>"
+            f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
             f"<td class='mono ev-process'>{_e(p.name)}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
-            f"</tr>"
+            f"</tr>{beh_detail_row}"
         )
 
     return (
         note
         + "<table id='tbl-process-all'>"
-        + "<tr><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
+        + "<tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
         + "".join(rows)
         + "</table>"
     )
