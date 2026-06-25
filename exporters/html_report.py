@@ -3366,25 +3366,27 @@ def _volatility_html(result) -> str:
     # ── psxview ───────────────────────────────────────────────────────
     if psxview:
         hidden_entries = [e for e in psxview if e.get("hidden")]
+        _CHK  = "<span style='color:#3fb950'>✓</span>"
+        _MISS = "<span style='color:#ff7b72'>✗</span>"
+        _GRAY = "<span style='color:#484f58'>✗</span>"
         rows = ""
         for e in psxview[:60]:
-            is_hidden = e.get("hidden", False)
-            row_style = "background:#3d1f1f" if is_hidden else ""
+            is_hidden  = e.get("hidden", False)
+            row_style  = "background:#3d1f1f" if is_hidden else ""
+            td_color   = "#ff7b72" if is_hidden else "#8b949e"
+            td_weight  = "bold" if is_hidden else "normal"
+            hidden_lbl = "⚠ 은닉 의심" if is_hidden else "-"
+            pslist_sp  = _MISS if not e.get("pslist") else _CHK
+            psscan_sp  = _CHK  if e.get("psscan")    else _GRAY
+            csrss_sp   = _CHK  if e.get("csrss")     else _GRAY
             rows += (
                 f"<tr style='{row_style}'>"
-                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
-                f"<td class='mono'>{_e(e.get('name',''))}</td>"
-                f"<td style='text-align:center'>"
-                f"{'<span style=\"color:#ff7b72\">✗</span>' if not e.get('pslist') else '<span style=\"color:#3fb950\">✓</span>'}"
-                f"</td>"
-                f"<td style='text-align:center'>"
-                f"{'<span style=\"color:#3fb950\">✓</span>' if e.get('psscan') else '<span style=\"color:#484f58\">✗</span>'}"
-                f"</td>"
-                f"<td style='text-align:center'>"
-                f"{'<span style=\"color:#3fb950\">✓</span>' if e.get('csrss') else '<span style=\"color:#484f58\">✗</span>'}"
-                f"</td>"
-                f"<td style='color:{'#ff7b72' if is_hidden else '#8b949e'};font-weight:{'bold' if is_hidden else 'normal'}'>"
-                f"{'⚠ 은닉 의심' if is_hidden else '-'}</td>"
+                f"<td class='mono' style='color:#79c0ff'>{e.get('pid', '')}</td>"
+                f"<td class='mono'>{_e(e.get('name', ''))}</td>"
+                f"<td style='text-align:center'>{pslist_sp}</td>"
+                f"<td style='text-align:center'>{psscan_sp}</td>"
+                f"<td style='text-align:center'>{csrss_sp}</td>"
+                f"<td style='color:{td_color};font-weight:{td_weight}'>{hidden_lbl}</td>"
                 f"</tr>"
             )
         hidden_count = len(hidden_entries)
