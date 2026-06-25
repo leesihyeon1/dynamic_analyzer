@@ -199,6 +199,21 @@ class DNSQuery:
 
 
 @dataclass
+class DnsRawQuery:
+    """개별 DNS 쿼리 패킷 — 프로세스 귀속용.
+
+    src_port(클라이언트 ephemeral UDP 포트)가 ProcMon UDP Send 이벤트와
+    1:1 매핑되므로 어떤 프로세스가 이 도메인을 조회했는지 특정할 수 있다.
+    """
+    name:     str
+    qtype:    str
+    src_port: int       # 클라이언트 ephemeral UDP port — ProcMon 매핑 키
+    pkt_time: float     # 패킷 Unix 타임스탬프
+    tx_id:    int = 0   # DNS Transaction ID (보조 확인용)
+    answers:  list[str] = field(default_factory=list)  # 사후 채움
+
+
+@dataclass
 class HTTPRequest:
     method:         str
     host:           str
@@ -277,6 +292,7 @@ class PcapSummary:
 class PcapResult:
     connections:        list[NetworkConnection] = field(default_factory=list)
     dns_queries:        list[DNSQuery]          = field(default_factory=list)
+    raw_dns_queries:    list[DnsRawQuery]       = field(default_factory=list)
     http_requests:      list[HTTPRequest]       = field(default_factory=list)
     tls_info:           list[TLSInfo]           = field(default_factory=list)
     beacon_candidates:  list[BeaconCandidate]   = field(default_factory=list)
@@ -1012,6 +1028,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     dns_seen:     dict[str, DNSQuery]             = {}
     dns_responses:dict[str, list[str]]            = defaultdict(list)  # name→[ip]
     ip_to_domain: dict[str, list[str]]            = defaultdict(list)  # ip→[domain]
+    raw_dns_list: list[DnsRawQuery]               = []                 # 프로세스 귀속용
     http_list:    list[HTTPRequest]               = []
     tls_list:     list[TLSInfo]                   = []
     beacon_ts:    dict[tuple, list[float]]        = defaultdict(list)  # (ip,port)→[ts]
@@ -1103,6 +1120,13 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         qtype_str = _QTYPE_MAP.get(int(qr.qtype), str(qr.qtype))
                         raw_domains.add(name)
                         dns_base_cnt[_base_domain(name)] += 1
+
+                        # 프로세스 귀속용 raw 쿼리 — PTR·분석서비스 포함 모든 쿼리 기록
+                        raw_dns_list.append(DnsRawQuery(
+                            name=name, qtype=qtype_str,
+                            src_port=src_port, pkt_time=ts,
+                            tx_id=getattr(dns_pkt, "id", 0) or 0,
+                        ))
 
                         if name not in dns_seen:
                             # PTR 레코드(.in-addr.arpa / .ip6.arpa)와
@@ -1269,9 +1293,14 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     if pkt_errors:
         parse_error = f"패킷 파싱 오류 {len(pkt_errors)}건 (처음 오류: {pkt_errors[0]})"
 
+    # raw_dns_list: answers 채우기 (응답 패킷은 이미 dns_responses에 수집됨)
+    for _rq in raw_dns_list:
+        _rq.answers = list(set(dns_responses.get(_rq.name, [])))
+
     return PcapResult(
         connections=list(conn_map.values()),
         dns_queries=list(dns_seen.values()),
+        raw_dns_queries=raw_dns_list,
         http_requests=http_list,
         tls_info=tls_list,
         beacon_candidates=beacon_candidates,

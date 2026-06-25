@@ -1021,6 +1021,16 @@ def _network_html(result) -> str:
         for _mip in hostname_to_ips.get(_pn.remote_ip.lower(), []):
             proc_known_ips[_proc_key].add(_mip)
 
+    # DNS 귀속 룩업: domain → list["process(pid)"]
+    # AttributedDnsQuery.attributed=True 인 것만 사용 (src_port 매핑 성공)
+    dns_proc_lookup: dict[str, list[str]] = {}
+    for _aq in (getattr(result, "dns_attributed", []) or []):
+        if _aq.attributed and _aq.process:
+            _lbl = f"{_aq.process} ({_aq.pid})" if _aq.pid else _aq.process
+            _lst = dns_proc_lookup.setdefault(_aq.name, [])
+            if _lbl not in _lst:
+                _lst.append(_lbl)
+
     parts = []
 
     # pcap 없으면 기본 안내 배너만 추가 (decrypted/fakenet은 계속 처리)
@@ -1232,11 +1242,13 @@ def _network_html(result) -> str:
         sorted_dns   = sorted(pcap.dns_queries, key=lambda x: -x.entropy)
         rows = []
         for q in sorted_dns[:_DNS_LIMIT]:
-            dns_procs: list[str] = []
-            for rip in q.response_ips[:5]:
-                for p in ip_proc_lookup.get(rip, []):
-                    if p not in dns_procs:
-                        dns_procs.append(p)
+            # 직접 귀속(src_port 매핑) 우선, 없으면 응답 IP 역방향 조회
+            dns_procs: list[str] = dns_proc_lookup.get(q.name, [])
+            if not dns_procs:
+                for rip in q.response_ips[:5]:
+                    for p in ip_proc_lookup.get(rip, []):
+                        if p not in dns_procs:
+                            dns_procs.append(p)
             # 의심 배지 조합
             susp_badges = ""
             if q.suspicious:

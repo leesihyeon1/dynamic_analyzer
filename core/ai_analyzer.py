@@ -455,13 +455,40 @@ def _build_prompt(result) -> str:
                 if len(seen_tls) >= 12:
                     break
 
-        dns_q = getattr(pcap, "dns_queries", []) or []
-        if dns_q:
-            net_lines.append(f"### DNS 쿼리 ({len(dns_q)}건)")
-            for q in dns_q[:15]:
-                name = getattr(q, "name", str(q))
-                rips = ", ".join(getattr(q, "response_ips", [])[:2])
-                net_lines.append(f"- {_trunc(name, 70)}" + (f" → {rips}" if rips else ""))
+        dns_q        = getattr(pcap, "dns_queries", []) or []
+        dns_attr     = getattr(result, "dns_attributed", []) or []
+        dns_attr_ok  = [q for q in dns_attr if q.attributed]
+
+        if dns_attr_ok or dns_q:
+            total_dns = len(dns_attr) if dns_attr else len(dns_q)
+            attr_cnt  = len(dns_attr_ok)
+            net_lines.append(
+                f"### DNS 쿼리 ({total_dns}건"
+                + (f", 프로세스 귀속 {attr_cnt}건" if attr_cnt else "")
+                + ")"
+            )
+            if dns_attr_ok:
+                # 프로세스별로 그룹화해서 표시
+                seen_names: set[str] = set()
+                for q in dns_attr_ok[:20]:
+                    rips = ", ".join(q.answers[:2]) if q.answers else ""
+                    proc = f"{q.process}({q.pid})" if q.pid else q.process
+                    net_lines.append(
+                        f"- [{proc}] {_trunc(q.name, 65)}"
+                        + (f" → {rips}" if rips else "")
+                    )
+                    seen_names.add(q.name)
+                # 귀속 실패 건 (미상 프로세스)
+                unattr = [q for q in dns_attr if not q.attributed]
+                if unattr:
+                    net_lines.append(f"- [프로세스 미상 {len(unattr)}건]"
+                                     + " ".join(_trunc(q.name, 30) for q in unattr[:5]))
+            else:
+                # ProcMon 없거나 귀속 실패 — 기존 방식
+                for q in dns_q[:15]:
+                    name = getattr(q, "name", str(q))
+                    rips = ", ".join(getattr(q, "response_ips", [])[:2])
+                    net_lines.append(f"- {_trunc(name, 70)}" + (f" → {rips}" if rips else ""))
 
         http = getattr(pcap, "http_requests", []) or []
         if http:

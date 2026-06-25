@@ -318,6 +318,8 @@ class AnalysisResult:
     fakenet_result:     dict  = field(default_factory=dict)   # FakeNet-NG 결과 dict
     # ── 메모리 포렌식 결과 ───────────────────────────────────────────
     mem_forensics:      dict  = field(default_factory=dict)   # MemForensicsResult dict
+    # ── DNS ↔ 프로세스 귀속 결과 ────────────────────────────────────
+    dns_attributed:     list  = field(default_factory=list)   # list[AttributedDnsQuery]
     # ── AI 분석 결과 ─────────────────────────────────────────────────
     ai_analysis:        dict  = field(default_factory=dict)   # AiAnalysisResult dict
 
@@ -926,6 +928,18 @@ def run_analysis(
                 status(f"      [!] 비콘 의심 {len(pr.beacon_candidates)}개 탐지")
             if pr.suspicious_domains:
                 status(f"      [!] 의심 도메인 {len(pr.suspicious_domains)}개 (DGA/터널링)")
+            # ── DNS ↔ 프로세스 귀속 ──────────────────────────────────
+            if pr.raw_dns_queries:
+                try:
+                    from parsers.dns_correlator import correlate_dns
+                    result.dns_attributed = correlate_dns(
+                        pr.raw_dns_queries, result.procmon_events,
+                    )
+                    _attr_n = sum(1 for q in result.dns_attributed if q.attributed)
+                    status(f"      DNS 귀속: {_attr_n}/{len(result.dns_attributed)}건 "
+                           f"프로세스 매핑 성공")
+                except Exception as _de:
+                    result.errors.append(f"DNS 귀속 실패: {_de}")
     else:
         from parsers.pcap_parser import PcapResult as _PR
         result.pcap_result = _PR()
