@@ -132,6 +132,30 @@ _IP_CHECK_DOMAINS = frozenset({
     "ipecho.net", "ifconfig.me", "api.myip.com",
 })
 
+_MINING_POOL_DOMAINS = frozenset({
+    "pool.hashvault.pro", "pool.minexmr.com", "xmrpool.eu", "supportxmr.com",
+    "gulf.moneroocean.stream", "mine.xmrpool.net", "moneropool.com",
+    "nanopool.org", "2miners.com", "ethermine.org", "f2pool.com",
+    "antpool.com", "nicehash.com", "pool.bitcoin.com",
+    "xmr.pool.minergate.com", "xmr-eu1.nanopool.org", "xmr-eu2.nanopool.org",
+    "xmr-us-east1.nanopool.org", "monero.herominers.com",
+})
+
+_DOMAIN_THREAT_LABELS: dict = {
+    "pool.hashvault.pro":          "★Monero 채굴 풀 (XMRig)★",
+    "pool.minexmr.com":            "★Monero 채굴 풀★",
+    "supportxmr.com":              "★Monero 채굴 풀★",
+    "xmrpool.eu":                  "★XMR 채굴 풀★",
+    "gulf.moneroocean.stream":     "★Monero 채굴 풀★",
+    "mine.xmrpool.net":            "★XMR 채굴 풀★",
+    "moneropool.com":              "★Monero 채굴 풀★",
+    "nanopool.org":                "★채굴 풀★",
+    "xmr.pool.minergate.com":      "★Monero 채굴 풀★",
+    "nicehash.com":                "★채굴 브로커★",
+    "ethermine.org":               "★ETH 채굴 풀★",
+    "monero.herominers.com":       "★Monero 채굴 풀★",
+}
+
 _STEALER_IDS = frozenset({
     "T1056", "T1539", "T1555", "T1552", "T1114", "T1113",
 })
@@ -178,6 +202,9 @@ def _compute_tags(result) -> list[tuple[str, str]]:
         if dns_names & _IP_CHECK_DOMAINS:
             matched = dns_names & _IP_CHECK_DOMAINS
             tags.append(("ip-check", f"외부 IP 조회 도메인: {', '.join(sorted(matched)[:2])}"))
+        if dns_names & _MINING_POOL_DOMAINS:
+            matched = dns_names & _MINING_POOL_DOMAINS
+            tags.append(("cryptominer", f"채굴 풀 도메인 DNS 쿼리 확인: {', '.join(sorted(matched)[:3])}"))
         if getattr(pcap, "ftp_sessions", []):
             tags.append(("ftp", f"FTP 세션 {len(pcap.ftp_sessions)}개 감지"))
         if getattr(pcap, "smtp_sessions", []):
@@ -287,13 +314,23 @@ def _build_prompt(result) -> str:
     # pe-sieve / hollows-hunter 인젝션
     pe_list = getattr(result, "pe_sieve_results", []) or []
     pe_susp = [r for r in pe_list if not getattr(r, "error", "") and getattr(r, "suspicious", 0) > 0]
-    hh_r    = getattr(result, "hh_result", None)
-    hh_susp = []
-    if hh_r and not hh_r.error:
-        hh_susp = getattr(hh_r, "suspicious_processes", []) or []
+    hh_r = getattr(result, "hh_result", None)
+    hh_proc_results = []
+    if hh_r and not getattr(hh_r, "error", ""):
+        hh_proc_results = [
+            r for r in (getattr(hh_r, "process_results", []) or [])
+            if getattr(r, "suspicious", 0) > 0
+        ]
 
-    if pe_susp or hh_susp:
+    if pe_susp or hh_proc_results:
         lines.append("## 메모리 인젝션 탐지")
+        if hh_proc_results:
+            total_shc = sum(getattr(r, "implanted_shc", 0) for r in hh_proc_results)
+            total_pe  = sum(getattr(r, "implanted_pe", 0) for r in hh_proc_results)
+            lines.append(
+                f"hollows-hunter 요약: {len(hh_proc_results)}개 프로세스 의심, "
+                f"쉘코드 총 {total_shc}개, PE인젝션 총 {total_pe}개"
+            )
         for r in pe_susp[:6]:
             name   = getattr(r, "name", "")
             shc    = getattr(r, "implanted_shc", 0)
@@ -304,8 +341,13 @@ def _build_prompt(result) -> str:
             lines.append(
                 f"- [pe-sieve] PID {r.pid} {name}: 쉘코드 {shc}개, PE인젝션 {pe_inj}개{mod_str}"
             )
-        for sp in hh_susp[:4]:
-            lines.append(f"- [hollows-hunter] {_trunc(str(sp), 100)}")
+        for r in hh_proc_results[:8]:
+            shc    = getattr(r, "implanted_shc", 0)
+            pe_inj = getattr(r, "implanted_pe", 0)
+            name   = getattr(r, "name", "")
+            lines.append(
+                f"- [hollows-hunter] PID {r.pid} {name}: 쉘코드 {shc}개, PE인젝션 {pe_inj}개"
+            )
         lines.append("")
 
     # ── 파일 시스템 활동 ─────────────────────────────────────────────────
@@ -473,22 +515,38 @@ def _build_prompt(result) -> str:
                 for q in dns_attr_ok[:20]:
                     rips = ", ".join(q.answers[:2]) if q.answers else ""
                     proc = f"{q.process}({q.pid})" if q.pid else q.process
+                    threat_lbl = _DOMAIN_THREAT_LABELS.get(q.name.lower(), "")
                     net_lines.append(
                         f"- [{proc}] {_trunc(q.name, 65)}"
-                        + (f" → {rips}" if rips else "")
+                        + (f" → {rips}" if rips else " → DNS응답없음(차단추정)")
+                        + (f" {threat_lbl}" if threat_lbl else "")
                     )
                     seen_names.add(q.name)
                 # 귀속 실패 건 (미상 프로세스)
                 unattr = [q for q in dns_attr if not q.attributed]
                 if unattr:
-                    net_lines.append(f"- [프로세스 미상 {len(unattr)}건]"
-                                     + " ".join(_trunc(q.name, 30) for q in unattr[:5]))
+                    unattr_parts = []
+                    for q in unattr[:5]:
+                        threat_lbl = _DOMAIN_THREAT_LABELS.get(
+                            getattr(q, "name", "").lower(), ""
+                        )
+                        unattr_parts.append(
+                            _trunc(q.name, 30) + (f" {threat_lbl}" if threat_lbl else "")
+                        )
+                    net_lines.append(
+                        f"- [프로세스 미상 {len(unattr)}건] " + " ".join(unattr_parts)
+                    )
             else:
                 # ProcMon 없거나 귀속 실패 — 기존 방식
                 for q in dns_q[:15]:
                     name = getattr(q, "name", str(q))
                     rips = ", ".join(getattr(q, "response_ips", [])[:2])
-                    net_lines.append(f"- {_trunc(name, 70)}" + (f" → {rips}" if rips else ""))
+                    threat_lbl = _DOMAIN_THREAT_LABELS.get(name.lower(), "")
+                    net_lines.append(
+                        f"- {_trunc(name, 70)}"
+                        + (f" → {rips}" if rips else "")
+                        + (f" {threat_lbl}" if threat_lbl else "")
+                    )
 
         http = getattr(pcap, "http_requests", []) or []
         if http:
