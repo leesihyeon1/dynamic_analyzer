@@ -150,6 +150,12 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .pt-legend span{display:flex;align-items:center;gap:.3rem}
 .proc-exp-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:0 .3rem;font-size:.72rem;line-height:1}
 .proc-exp-btn:hover{color:#c9d1d9}
+.act-badge{font-size:.6rem;padding:1px 5px;border-radius:3px;margin:0 2px 0 0;white-space:nowrap;font-weight:600;display:inline-block;line-height:1.45}
+.act-file{background:#0d1f37;color:#79c0ff}
+.act-reg{background:#2d270a;color:#e3b341}
+.act-net{background:#0d2415;color:#56d364}
+.act-dns{background:#1a0d37;color:#d2a8ff}
+.act-child{background:#2d1a0a;color:#ffa657}
 .beh-row td{padding:0!important;border-bottom:1px solid #30363d}
 .beh-panel{padding:.55rem .9rem .75rem;background:#0d1117}
 .beh-tabs{display:flex;gap:.22rem;margin-bottom:.45rem;flex-wrap:wrap}
@@ -1946,6 +1952,11 @@ def _process_html(result) -> str:
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
         beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors)
+        badges = _activity_badges_html(behaviors.get(p.pid))
+        name_cell = (
+            f"<div class='mono ev-process'>{_e(p.name)}</div>"
+            f"<div style='margin-top:2px'>{badges}</div>"
+        ) if badges else f"<div class='mono ev-process'>{_e(p.name)}</div>"
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
         exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
                   if beh_btn else "<td style='width:26px'></td>")
@@ -1953,7 +1964,7 @@ def _process_html(result) -> str:
             f"<tr{tr_behrow}>"
             f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
-            f"<td class='mono ev-process'>{_e(p.name)}</td>"
+            f"<td>{name_cell}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
             f"</tr>{beh_detail_row}"
@@ -2057,6 +2068,158 @@ def _beh_cells(pid: int, behaviors: dict) -> tuple[str, str]:
     return btn, detail_row
 
 
+def _activity_badges_html(b) -> str:
+    """ProcessBehavior → 행위 카테고리 배지 HTML (행에 바로 표시)."""
+    if b is None:
+        return ""
+    parts = []
+    nf = len(b.files_written) + len(b.files_deleted)
+    nr = len(b.reg_written)   + len(b.reg_deleted)
+    nn = len(b.tcp_conns)
+    nd = len(b.dns_queries)
+    nc = len(b.children)
+    if nf: parts.append(f"<span class='act-badge act-file'>파일 {nf}</span>")
+    if nr: parts.append(f"<span class='act-badge act-reg'>레지 {nr}</span>")
+    if nn: parts.append(f"<span class='act-badge act-net'>넷 {nn}</span>")
+    if nd: parts.append(f"<span class='act-badge act-dns'>DNS {nd}</span>")
+    if nc: parts.append(f"<span class='act-badge act-child'>자식 {nc}</span>")
+    return "".join(parts)
+
+
+def _quick_scan_card_html(result) -> str:
+    """LLM 없이 수집 데이터로 즉시 생성하는 빠른 위협 요약 카드."""
+    findings: list[tuple[str, str, str]] = []  # (level, title, detail)
+
+    pcap = result.pcap_result
+
+    # FTP 유출
+    if pcap:
+        for s in (getattr(pcap, "ftp_sessions", []) or [])[:2]:
+            detail = f"{s.dst_ip}:{s.dst_port}"
+            if getattr(s, "uploaded", []):
+                detail += f" · 업로드 {len(s.uploaded)}건"
+            findings.append(("critical", "FTP 데이터 유출 확인", detail))
+        for s in (getattr(pcap, "smtp_sessions", []) or [])[:2]:
+            findings.append(("critical", "SMTP C2 연결 확인",
+                              f"{s.dst_ip}:{s.dst_port}"))
+
+    # 메모리 인젝션
+    pe_list = getattr(result, "pe_sieve_results", []) or []
+    pe_susp = [r for r in pe_list
+               if not getattr(r, "error", "") and getattr(r, "suspicious", 0) > 0]
+    if pe_susp:
+        names = ", ".join(getattr(r, "name", f"PID {r.pid}") for r in pe_susp[:3])
+        findings.append(("critical", f"메모리 인젝션·쉘코드 {len(pe_susp)}건", names))
+
+    hh_r = getattr(result, "hh_result", None)
+    if hh_r and not getattr(hh_r, "error", None):
+        hh_susp = getattr(hh_r, "suspicious_processes", []) or []
+        if hh_susp:
+            findings.append(("critical", f"프로세스 인젝션/할로잉 {len(hh_susp)}건", ""))
+
+    # Volatility 숨김 프로세스
+    mf = getattr(result, "mem_forensics", {}) or {}
+    hidden_procs = [p for p in (mf.get("psxview") or []) if p.get("hidden")]
+    if hidden_procs:
+        names = ", ".join(p.get("name", f"PID {p.get('pid','')}") for p in hidden_procs[:3])
+        findings.append(("critical", f"루트킷 의심 숨김 프로세스 {len(hidden_procs)}건", names))
+
+    # 레지스트리 지속성
+    reg_diff = result.registry_diff or {}
+    _PERSIST_KEYS = ("\\run\\", "\\runonce\\")
+    persist_reg = [r for r in (reg_diff.get("added", []) or [])
+                   if any(k in str(r[0]).lower() for k in _PERSIST_KEYS)]
+    if persist_reg:
+        findings.append(("high", f"레지스트리 지속성 {len(persist_reg)}건",
+                          str(persist_reg[0][0])[-80:]))
+
+    # 외부 TCP 연결
+    if pcap:
+        ext = [c for c in (getattr(pcap, "connections", []) or [])
+               if not _is_private_ip_str(getattr(c, "dst_ip", ""))]
+        if ext:
+            sample = ", ".join(f"{c.dst_ip}:{c.dst_port}" for c in ext[:3])
+            findings.append(("high", f"외부 TCP 연결 {len(ext)}건", sample))
+
+    # 드롭 실행 파일
+    ioc = result.ioc_report
+    _EXE_EXT = frozenset({".exe", ".dll", ".sys", ".bat", ".ps1", ".vbs", ".js"})
+    if ioc and getattr(ioc, "dropped_files", None):
+        drop_exe = [f for f in ioc.dropped_files
+                    if any(str(f).lower().endswith(e) for e in _EXE_EXT)]
+        if drop_exe:
+            findings.append(("high", f"실행 파일 드롭 {len(drop_exe)}건",
+                              str(drop_exe[0])[-80:]))
+
+    # 외부 IP 조회
+    _IP_LOOKUP = frozenset({"ip-api.com", "ipify.org", "api.ipify.org",
+                             "checkip.amazonaws.com", "ipinfo.io", "icanhazip.com"})
+    if pcap:
+        dns_names = {getattr(q, "name", "").lower()
+                     for q in (getattr(pcap, "dns_queries", []) or [])}
+        matched = dns_names & _IP_LOOKUP
+        if matched:
+            findings.append(("medium", "외부 IP 조회 탐지",
+                              ", ".join(sorted(matched)[:3])))
+
+    # MITRE ATT&CK 요약
+    br = result.behavior_report
+    if br and getattr(br, "techniques", None):
+        n = len(br.techniques)
+        tactics = {t.tactic for t in br.techniques}
+        crit = tactics & {"Exfiltration", "Command and Control", "Privilege Escalation"}
+        if crit:
+            findings.append(("high", f"MITRE 고위험 전술 {len(crit)}개",
+                              ", ".join(sorted(crit))))
+        else:
+            findings.append(("medium", f"MITRE ATT&CK {n}건 탐지",
+                              ", ".join(sorted(tactics)[:4])))
+
+    # 신규 프로세스
+    new_procs = (result.process_diff or {}).get("new_processes", [])
+    if new_procs:
+        names = ", ".join(getattr(p, "name", "") for p in new_procs[:4])
+        if len(new_procs) > 4:
+            names += f" 외 {len(new_procs)-4}개"
+        findings.append(("info", f"신규 프로세스 {len(new_procs)}개", names))
+
+    if not findings:
+        return ""
+
+    _LVL = {
+        "critical": ("#ff7b72", "#2d1117", "CRITICAL"),
+        "high":     ("#ffa657", "#2d1f0a", "HIGH"),
+        "medium":   ("#e3b341", "#2d2a0a", "MEDIUM"),
+        "info":     ("#79c0ff", "#0d1f37", "INFO"),
+    }
+    _ORDER = {"critical": 0, "high": 1, "medium": 2, "info": 3}
+
+    rows = []
+    for level, title, detail in sorted(findings, key=lambda x: _ORDER.get(x[0], 9))[:8]:
+        color, bg, label = _LVL.get(level, ("#8b949e", "#21262d", level.upper()))
+        det = (f"<span style='color:#6e7681;font-size:.76rem;margin-left:.1rem'>"
+               f"{_e(detail)}</span>") if detail else ""
+        rows.append(
+            f"<div style='display:flex;align-items:center;gap:.55rem;"
+            f"padding:.3rem 0;border-bottom:1px solid #21262d'>"
+            f"<span style='background:{bg};color:{color};border:1px solid {color};"
+            f"border-radius:3px;padding:1px 7px;font-size:.66rem;font-weight:700;"
+            f"flex-shrink:0;letter-spacing:.04em'>{label}</span>"
+            f"<span style='font-size:.82rem;color:#c9d1d9;font-weight:500;flex-shrink:0'>"
+            f"{_e(title)}</span>"
+            f"{det}</div>"
+        )
+
+    return (
+        f"<div class='card' style='margin-bottom:1.2rem;"
+        f"border-left:3px solid #ffa657;padding:.7rem 1rem'>"
+        f"<p style='font-size:.67rem;color:#6e7681;text-transform:uppercase;"
+        f"letter-spacing:.06em;margin-bottom:.4rem'>빠른 위협 요약</p>"
+        + "".join(rows)
+        + "</div>"
+    )
+
+
 def _all_procs_html(result, chain_pids: set) -> str:
     """화이트리스트 오탐만 제외한 신규 프로세스 전체 기록 테이블."""
     all_new = result.process_diff.get("new_processes", [])
@@ -2077,6 +2240,11 @@ def _all_procs_html(result, chain_pids: set) -> str:
     for p in table_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
         beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors)
+        badges = _activity_badges_html(behaviors.get(p.pid))
+        name_cell = (
+            f"<div class='mono ev-process'>{_e(p.name)}</div>"
+            f"<div style='margin-top:2px'>{badges}</div>"
+        ) if badges else f"<div class='mono ev-process'>{_e(p.name)}</div>"
         style = "" if p.pid in chain_pids else " style='opacity:.45'"
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
         exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
@@ -2085,7 +2253,7 @@ def _all_procs_html(result, chain_pids: set) -> str:
             f"<tr{style}{tr_behrow}>"
             f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
-            f"<td class='mono ev-process'>{_e(p.name)}</td>"
+            f"<td>{name_cell}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
             f"</tr>{beh_detail_row}"
@@ -3577,6 +3745,11 @@ def _ai_html(result) -> str:
     error     = ai.get("error", "")
 
     parts = ["<h2>🤖 AI 위협 분석</h2>"]
+
+    # 빠른 위협 요약 카드 — LLM 없이 데이터 기반으로 즉시 생성
+    quick_card = _quick_scan_card_html(result)
+    if quick_card:
+        parts.append(quick_card)
 
     # 메타
     parts.append(
