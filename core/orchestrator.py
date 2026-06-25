@@ -1071,18 +1071,6 @@ def run_analysis(
         injection_events=_injection_events or None,
     )
 
-    # ── 프로세스 행위 역색인 (HTML expand 패널용) ────────────────────
-    try:
-        from analysis.process_behavior_map import build_process_behavior_map as _bpm
-        result.process_behaviors = _bpm(
-            result.filtered_events,
-            result.dns_attributed,
-            result.process_network_map,
-            result.process_diff.get("new_processes", []),
-        )
-    except Exception as _bpe:
-        result.errors.append(f"프로세스 행위 맵 실패: {_bpe}")
-
     # ── CAPA 정적 분석 (선택적) ──────────────────────────────────────
     from core.config_loader import load_config as _load_cfg
     _cfg = _load_cfg()
@@ -1201,6 +1189,19 @@ def run_analysis(
 
     if result.process_network_map:
         status(f"      총 {len(result.process_network_map)}개 연결 집계")
+
+    # ── 프로세스 행위 역색인 (HTML expand 패널용) ────────────────────
+    # process_network_map 완성 후 호출해야 tcp_conns가 채워집니다.
+    try:
+        from analysis.process_behavior_map import build_process_behavior_map as _bpm
+        result.process_behaviors = _bpm(
+            result.filtered_events,
+            result.dns_attributed,
+            result.process_network_map,
+            result.process_diff.get("new_processes", []),
+        )
+    except Exception as _bpe:
+        result.errors.append(f"프로세스 행위 맵 실패: {_bpe}")
 
     # ── 메모리 포렌식 (Volatility3) ──────────────────────────────────
     if config.use_memdump:
