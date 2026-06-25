@@ -217,13 +217,15 @@ _NETSTAT_RE = re.compile(
 )
 
 
-def capture_netstat_snapshot() -> list[tuple[str, int, int]]:
+def capture_netstat_snapshot() -> list[tuple[str, int, int, str]]:
     """현재 ESTABLISHED TCP 연결을 `netstat -ano`로 캡처.
 
     Returns
     -------
-    list of (remote_ip, remote_port, pid)
+    list of (remote_ip, remote_port, pid, proc_name)
         사설 IP 및 루프백은 제외됩니다.
+        proc_name은 캡처 시점에 psutil로 즉시 조회합니다 — 프로세스가
+        분석 종료 후 종료되더라도 이름이 보존됩니다.
     """
     try:
         out = subprocess.run(
@@ -233,18 +235,29 @@ def capture_netstat_snapshot() -> list[tuple[str, int, int]]:
     except Exception:
         return []
 
-    results: list[tuple[str, int, int]] = []
+    try:
+        import psutil as _psutil
+    except ImportError:
+        _psutil = None  # type: ignore[assignment]
+
+    results: list[tuple[str, int, int, str]] = []
     for m in _NETSTAT_RE.finditer(out):
         remote_ip   = m.group(1)
         remote_port = int(m.group(2))
         pid         = int(m.group(3))
         if not _is_private(remote_ip):
-            results.append((remote_ip, remote_port, pid))
+            proc_name = ""
+            if _psutil is not None:
+                try:
+                    proc_name = _psutil.Process(pid).name()
+                except Exception:
+                    pass
+            results.append((remote_ip, remote_port, pid, proc_name))
     return results
 
 
 def build_netstat_proc_map(
-    snapshots:      list[list[tuple[str, int, int]]],
+    snapshots:      list[list[tuple]],
     proc_snapshots: "dict | None" = None,
 ) -> list[ProcNetConnection]:
     """netstat 스냅샷 목록 → ProcNetConnection 목록.
@@ -256,23 +269,32 @@ def build_netstat_proc_map(
     ----------
     snapshots:
         ``capture_netstat_snapshot()`` 반환값 목록.
+        4-튜플 (remote_ip, remote_port, pid, proc_name) — 캡처 시점 이름 포함.
+        구형 3-튜플 (remote_ip, remote_port, pid) 도 허용합니다.
     proc_snapshots:
-        ``dict[int, ProcessSnapshot]`` — PID → 프로세스 정보.
-        None이거나 해당 PID가 없으면 psutil 조회로 폴백합니다.
+        ``dict[int, ProcessSnapshot]`` — PID → 프로세스 정보 (보조 fallback).
     """
     if not snapshots:
         return []
 
     agg: dict[tuple[int, str, int], int] = defaultdict(int)
+    snap_names: dict[tuple[int, str, int], str] = {}  # 캡처 시점 이름 (최초 비어있지 않은 값)
+
     for snap in snapshots:
-        for (remote_ip, remote_port, pid) in snap:
-            agg[(pid, remote_ip, remote_port)] += 1
+        for entry in snap:
+            remote_ip, remote_port, pid = entry[0], entry[1], entry[2]
+            snap_proc = entry[3] if len(entry) >= 4 else ""
+            key = (pid, remote_ip, remote_port)
+            agg[key] += 1
+            if snap_proc and key not in snap_names:
+                snap_names[key] = snap_proc
 
     connections: list[ProcNetConnection] = []
     for (pid, remote_ip, remote_port), count in agg.items():
-        # PID → 프로세스명 조회
-        proc_name = ""
-        if proc_snapshots and pid in proc_snapshots:
+        key = (pid, remote_ip, remote_port)
+        # 우선순위: ① 캡처 시점 이름 → ② proc_after_snapshot → ③ psutil 라이브 → ④ pid_{pid}
+        proc_name = snap_names.get(key, "")
+        if not proc_name and proc_snapshots and pid in proc_snapshots:
             ps = proc_snapshots[pid]
             proc_name = getattr(ps, "name", "") or ""
         if not proc_name:

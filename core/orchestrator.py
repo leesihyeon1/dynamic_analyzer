@@ -511,7 +511,7 @@ def run_analysis(
 
     # ── 4. 모니터링 대기 ──────────────────────────────────────────────
     status(f"[4/6] 모니터링 중... ({config.timeout}초)  Ctrl+C로 조기 종료 가능")
-    _netstat_snaps: list[list[tuple[str, int, int]]] = []  # KeyboardInterrupt 전 참조 방지
+    _netstat_snaps: list[list[tuple]] = []  # KeyboardInterrupt 전 참조 방지
 
     # ── 실시간 프로세스 감시 시작 (신규 PID → 즉시 pe-sieve 스캔)
     # proc_before에 없는 PID가 생성되면 1초 이내에 자동 스캔하여
