@@ -3407,7 +3407,6 @@ def _render_classification(body: str) -> str:
         threat_color = "#56d364"; threat_bg = "rgba(86,211,100,.10)"
 
     # 태그 파싱 (태그 및 해석 블록)
-    # 태그 블록이 섹션 끝에 있어도 캡처되도록 lookahead에 $ 별도 처리
     tag_block_m = _re.search(
         r"(?:태그 및 해석|Tags & interpretation)[:\s]*\n([\s\S]+?)(?=\n(?:위협|주요|설명)|$)",
         body, _re.IGNORECASE,
@@ -3415,27 +3414,30 @@ def _render_classification(body: str) -> str:
     tag_html = ""
     if tag_block_m:
         tag_lines = tag_block_m.group(1).strip().splitlines()
-        chips = []
+        tag_rows = []
         for tl_line in tag_lines:
             tl_line = tl_line.strip().lstrip("-•").strip()
             if not tl_line:
                 continue
-            # "[tag]: 설명" 또는 "tag: 설명" 형태 모두 처리
             tm = _re.match(r"^\[?([a-zA-Z가-힣/_\-]+)\]?:\s*(.+)", tl_line)
             if tm:
-                chip_label = _e(tm.group(1).strip())
-                chip_title = _e(tm.group(2).strip())
-                chips.append(
-                    f"<span title='{chip_title}' style='display:inline-block;"
-                    f"background:#1f2d3d;border:1px solid #30363d;border-radius:12px;"
-                    f"padding:2px 10px;font-size:.75rem;color:#79c0ff;margin:2px 3px 2px 0;"
-                    f"cursor:help'>{chip_label}</span>"
+                badge = _e(tm.group(1).strip())
+                desc  = _e(tm.group(2).strip())
+                tag_rows.append(
+                    f"<div style='display:flex;align-items:flex-start;gap:.55rem;"
+                    f"padding:.28rem 0;border-bottom:1px solid #21262d'>"
+                    f"<span style='flex-shrink:0;background:#1f2d3d;border:1px solid #264466;"
+                    f"border-radius:10px;padding:1px 9px;font-size:.7rem;color:#79c0ff;"
+                    f"white-space:nowrap;margin-top:2px'>{badge}</span>"
+                    f"<span style='font-size:.82rem;color:#8b949e;line-height:1.5'>{desc}</span>"
+                    f"</div>"
                 )
-        if chips:
+        if tag_rows:
             tag_html = (
-                "<div style='margin-top:.6rem'>"
-                "<span style='font-size:.75rem;color:#8b949e;margin-right:.4rem'>태그</span>"
-                + "".join(chips) + "</div>"
+                f"<div style='margin-top:.7rem;border-top:1px solid #21262d;padding-top:.45rem'>"
+                f"<p style='font-size:.68rem;color:#6e7681;margin-bottom:.3rem;"
+                f"text-transform:uppercase;letter-spacing:.05em'>태그 및 해석</p>"
+                + "".join(tag_rows) + "</div>"
             )
 
     return (
