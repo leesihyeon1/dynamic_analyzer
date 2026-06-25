@@ -350,6 +350,7 @@ def run_analysis(
     from core.process_tracker  import (
         take_process_snapshot, diff_process_snapshots,
         find_process_hacker, launch_process_hacker,
+        _ANALYSIS_TOOL_PROC_NAMES,
     )
     from parsers.procmon_csv   import parse_csv, get_child_pids as pm_child_pids
     from parsers.pcap_parser   import parse_pcap, PcapResult
@@ -844,6 +845,8 @@ def run_analysis(
         def _add_proc(_ci: ChildProcInfo) -> None:
             """합성 ProcessSnapshot을 new_processes / all_pids 에 추가."""
             nonlocal _added
+            if _ci.name.lower() in _ANALYSIS_TOOL_PROC_NAMES:
+                return  # 분석 도구 자신은 신규 프로세스 목록에서 제외
             result.process_diff["new_processes"].append(_ProcSnap(
                 pid         = _ci.child_pid,
                 ppid        = _ci.parent_pid,

@@ -29,6 +29,7 @@ import psutil
 # (lowercased for case-insensitive comparison)
 # ---------------------------------------------------------------------------
 _ANALYSIS_TOOL_PROC_NAMES: frozenset[str] = frozenset({
+    # Process monitors / explorers
     "systeminformer.exe",
     "processhacker.exe",
     "procmon.exe",
@@ -37,8 +38,21 @@ _ANALYSIS_TOOL_PROC_NAMES: frozenset[str] = frozenset({
     "procexp64.exe",
     "zoomit.exe",
     "zoomit64.exe",
+    # Network capture
     "tshark.exe",
     "dumpcap.exe",
+    "wireshark.exe",
+    "etwdump.exe",       # Wireshark ETW extcap (child of tshark)
+    # Memory / injection scanners
+    "hollows_hunter.exe",
+    "pe-sieve64.exe",
+    "pe-sieve32.exe",
+    "pe-sieve.exe",
+    "pesieve64.exe",
+    "pesieve.exe",
+    # Fakenet / network simulation
+    "fakenet.exe",
+    "fakenet-ng.exe",
 })
 
 # ---------------------------------------------------------------------------
