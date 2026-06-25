@@ -1948,10 +1948,12 @@ def _process_html(result) -> str:
 
     behaviors = getattr(result, "process_behaviors", {}) or {}
 
+    _http_by_conn = _build_http_by_conn(result)
+
     rows = []
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
-        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors)
+        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors, _http_by_conn)
         badges = _activity_badges_html(behaviors.get(p.pid))
         name_cell = (
             f"<div class='mono ev-process'>{_e(p.name)}</div>"
@@ -1980,7 +1982,7 @@ def _process_html(result) -> str:
     return tree_html + excl_note + table_html + all_procs_html
 
 
-def _behavior_panel_html(b, pid: int) -> str:
+def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
     """ProcessBehavior → expand 패널 HTML."""
     prefix = f"beh-{pid}"
     tabs: list[tuple[str, str]] = []
@@ -2023,7 +2025,29 @@ def _behavior_panel_html(b, pid: int) -> str:
         panes.append(("re", html))
 
     if b.tcp_conns:
-        items = "".join(f"<li>{_e(ip)}:{port}</li>" for ip, port in b.tcp_conns[:50])
+        _hbc = http_by_conn or {}
+        item_parts = []
+        for ip, port in b.tcp_conns[:50]:
+            reqs = _hbc.get((ip, port), [])
+            if reqs:
+                # HTTP 요청 상세: 메서드+경로 표시 (최대 5건)
+                req_lines = "".join(
+                    f"<div style='font-size:.70rem;color:#79c0ff;padding-left:.8rem'>"
+                    f"{_e(r.method)} "
+                    f"<span title='{_e(f\"http://{r.host}{r.path}\")}'>"
+                    f"{_e(r.path[:120] or '/')}</span>"
+                    + (f" <span style='color:#6e7681'>({_fmt_bytes(r.content_length)})</span>" if r.content_length else "")
+                    + "</div>"
+                    for r in reqs[:5]
+                )
+                item_parts.append(
+                    f"<li>{_e(ip)}:{port}"
+                    f"<span style='font-size:.70rem;color:#56d364'> HTTP</span>"
+                    f"{req_lines}</li>"
+                )
+            else:
+                item_parts.append(f"<li>{_e(ip)}:{port}</li>")
+        items = "".join(item_parts)
         tabs.append((f"네트워크 {len(b.tcp_conns)}", "ne"))
         panes.append(("ne", f"<ul class='beh-list'>{items}</ul>"))
 
@@ -2048,7 +2072,21 @@ def _behavior_panel_html(b, pid: int) -> str:
     return f"<div class='beh-panel'><div class='beh-tabs'>{tabs_html}</div>{panes_html}</div>"
 
 
-def _beh_cells(pid: int, behaviors: dict) -> tuple[str, str]:
+def _build_http_by_conn(result) -> dict:
+    """pcap_result.http_requests → {(dst_ip, dst_port): [HTTPRequest, ...]}."""
+    out: dict = {}
+    _pcap = getattr(result, "pcap_result", None)
+    if not _pcap:
+        return out
+    for _req in (getattr(_pcap, "http_requests", None) or []):
+        _ip = getattr(_req, "dst_ip", "")
+        _port = getattr(_req, "dst_port", 80)
+        if _ip:
+            out.setdefault((_ip, _port), []).append(_req)
+    return out
+
+
+def _beh_cells(pid: int, behaviors: dict, http_by_conn: dict = None) -> tuple[str, str]:
     """▶ 버튼 HTML + detail <tr> HTML을 반환합니다. 행위 없으면 빈 문자열 쌍."""
     b = behaviors.get(pid)
     if not b:
@@ -2059,7 +2097,7 @@ def _beh_cells(pid: int, behaviors: dict) -> tuple[str, str]:
         return "", ""
     btn = (f"<button id='beh-btn-{pid}' class='proc-exp-btn' "
            f"onclick='toggleProcBeh({pid})'>▶</button>")
-    panel = _behavior_panel_html(b, pid)
+    panel = _behavior_panel_html(b, pid, http_by_conn)
     detail_row = (
         f"<tr class='beh-row' id='beh-row-{pid}' style='display:none'>"
         f"<td colspan='5' style='padding:0'>{panel}</td>"
@@ -2236,10 +2274,12 @@ def _all_procs_html(result, chain_pids: set) -> str:
 
     behaviors = getattr(result, "process_behaviors", {}) or {}
 
+    _http_by_conn2 = _build_http_by_conn(result)
+
     rows = []
     for p in table_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
-        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors)
+        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors, _http_by_conn2)
         badges = _activity_badges_html(behaviors.get(p.pid))
         name_cell = (
             f"<div class='mono ev-process'>{_e(p.name)}</div>"
