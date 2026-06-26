@@ -17,7 +17,7 @@ import re as _re
 import time
 import urllib.request
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -32,11 +32,12 @@ _MAX_PROMPT_CHARS = 10_000
 
 @dataclass
 class AiAnalysisResult:
-    model:        str   = DEFAULT_MODEL
-    response:     str   = ""    # Ollama 응답 원문 (마크다운)
-    elapsed_sec:  float = 0.0
-    prompt_chars: int   = 0
-    error:        str   = ""
+    model:             str   = DEFAULT_MODEL
+    response:          str   = ""    # Ollama 응답 원문 (마크다운)
+    elapsed_sec:       float = 0.0
+    prompt_chars:      int   = 0
+    error:             str   = ""
+    mitre_techniques:  list  = field(default_factory=list)  # 파싱된 MITRE 기법 [{id,name,tactic,evidence}]
 
 
 # ── Ollama 가용성 확인 ────────────────────────────────────────────────────────
@@ -237,6 +238,96 @@ def _compute_tags(result) -> list[tuple[str, str]]:
         tags.append(("phishing", "문서 템플릿 인젝션 (T1221) — 이메일 기반 배포 가능성"))
 
     return tags
+
+
+# ── AI MITRE 파싱 + 병합 ─────────────────────────────────────────────────────
+
+def parse_mitre_from_ai(response: str) -> list:
+    """AI 응답의 '마이터 기법 목록' 섹션을 파싱해 구조화된 기법 목록을 반환한다.
+
+    형식: T기법ID|기법명(영문)|전술명(영문)|구체적 근거
+    """
+    results: list = []
+    in_section = False
+    _NEXT_SECTIONS = frozenset({
+        "분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "확인된 IOC", "결론",
+        "Analytical classification", "Executive summary",
+        "Execution flow", "Behavioral analysis", "Conclusion",
+    })
+    for line in response.split("\n"):
+        stripped = line.strip()
+        if stripped == "마이터 기법 목록":
+            in_section = True
+            continue
+        if not in_section:
+            continue
+        if not stripped:
+            break  # 빈 줄 = 섹션 끝
+        if stripped == "없음":
+            break
+        if stripped in _NEXT_SECTIONS:
+            break
+        parts = [p.strip() for p in stripped.split("|")]
+        if len(parts) >= 4:
+            tid = parts[0]
+            if _re.match(r"^T\d{4}(\.\d{3})?$", tid):
+                results.append({
+                    "id":       tid,
+                    "name":     parts[1],
+                    "tactic":   parts[2],
+                    "evidence": parts[3],
+                })
+    return results
+
+
+def merge_ai_mitre(behavior_report, ai_techniques: list) -> None:
+    """AI 분석에서 추출한 MITRE 기법을 behavior_report에 병합한다.
+
+    - 이미 존재하는 technique_id → 'AI' 소스와 증거만 추가
+    - 새 기법 → MitreTechnique 생성 후 추가, 전술순 재정렬
+    """
+    if not behavior_report or not ai_techniques:
+        return
+    try:
+        from analysis.behavior_classifier import MitreTechnique, _tactic_key
+    except ImportError:
+        return
+
+    existing_map = {t.technique_id: t for t in behavior_report.techniques}
+    added = False
+
+    for item in ai_techniques:
+        tid    = item.get("id", "")
+        tname  = item.get("name", "")
+        tactic = item.get("tactic", "")
+        tevid  = item.get("evidence", "")
+        if not tid or not tname or not tactic:
+            continue
+
+        ai_ev = f"[AI] {tevid}" if tevid else "[AI]"
+
+        if tid in existing_map:
+            t = existing_map[tid]
+            if ai_ev not in t.evidence:
+                t.evidence.append(ai_ev)
+            if "AI" not in t.sources:
+                t.sources.append("AI")
+        else:
+            ref = f"https://attack.mitre.org/techniques/{tid.replace('.', '/')}/"
+            new_t = MitreTechnique(
+                technique_id   = tid,
+                technique_name = tname,
+                tactic         = tactic,
+                evidence       = [ai_ev],
+                reference      = ref,
+                sources        = ["AI"],
+            )
+            behavior_report.techniques.append(new_t)
+            existing_map[tid] = new_t
+            added = True
+
+    if added:
+        behavior_report.techniques.sort(key=_tactic_key)
 
 
 # ── 프롬프트 빌더 ────────────────────────────────────────────────────────────
@@ -699,7 +790,7 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 
 [근거 인용 — 각 행위 항목 필수]
 - 파일명·도메인·IP 등 구체적 값과 데이터 출처를 함께 기술하세요.
-- 예: C:\ProgramData\system32\explorer.exe 드롭 [WriteFile 이벤트]
+- 예: C:\\ProgramData\\system32\\explorer.exe 드롭 [WriteFile 이벤트]
 - 예: pool.hashvault.pro DNS 쿼리 응답없음 [DNS 데이터] / dwm.exe(820) 쉘코드 26개 [hollows-hunter]
 
 {tag_section}
@@ -735,7 +826,13 @@ C2 / 채굴 서버: [도메인 또는 IP:포트 나열. 없으면 "없음"]
 뮤텍스 / 기타: [Mutex명 등. 없으면 "없음"]
 
 결론
-[1~2문장. 최종 위협 판단과 공격자 의도를 HIGH 증거와 함께 서술.]"""
+[1~2문장. 최종 위협 판단과 공격자 의도를 HIGH 증거와 함께 서술.]
+
+마이터 기법 목록
+[행위 데이터 전체를 검토해 식별한 MITRE ATT&CK 기법을 아래 형식으로 한 줄씩 나열.
+형식: T기법ID|기법명(영문)|전술명(영문)|구체적 근거(파일명·프로세스·IP 직접 인용)
+예시: T1055.012|Process Hollowing|Defense Evasion|aspnet_compiler.exe 5개 인스턴스 hollows-hunter 탐지
+규칙: HIGH 근거가 있는 기법만 포함. 없으면 "없음"만 작성. 파이프(|) 구분자 유지.]"""
 
     tag_section = ""
     if tag_hint:
@@ -780,7 +877,7 @@ def _call_ollama(
         "options": {
             "temperature": 0.2,
             "num_ctx":     8192,
-            "num_predict": 3072,   # 확인된 IOC·메모리 인젝션·채굴 활동 섹션 추가로 2048→3072
+            "num_predict": 4096,   # 마이터 기법 목록 섹션 추가로 3072→4096
         },
     }).encode("utf-8")
 
@@ -854,6 +951,7 @@ class OllamaAnalyzer:
         t0 = time.monotonic()
         try:
             ai.response = _call_ollama(prompt, self.base_url, self.model, timeout)
+            ai.mitre_techniques = parse_mitre_from_ai(ai.response)
         except urllib.error.URLError as e:
             ai.error = f"Ollama 연결 오류: {e.reason}"
         except TimeoutError:
@@ -867,9 +965,10 @@ class OllamaAnalyzer:
 
 def ai_analysis_to_dict(r: AiAnalysisResult) -> dict:
     return {
-        "model":        r.model,
-        "response":     r.response,
-        "elapsed_sec":  r.elapsed_sec,
-        "prompt_chars": r.prompt_chars,
-        "error":        r.error,
+        "model":            r.model,
+        "response":         r.response,
+        "elapsed_sec":      r.elapsed_sec,
+        "prompt_chars":     r.prompt_chars,
+        "error":            r.error,
+        "mitre_techniques": r.mitre_techniques,
     }

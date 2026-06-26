@@ -637,6 +637,7 @@ _SOURCE_COLOR = {
     "로컬룰":      "gray",
     "CAPA":       "blue",
     "VirusTotal": "green",
+    "AI":         "purple",
 }
 
 
@@ -3768,7 +3769,7 @@ def _parse_ai_sections(text: str) -> dict:
     import re as _re
 
     SECTION_TITLES = [
-        "분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "결론",
+        "분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "결론", "마이터 기법 목록",
         # 영문 fallback (모델이 영문으로 출력한 경우)
         "Analytical classification", "Executive summary",
         "Execution flow", "Behavioral analysis", "Conclusion",

@@ -459,7 +459,7 @@ def run_analysis(
     from core.tls_keylog              import TLSKeyLogger
     from core.fakenet_integrator      import FakeNetIntegrator, fakenet_result_to_dict
     from core.memory_forensics        import run_memory_forensics, memforensics_to_dict, find_winpmem, find_volatility3
-    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict, detect_model
+    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict, detect_model, merge_ai_mitre
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     _early_cfg  = _load_cfg_early()
@@ -1376,6 +1376,9 @@ def run_analysis(
                         result.errors.append(f"AI 분석: {_ai.error}")
                     else:
                         status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
+                        if _ai.mitre_techniques and result.behavior_report:
+                            merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
+                            status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
                 except Exception as _ae:
                     result.errors.append(f"AI 분석 예외: {_ae}")
                     status(f"      [오류] {_ae}")
