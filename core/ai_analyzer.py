@@ -370,16 +370,57 @@ def _build_prompt(result) -> str:
                 lines.append(f"- [{t.technique_id}] {t.technique_name}{ev_str}")
         lines.append("")
 
-    # ── 프로세스 행위 ───────────────────────────────────────────────────
+    # ── 프로세스 실행 체인 + 행위 상세 ────────────────────────────────────
     new_procs = (result.process_diff or {}).get("new_processes", [])
     if new_procs:
-        lines.append(f"## 프로세스 행위 (신규 {len(new_procs)}개)")
+        # PID→이름 맵: 사후 전체 스냅샷(부모 포함) + 신규 프로세스
+        _pid_to_nm: dict[int, str] = {}
+        for _pid, _ps in (getattr(result, "proc_after_snapshot", {}) or {}).items():
+            _pid_to_nm[_pid] = getattr(_ps, "name", "?")
+        for _np in new_procs:
+            _pid_to_nm[getattr(_np, "pid", 0)] = getattr(_np, "name", "?")
+
+        # 신규 프로세스 PID 집합
+        _new_pids: set[int] = {getattr(p, "pid", 0) for p in new_procs}
+
+        # 부모→자식 관계 구성 (신규 프로세스 내부 관계)
+        _children: dict[int, list] = {}
+        _roots: list[int] = []
+        for _np in new_procs:
+            _pp = getattr(_np, "ppid", 0)
+            _cp = getattr(_np, "pid", 0)
+            if _pp in _new_pids:
+                _children.setdefault(_pp, []).append(_cp)
+            else:
+                _roots.append(_cp)
+
+        # 체인 트리 DFS 출력
+        def _chain_lines(pid: int, depth: int = 0) -> list[str]:
+            pname  = _pid_to_nm.get(pid, "?")
+            prefix = ("  " * depth) + ("→ " if depth else "")
+            rows   = [f"{prefix}{pname}({pid})"]
+            for child in _children.get(pid, []):
+                rows.extend(_chain_lines(child, depth + 1))
+            return rows
+
+        chain_rows: list[str] = []
+        for rp in _roots:
+            chain_rows.extend(_chain_lines(rp))
+
+        lines.append(f"## 프로세스 실행 체인 ← 공격 흐름 파악 핵심 (신규 {len(new_procs)}개)")
+        lines.extend(chain_rows[:30])
+        lines.append("")
+
+        # 명령줄 상세 (부모 이름 주석 포함)
+        lines.append("## 프로세스 행위 상세")
         for p in new_procs[:15]:
-            name = getattr(p, "name", "?")
-            pid  = getattr(p, "pid", "?")
-            exe  = getattr(p, "exe", "") or ""
-            cmd  = " ".join(getattr(p, "cmdline", []) or []) or exe
-            lines.append(f"- {name} (PID {pid}): {_trunc(cmd, 120)}")
+            name  = getattr(p, "name", "?")
+            pid   = getattr(p, "pid", "?")
+            ppid  = getattr(p, "ppid", 0)
+            pname = _pid_to_nm.get(ppid, f"PID {ppid}")
+            exe   = getattr(p, "exe", "") or ""
+            cmd   = " ".join(getattr(p, "cmdline", []) or []) or exe
+            lines.append(f"- {name} (PID {pid}, 부모: {pname}): {_trunc(cmd, 100)}")
         lines.append("")
 
     # ── 지속성/실행 아티팩트 ─────────────────────────────────────────────
@@ -806,9 +847,10 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 [2~3문장. 악성코드 유형(추정)·실행 진입점·핵심 행위를 구체적 파일명·IP·도메인과 함께 서술. HIGH 증거만 사용.]
 
 실행 흐름
-[사용자 행위] [파일명과 실행 위치 포함]
-[준비 단계] [드롭한 파일명과 전체 경로 포함]
-[자율 실행] [C2 도메인 또는 IP, 프로토콜, 채굴 풀 도메인 등 포함]
+[주의: 위 "프로세스 실행 체인" 데이터를 반드시 참조해 부모→자식 순서대로 기술하세요.]
+[사용자 행위] [진입점 파일명과 실행 방법 포함 — 예: wscript.exe로 JS 실행]
+[준비 단계] [체인 중간 단계 — 부모→자식 프로세스명, 드롭 파일 경로 포함]
+[자율 실행] [최종 페이로드 행위 — C2 IP/도메인, 인젝션 대상 프로세스, 키로깅 등]
 
 행위 분석
 로더 / 스테이징: [{sample_name}의 역할과 드롭·로드한 페이로드 파일명·경로 직접 인용. 없으면 "관찰되지 않음"]
