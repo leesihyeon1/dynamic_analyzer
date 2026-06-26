@@ -3931,6 +3931,7 @@ def _render_behavioral(body: str) -> str:
         ("로더 / 스테이징",                    "Loader / Staging"),
         ("실행 및 피벗 (LOLBin / 인터프리터)",  "Execution & Pivots"),
         ("지속성 (관찰된 경우)",                "Persistence"),
+        ("메모리 인젝션 (관찰된 경우)",          "Memory Injection"),
         ("탐색 / 수집 (관찰된 경우)",           "Discovery / Collection"),
         ("네트워크 / C2 또는 유출 (관찰된 경우)","Network / C2"),
         ("오류 / 크래시 (관찰된 경우)",          "Errors / Crashes"),

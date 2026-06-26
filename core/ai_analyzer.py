@@ -335,6 +335,159 @@ def merge_ai_mitre(behavior_report, ai_techniques: list) -> None:
         behavior_report.techniques.sort(key=_tactic_key)
 
 
+# ── 행위 분석 섹션 빌더 (데이터 기반, AI 할루시네이션 방지) ─────────────────────
+
+def _build_behavioral_text(result) -> str:
+    """'행위 분석' 섹션을 분석 데이터에서 직접 계산한다.
+
+    AI에게 맡기면 7b 모델이 훈련 데이터의 일반적 악성코드 패턴으로 채워버리므로
+    Python에서 확인된 사실만 기술한다.
+    필드명은 html_report.py _render_behavioral FIELDS와 정확히 일치해야 한다.
+    """
+    parts: list[str] = ["행위 분석"]
+
+    new_procs = (result.process_diff or {}).get("new_processes", []) if result.process_diff else []
+    sample_name = "샘플"
+    if getattr(result.config, "sample_path", None):
+        sample_name = Path(result.config.sample_path).name
+    pcap = getattr(result, "pcap_result", None)
+
+    # 로더 / 스테이징
+    try:
+        from parsers.procmon_csv import EventCategory as _EC2
+        _drop_files = list(dict.fromkeys([
+            ev.path for ev in (result.filtered_events or [])
+            if ev.category == _EC2.FILE
+            and ev.operation in ("WriteFile", "CreateFile")
+            and any(ev.path.lower().endswith(ext) for ext in (".ps1", ".vbs", ".bat", ".js", ".hta", ".exe", ".dll"))
+            and getattr(ev, "result", "") == "SUCCESS"
+        ]))[:4]
+    except Exception:
+        _drop_files = []
+    if _drop_files:
+        _drops_str = ", ".join(_trunc(f, 70) for f in _drop_files[:2])
+        parts.append(f"로더 / 스테이징: {sample_name}가 실행되어 페이로드를 드롭 — {_drops_str}")
+    else:
+        parts.append(f"로더 / 스테이징: {sample_name}가 실행됨")
+
+    # 실행 및 피벗 (LOLBin)
+    _LOLBINS = {"wscript.exe", "cscript.exe", "powershell.exe", "pwsh.exe",
+                "mshta.exe", "regsvr32.exe", "rundll32.exe", "cmd.exe"}
+    _lolbins_seen = list(dict.fromkeys([
+        getattr(p, "name", "") for p in new_procs
+        if getattr(p, "name", "").lower() in _LOLBINS
+    ]))
+    if _lolbins_seen:
+        parts.append(f"실행 및 피벗 (LOLBin / 인터프리터): {' → '.join(_lolbins_seen)}")
+    else:
+        parts.append("실행 및 피벗 (LOLBin / 인터프리터): 관찰되지 않음")
+
+    # 지속성 — 실제 확인된 경우만 기술
+    _reg_diff = result.registry_diff or {}
+    _PERSIST_REG = ("\\run\\", "\\runonce\\", "\\currentversion\\run")
+    _persist_reg = [
+        r[0] for r in (_reg_diff.get("added", []) or []) + (_reg_diff.get("modified", []) or [])
+        if any(k in str(r[0]).lower() for k in _PERSIST_REG)
+    ]
+    _persist_procs = [
+        p for p in new_procs
+        if getattr(p, "name", "").lower() in {"schtasks.exe", "sc.exe", "at.exe"}
+    ]
+    if _persist_reg:
+        parts.append(f"지속성 (관찰된 경우): 레지스트리 Run 키 — {_trunc(str(_persist_reg[0]), 80)}")
+    elif _persist_procs:
+        _pp = _persist_procs[0]
+        _pp_cmd = " ".join(getattr(_pp, "cmdline", []) or []) or getattr(_pp, "exe", "")
+        parts.append(f"지속성 (관찰된 경우): {getattr(_pp,'name','')} — {_trunc(_pp_cmd, 80)}")
+    else:
+        parts.append("지속성 (관찰된 경우): 관찰되지 않음")
+
+    # 메모리 인젝션
+    _hh = getattr(result, "hh_result", None)
+    _pe_list = getattr(result, "pe_sieve_results", []) or []
+    _hh_susp: list = []
+    if _hh and not getattr(_hh, "error", ""):
+        _hh_susp = [r for r in (getattr(_hh, "process_results", []) or []) if getattr(r, "suspicious", 0) > 0]
+    _pe_susp = [r for r in _pe_list if not getattr(r, "error", "") and getattr(r, "suspicious", 0) > 0]
+    if _hh_susp:
+        _total_shc  = sum(getattr(r, "implanted_shc", 0) for r in _hh_susp)
+        _total_repl = sum(getattr(r, "replaced", 0) for r in _hh_susp)
+        _inj_names  = ", ".join(f"{getattr(r,'name','?')}(PID {getattr(r,'pid',0)})" for r in _hh_susp[:3])
+        _inj_parts  = []
+        if _total_repl: _inj_parts.append(f"코드교체 {_total_repl}건")
+        if _total_shc:  _inj_parts.append(f"쉘코드 {_total_shc}건")
+        parts.append(f"메모리 인젝션 (관찰된 경우): hollows-hunter 탐지 — {_inj_names} ({', '.join(_inj_parts) or '의심'})")
+    elif _pe_susp:
+        parts.append(f"메모리 인젝션 (관찰된 경우): pe-sieve 탐지 — {len(_pe_susp)}개 프로세스")
+    else:
+        parts.append("메모리 인젝션 (관찰된 경우): 관찰되지 않음")
+
+    # 탐색 / 수집
+    _smtp_ss = getattr(pcap, "smtp_sessions", []) or [] if pcap else []
+    if _hh_susp and _smtp_ss:
+        _inj_nm = ", ".join(getattr(r, "name", "?") for r in _hh_susp[:2])
+        parts.append(
+            f"탐색 / 수집 (관찰된 경우): {_inj_nm}(hollowed) → SMTP로 데이터 유출 — 키로거/정보탈취 추정"
+        )
+    elif _hh_susp:
+        parts.append("탐색 / 수집 (관찰된 경우): hollowed 프로세스 탐지, 수집 행위 상세 불명")
+    else:
+        parts.append("탐색 / 수집 (관찰된 경우): 관찰되지 않음")
+
+    # 네트워크 / C2
+    if pcap and _smtp_ss:
+        _s0      = _smtp_ss[0]
+        _ip2dom  = getattr(pcap, "ip_to_domain", {}) or {}
+        _doms    = _ip2dom.get(_s0.dst_ip, [])
+        _host    = _doms[0] if _doms else _s0.dst_ip
+        _auth    = f"AUTH:{_s0.auth_user}" if _s0.auth_user else ("AUTH확인됨" if _s0.has_auth else "")
+        _c2_seg  = [f"{_host}:{_s0.dst_port} (SMTP"]
+        if _s0.mail_from: _c2_seg.append(f"FROM:{_s0.mail_from}")
+        if _auth:         _c2_seg.append(_auth)
+        if _s0.has_data:  _c2_seg.append("DATA전송완료")
+        parts.append(f"네트워크 / C2 또는 유출 (관찰된 경우): {', '.join(_c2_seg)})")
+    elif pcap:
+        _conns  = getattr(pcap, "connections", []) or []
+        _ext    = [c for c in _conns if not _is_private_ip(c.dst_ip)]
+        if _ext:
+            _ip2dom2 = getattr(pcap, "ip_to_domain", {}) or {}
+            _doms2   = _ip2dom2.get(_ext[0].dst_ip, [])
+            _h2      = _doms2[0] if _doms2 else _ext[0].dst_ip
+            parts.append(f"네트워크 / C2 또는 유출 (관찰된 경우): 외부 TCP {len(_ext)}건 — {_h2}:{_ext[0].dst_port}")
+        else:
+            parts.append("네트워크 / C2 또는 유출 (관찰된 경우): 활동 없음")
+    else:
+        parts.append("네트워크 / C2 또는 유출 (관찰된 경우): 관찰되지 않음")
+
+    # 오류 / 크래시
+    parts.append("오류 / 크래시 (관찰된 경우): 관찰되지 않음")
+
+    return "\n".join(parts)
+
+
+def _inject_behavioral_section(ai_response: str, behavioral_text: str) -> str:
+    """AI 응답에서 '행위 분석' 섹션을 Python 계산값으로 교체한다.
+
+    AI가 쓴 '행위 분석'이 있으면 그 범위를 교체하고, 없으면 '결론' 앞에 삽입한다.
+    """
+    import re as _re2
+    _TITLES = ["분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "확인된 IOC", "결론", "마이터 기법 목록"]
+    _pat    = "|".join(_re2.escape(t) for t in _TITLES)
+    _splits = list(_re2.finditer(rf"^({_pat})\s*$", ai_response, _re2.MULTILINE))
+
+    for i, m in enumerate(_splits):
+        if m.group(1) == "행위 분석":
+            end = _splits[i + 1].start() if i + 1 < len(_splits) else len(ai_response)
+            return ai_response[:m.start()] + behavioral_text + "\n\n" + ai_response[end:]
+
+    # 행위 분석 없음 → 결론/마이터 앞에 삽입
+    for m in _splits:
+        if m.group(1) in ("결론", "마이터 기법 목록"):
+            return ai_response[:m.start()] + behavioral_text + "\n\n" + ai_response[m.start():]
+
+    return ai_response + "\n\n" + behavioral_text
+
+
 # ── 프롬프트 빌더 ────────────────────────────────────────────────────────────
 
 def _build_prompt(result) -> str:
@@ -960,67 +1113,6 @@ def _build_prompt(result) -> str:
     if computed_tags:
         tag_hint = "\n".join(f"  {tag}: {reason}" for tag, reason in computed_tags)
 
-    # ── 동적 필드 힌트 (감지된 데이터 기반) ────────────────────────────
-    # 네트워크/C2: SMTP 세션이 있으면 실제 도메인:포트를 필드 지시에 직접 주입
-    _pcap_t = getattr(result, "pcap_result", None)
-    _smtp_field_hint = (
-        "SMTP 세션이 있으면 해당 도메인:포트를 C2로 우선 기재. "
-        "없으면 외부 TCP 연결. 도메인·IP:포트·프로토콜 직접 인용. 없으면 '활동 없음'"
-    )
-    if _pcap_t:
-        _smtp_ss = getattr(_pcap_t, "smtp_sessions", []) or []
-        if _smtp_ss:
-            _ss0 = _smtp_ss[0]
-            _ss_doms = (getattr(_pcap_t, "ip_to_domain", {}) or {}).get(_ss0.dst_ip, [])
-            _ss_host = _ss_doms[0] if _ss_doms else _ss0.dst_ip
-            _smtp_field_hint = (
-                f"반드시 '{_ss_host}:{_ss0.dst_port} (SMTP)'를 C2로 첫 번째 기재. "
-                f"FROM:{_ss0.mail_from or '?'} TO:{', '.join(_ss0.rcpt_to[:2]) or '?'} "
-                f"{'AUTH 인증됨 ' if _ss0.has_auth else ''}"
-                f"{'DATA전송완료' if _ss0.has_data else ''}"
-            )
-
-    # 실행 및 피벗: 프로세스 체인에서 실제 LOLBin 도구 나열
-    _lolbin_names = {
-        "wscript.exe", "cscript.exe", "powershell.exe", "pwsh.exe",
-        "mshta.exe", "regsvr32.exe", "rundll32.exe", "cmd.exe",
-    }
-    _np_t = (result.process_diff or {}).get("new_processes", []) if result.process_diff else []
-    _lolbins_seen = [
-        getattr(p, "name", "").lower() for p in _np_t
-        if getattr(p, "name", "").lower() in _lolbin_names
-    ]
-    _lolbin_field_hint = (
-        "\"프로세스 실행 체인\"에서 wscript·powershell·mshta 등 시스템 기본 도구(LOLBin)가 "
-        "어떤 순서로 자식 프로세스를 실행(spawn)했는지 부모→자식 방향으로 기술. 없으면 \"관찰되지 않음\""
-    )
-    if _lolbins_seen:
-        _lolbin_field_hint = (
-            f"탐지된 LOLBin: {', '.join(dict.fromkeys(_lolbins_seen))} — "
-            "\"프로세스 실행 체인\" 순서대로 부모→자식 방향으로 기술 "
-            "(예: wscript.exe → powershell.exe → aspnet_compiler.exe). 없으면 \"관찰되지 않음\""
-        )
-
-    # 탐색/수집: hollows-hunter replaced + SMTP = 키로거/정보수집 판단
-    _hh_t = getattr(result, "hh_result", None)
-    _collect_field_hint = (
-        "키로거·API 후킹·파일 수집 등 직접 확인(HIGH)된 경우에만 기술. 없으면 \"관찰되지 않음\""
-    )
-    if _hh_t and not getattr(_hh_t, "error", ""):
-        _hh_susp = [
-            r for r in (getattr(_hh_t, "process_results", []) or [])
-            if getattr(r, "suspicious", 0) > 0
-        ]
-        if _hh_susp and _pcap_t and getattr(_pcap_t, "smtp_sessions", []):
-            _inj_names = ", ".join(
-                f"{getattr(r,'name','?')}(PID {getattr(r,'pid',0)})"
-                for r in _hh_susp[:3]
-            )
-            _collect_field_hint = (
-                f"hollows-hunter 대체 프로세스({_inj_names})가 SMTP로 데이터를 유출함 "
-                "→ 키로거/정보탈취로 판단. 인젝션된 프로세스명·PID와 SMTP 유출 사실을 함께 기술"
-            )
-
     # ── 분석 지시 ───────────────────────────────────────────────────────
     # 아래 템플릿을 LLM이 그대로 채워 넣도록 지시
     template = """---
@@ -1065,16 +1157,6 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 [준비 단계] [체인 중간 단계 — 부모→자식 프로세스명, 드롭 파일 경로 포함. "프로세스별 악성 행위"의 파일[Write] 항목 직접 인용]
 [자율 실행] [최종 페이로드 행위 — "프로세스별 악성 행위"의 네트워크·인젝션 항목 직접 인용. SMTP C2 있으면 도메인:포트 우선 기재]
 
-행위 분석
-로더 / 스테이징: [{sample_name}의 역할과 드롭·로드한 페이로드 파일명·경로 직접 인용. 없으면 "관찰되지 않음"]
-실행 및 피벗 (LOLBin / 인터프리터): [{lolbin_field_hint}]
-지속성: [레지스트리 전체 키 경로·서비스명·스케줄 작업명 직접 인용. 없으면 "관찰되지 않음"]
-메모리 인젝션: [hollows-hunter·pe-sieve 탐지 프로세스명·PID·쉘코드 수 직접 인용. 없으면 "관찰되지 않음"]
-채굴 활동: [채굴 풀 도메인·연결 IP·포트·추정 알고리즘 인용. 없으면 "관찰되지 않음"]
-탐색 / 수집: [{collect_field_hint}]
-네트워크 / C2: [{smtp_field_hint}]
-오류 / 크래시: [실행 중 관찰된 오류·비정상 종료 정보. 없으면 "관찰되지 않음"]
-
 확인된 IOC
 C2 / 채굴 서버: [SMTP C2이면 "mail.도메인:포트 (SMTP)" 형식으로 첫 번째 기재. 추가 C2가 있으면 나열. 없으면 "없음"]
 드롭 파일: [전체 경로 나열. 없으면 "없음"]
@@ -1099,9 +1181,6 @@ C2 / 채굴 서버: [SMTP C2이면 "mail.도메인:포트 (SMTP)" 형식으로 �
     lines.append(template.format(
         tag_section=tag_section,
         sample_name=sample_name,
-        smtp_field_hint=_smtp_field_hint,
-        lolbin_field_hint=_lolbin_field_hint,
-        collect_field_hint=_collect_field_hint,
     ))
 
     prompt = "\n".join(lines)
@@ -1212,6 +1291,12 @@ class OllamaAnalyzer:
         t0 = time.monotonic()
         try:
             ai.response = _call_ollama(prompt, self.base_url, self.model, timeout)
+            # 행위 분석 섹션을 데이터 기반 값으로 교체 (AI 할루시네이션 방지)
+            try:
+                _beh = _build_behavioral_text(result)
+                ai.response = _inject_behavioral_section(ai.response, _beh)
+            except Exception:
+                pass
             ai.mitre_techniques = parse_mitre_from_ai(ai.response)
         except urllib.error.URLError as e:
             ai.error = f"Ollama 연결 오류: {e.reason}"
