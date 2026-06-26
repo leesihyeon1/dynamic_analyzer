@@ -1176,6 +1176,8 @@ def run_analysis(
         result.pcap_result,
         result.registry_diff,
         result.process_diff,
+        hh_result=result.hh_result,
+        pe_sieve_results=result.pe_sieve_results,
     )
     result.ioc_report = extract_iocs(
         result.filtered_events,
