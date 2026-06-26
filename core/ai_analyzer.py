@@ -428,6 +428,145 @@ def _build_prompt(result) -> str:
             lines.append(f"- {name} (PID {pid}, 부모: {pname}): {_trunc(cmd, 100)}")
         lines.append("")
 
+        # ── 프로세스별 악성 행위 요약 ──────────────────────────────────────
+        # EventCategory import
+        try:
+            from parsers.procmon_csv import EventCategory as _EC
+            _FILE_CAT = _EC.FILE
+            _REG_CAT  = _EC.REGISTRY
+            _ec_ok    = True
+        except Exception:
+            _FILE_CAT = _REG_CAT = None
+            _ec_ok = False
+
+        # PID별 파일/레지스트리 이벤트 그룹화
+        _pid_fevs: dict[int, list] = {}
+        _pid_revs: dict[int, list] = {}
+        if _ec_ok:
+            _FILE_OPS_PP = {"WriteFile", "CreateFile", "DeleteFile"}
+            for _ev in (result.filtered_events or []):
+                _evpid = getattr(_ev, "pid", 0)
+                if _evpid not in _new_pids:
+                    continue
+                _evc = getattr(_ev, "category", None)
+                _evo = getattr(_ev, "operation", "")
+                if _evc == _FILE_CAT and _evo in _FILE_OPS_PP:
+                    _pid_fevs.setdefault(_evpid, []).append(_ev)
+                elif _evc == _REG_CAT and _evo == "RegSetValue":
+                    _pid_revs.setdefault(_evpid, []).append(_ev)
+
+        # PID별 네트워크 연결 그룹화
+        _pid_nets: dict[int, list] = {}
+        for _pnc in (getattr(result, "process_network_map", []) or []):
+            _pncpid = getattr(_pnc, "pid", 0)
+            if _pncpid in _new_pids:
+                _pid_nets.setdefault(_pncpid, []).append(_pnc)
+
+        # PID별 DNS 귀속 그룹화
+        _pid_dns: dict[int, list] = {}
+        for _dq in (getattr(result, "dns_attributed", []) or []):
+            _dqpid = getattr(_dq, "pid", 0)
+            if _dqpid in _new_pids and getattr(_dq, "attributed", False):
+                _pid_dns.setdefault(_dqpid, []).append(_dq)
+
+        # PID별 hollows-hunter 인젝션 결과 그룹화
+        _pid_hh2: dict[int, object] = {}
+        _hhr2 = getattr(result, "hh_result", None)
+        if _hhr2 and not getattr(_hhr2, "error", ""):
+            for _hr in (getattr(_hhr2, "process_results", []) or []):
+                if getattr(_hr, "suspicious", 0) > 0:
+                    _pid_hh2[getattr(_hr, "pid", 0)] = _hr
+
+        # 도메인 역조회 맵
+        _pcap_pp = getattr(result, "pcap_result", None)
+        _ip2dom_pp = getattr(_pcap_pp, "ip_to_domain", {}) or {} if _pcap_pp else {}
+
+        # 의심 경로/확장자 필터
+        _SUSP_FRAGS_PP = ("\\temp\\", "\\appdata\\", "\\programdata\\",
+                          "\\users\\public\\", "\\windows\\system32\\",
+                          "\\windows\\syswow64\\")
+        _SUSP_EXTS_PP  = {".exe", ".dll", ".bat", ".ps1", ".vbs", ".js", ".hta", ".tmp"}
+
+        _proc_act_lines: list[str] = []
+
+        for _pp in new_procs[:15]:
+            _pp_pid  = getattr(_pp, "pid", 0)
+            _pp_name = getattr(_pp, "name", "?")
+
+            _fevs  = _pid_fevs.get(_pp_pid, [])
+            _revs  = _pid_revs.get(_pp_pid, [])
+            _nets  = _pid_nets.get(_pp_pid, [])
+            _dnsl  = _pid_dns.get(_pp_pid, [])
+            _hh_r  = _pid_hh2.get(_pp_pid)
+
+            if not (_fevs or _revs or _nets or _dnsl or _hh_r):
+                continue
+
+            _proc_act_lines.append(f"### {_pp_name} (PID {_pp_pid})")
+
+            # 파일 행위 (의심 경로/확장자 우선, 중복 제거)
+            _seen_paths: set[str] = set()
+            _flines: list[str] = []
+            for _ev in _fevs:
+                _op   = getattr(_ev, "operation", "")
+                _path = getattr(_ev, "path", "")
+                _low  = _path.lower()
+                _ext  = ("." + _low.rsplit(".", 1)[-1]) if "." in _low else ""
+                if _path in _seen_paths:
+                    continue
+                if any(f in _low for f in _SUSP_FRAGS_PP) or _ext in _SUSP_EXTS_PP:
+                    _seen_paths.add(_path)
+                    _tag = "Write" if "Write" in _op else ("Create" if "Create" in _op else "Delete")
+                    _flines.append(f"  파일[{_tag}]: {_trunc(_path, 90)}")
+            for _fl in _flines[:5]:
+                _proc_act_lines.append(_fl)
+
+            # 레지스트리 쓰기 (중복 제거)
+            _seen_regs: set[str] = set()
+            _rlines: list[str] = []
+            for _ev in _revs:
+                _path = getattr(_ev, "path", "")
+                if _path not in _seen_regs:
+                    _seen_regs.add(_path)
+                    _rlines.append(f"  레지스트리[Set]: {_trunc(_path, 90)}")
+            for _rl in _rlines[:3]:
+                _proc_act_lines.append(_rl)
+
+            # 네트워크 연결
+            for _pnc in _nets[:4]:
+                _rip   = getattr(_pnc, "remote_ip", "")
+                _rport = getattr(_pnc, "remote_port", 0)
+                _proto = getattr(_pnc, "proto", "TCP")
+                _dir   = str(getattr(_pnc, "direction", "")).lower()
+                _doms  = _ip2dom_pp.get(_rip, [])
+                _host  = f"{_doms[0]}({_rip})" if _doms else _rip
+                _arrow = "→" if "out" in _dir else "↔"
+                _proc_act_lines.append(f"  네트워크: {_proto}{_arrow}{_host}:{_rport}")
+
+            # DNS 쿼리
+            for _dq in _dnsl[:3]:
+                _dom = getattr(_dq, "name", "")
+                _ans = getattr(_dq, "answers", [])
+                _proc_act_lines.append(f"  DNS: {_dom}→{_ans[0] if _ans else '?'}")
+
+            # hollows-hunter 인젝션 탐지
+            if _hh_r:
+                _repl  = getattr(_hh_r, "replaced", 0)
+                _shc   = getattr(_hh_r, "implanted_shc", 0)
+                _pe_inj = getattr(_hh_r, "implanted_pe", 0)
+                _iparts = []
+                if _repl:   _iparts.append(f"코드교체={_repl}")
+                if _shc:    _iparts.append(f"쉘코드={_shc}")
+                if _pe_inj: _iparts.append(f"PE인젝션={_pe_inj}")
+                _proc_act_lines.append(
+                    f"  ⚠ 인젝션: {', '.join(_iparts) if _iparts else '의심항목탐지'}"
+                )
+
+        if _proc_act_lines:
+            lines.append("## 프로세스별 악성 행위 ← 각 프로세스가 실제로 한 행위 (C2·파일·레지 직접 인용)")
+            lines.extend(_proc_act_lines)
+            lines.append("")
+
     # ── 지속성/실행 아티팩트 ─────────────────────────────────────────────
     # schtasks, sc, reg 등의 전체 명령줄을 별도 섹션으로 표시
     # → AI가 /tn, /tr, /sc 등 지속성 파라미터를 직접 인용할 수 있도록
@@ -860,10 +999,10 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 [2~3문장. 악성코드 유형(추정)·실행 진입점·핵심 행위를 구체적 파일명·IP·도메인과 함께 서술. HIGH 증거만 사용.]
 
 실행 흐름
-[주의: 위 "프로세스 실행 체인" 데이터를 반드시 참조해 부모→자식 순서대로 기술하세요.]
+[주의: "프로세스 실행 체인" + "프로세스별 악성 행위" 데이터를 반드시 참조. 부모→자식 순서로 각 단계의 파일·네트워크·인젝션 행위를 구체적으로 포함하세요.]
 [사용자 행위] [진입점 파일명과 실행 방법 포함 — 예: wscript.exe로 JS 실행]
-[준비 단계] [체인 중간 단계 — 부모→자식 프로세스명, 드롭 파일 경로 포함]
-[자율 실행] [최종 페이로드 행위 — 위 "SMTP C2" 데이터가 있으면 도메인:포트를 C2로 직접 인용. 인젝션 대상 프로세스명, 수집 행위 포함]
+[준비 단계] [체인 중간 단계 — 부모→자식 프로세스명, 드롭 파일 경로 포함. "프로세스별 악성 행위"의 파일[Write] 항목 직접 인용]
+[자율 실행] [최종 페이로드 행위 — "프로세스별 악성 행위"의 네트워크·인젝션 항목 직접 인용. SMTP C2 있으면 도메인:포트 우선 기재]
 
 행위 분석
 로더 / 스테이징: [{sample_name}의 역할과 드롭·로드한 페이로드 파일명·경로 직접 인용. 없으면 "관찰되지 않음"]
