@@ -209,7 +209,12 @@ def _compute_tags(result) -> list[tuple[str, str]]:
         if getattr(pcap, "ftp_sessions", []):
             tags.append(("ftp", f"FTP 세션 {len(pcap.ftp_sessions)}개 감지"))
         if getattr(pcap, "smtp_sessions", []):
-            tags.append(("smtp", f"SMTP 세션 {len(pcap.smtp_sessions)}개 감지"))
+            _ss0 = pcap.smtp_sessions[0]
+            _ss_doms = (getattr(pcap, "ip_to_domain", {}) or {}).get(_ss0.dst_ip, [])
+            _ss_host = _ss_doms[0] if _ss_doms else _ss0.dst_ip
+            tags.append(("smtp", f"SMTP C2 유출 — {_ss_host}:{_ss0.dst_port} "
+                                  f"{'(인증 확인) ' if _ss0.has_auth else ''}"
+                                  f"FROM:{_ss0.mail_from or '?'}"))
 
     # MITRE 기반
     if technique_ids & _STEALER_IDS:
@@ -703,11 +708,19 @@ def _build_prompt(result) -> str:
 
         smtp_sessions = getattr(pcap, "smtp_sessions", []) or []
         if smtp_sessions:
-            net_lines.append(f"### SMTP C2 ({len(smtp_sessions)}건)")
+            _ip2dom = getattr(pcap, "ip_to_domain", {}) or {}
+            net_lines.append(f"### SMTP C2 ({len(smtp_sessions)}건) ← 데이터 유출 주요 채널")
             for s in smtp_sessions[:4]:
+                _doms  = _ip2dom.get(s.dst_ip, [])
+                _host  = _doms[0] if _doms else s.dst_ip
+                _auth  = f" AUTH:{s.auth_user}" if s.auth_user else (" AUTH:확인됨" if s.has_auth else "")
+                _ehlo  = f" EHLO:{s.ehlo_domain}" if s.ehlo_domain else ""
                 net_lines.append(
-                    f"- {s.dst_ip}:{s.dst_port} FROM:{s.mail_from or '-'} "
-                    f"TO:{', '.join(s.rcpt_to[:2]) or '-'}"
+                    f"- {_host} ({s.dst_ip}):{s.dst_port}{_ehlo}"
+                    f" FROM:{s.mail_from or '-'}"
+                    f" TO:{', '.join(s.rcpt_to[:2]) or '-'}"
+                    f"{_auth}"
+                    + (" [DATA전송완료]" if s.has_data else "")
                 )
 
         ftp_sessions = getattr(pcap, "ftp_sessions", []) or []
@@ -850,7 +863,7 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 [주의: 위 "프로세스 실행 체인" 데이터를 반드시 참조해 부모→자식 순서대로 기술하세요.]
 [사용자 행위] [진입점 파일명과 실행 방법 포함 — 예: wscript.exe로 JS 실행]
 [준비 단계] [체인 중간 단계 — 부모→자식 프로세스명, 드롭 파일 경로 포함]
-[자율 실행] [최종 페이로드 행위 — C2 IP/도메인, 인젝션 대상 프로세스, 키로깅 등]
+[자율 실행] [최종 페이로드 행위 — 위 "SMTP C2" 데이터가 있으면 도메인:포트를 C2로 직접 인용. 인젝션 대상 프로세스명, 수집 행위 포함]
 
 행위 분석
 로더 / 스테이징: [{sample_name}의 역할과 드롭·로드한 페이로드 파일명·경로 직접 인용. 없으면 "관찰되지 않음"]
@@ -859,11 +872,11 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 메모리 인젝션: [hollows-hunter·pe-sieve 탐지 프로세스명·PID·쉘코드 수 직접 인용. 없으면 "관찰되지 않음"]
 채굴 활동: [채굴 풀 도메인·연결 IP·포트·추정 알고리즘 인용. 없으면 "관찰되지 않음"]
 탐색 / 수집: [키로거·API 후킹·캡처 프로세스 등 직접 확인(HIGH)된 경우에만 기술. 없으면 "관찰되지 않음"]
-네트워크 / C2: [C2 도메인 또는 IP:포트·프로토콜·전송 크기 직접 인용. 없으면 "활동 없음"]
+네트워크 / C2: [SMTP 세션이 있으면 해당 도메인:포트를 C2로 우선 기재. 없으면 외부 TCP 연결. 도메인·IP:포트·프로토콜 직접 인용. 없으면 "활동 없음"]
 오류 / 크래시: [실행 중 관찰된 오류·비정상 종료 정보. 없으면 "관찰되지 않음"]
 
 확인된 IOC
-C2 / 채굴 서버: [도메인 또는 IP:포트 나열. 없으면 "없음"]
+C2 / 채굴 서버: [SMTP C2이면 "mail.도메인:포트 (SMTP)" 형식으로 첫 번째 기재. 추가 C2가 있으면 나열. 없으면 "없음"]
 드롭 파일: [전체 경로 나열. 없으면 "없음"]
 뮤텍스 / 기타: [Mutex명 등. 없으면 "없음"]
 
