@@ -960,6 +960,67 @@ def _build_prompt(result) -> str:
     if computed_tags:
         tag_hint = "\n".join(f"  {tag}: {reason}" for tag, reason in computed_tags)
 
+    # ── 동적 필드 힌트 (감지된 데이터 기반) ────────────────────────────
+    # 네트워크/C2: SMTP 세션이 있으면 실제 도메인:포트를 필드 지시에 직접 주입
+    _pcap_t = getattr(result, "pcap_result", None)
+    _smtp_field_hint = (
+        "SMTP 세션이 있으면 해당 도메인:포트를 C2로 우선 기재. "
+        "없으면 외부 TCP 연결. 도메인·IP:포트·프로토콜 직접 인용. 없으면 '활동 없음'"
+    )
+    if _pcap_t:
+        _smtp_ss = getattr(_pcap_t, "smtp_sessions", []) or []
+        if _smtp_ss:
+            _ss0 = _smtp_ss[0]
+            _ss_doms = (getattr(_pcap_t, "ip_to_domain", {}) or {}).get(_ss0.dst_ip, [])
+            _ss_host = _ss_doms[0] if _ss_doms else _ss0.dst_ip
+            _smtp_field_hint = (
+                f"반드시 '{_ss_host}:{_ss0.dst_port} (SMTP)'를 C2로 첫 번째 기재. "
+                f"FROM:{_ss0.mail_from or '?'} TO:{', '.join(_ss0.rcpt_to[:2]) or '?'} "
+                f"{'AUTH 인증됨 ' if _ss0.has_auth else ''}"
+                f"{'DATA전송완료' if _ss0.has_data else ''}"
+            )
+
+    # 실행 및 피벗: 프로세스 체인에서 실제 LOLBin 도구 나열
+    _lolbin_names = {
+        "wscript.exe", "cscript.exe", "powershell.exe", "pwsh.exe",
+        "mshta.exe", "regsvr32.exe", "rundll32.exe", "cmd.exe",
+    }
+    _np_t = (result.process_diff or {}).get("new_processes", []) if result.process_diff else []
+    _lolbins_seen = [
+        getattr(p, "name", "").lower() for p in _np_t
+        if getattr(p, "name", "").lower() in _lolbin_names
+    ]
+    _lolbin_field_hint = (
+        "\"프로세스 실행 체인\"에서 wscript·powershell·mshta 등 시스템 기본 도구(LOLBin)가 "
+        "어떤 순서로 자식 프로세스를 실행(spawn)했는지 부모→자식 방향으로 기술. 없으면 \"관찰되지 않음\""
+    )
+    if _lolbins_seen:
+        _lolbin_field_hint = (
+            f"탐지된 LOLBin: {', '.join(dict.fromkeys(_lolbins_seen))} — "
+            "\"프로세스 실행 체인\" 순서대로 부모→자식 방향으로 기술 "
+            "(예: wscript.exe → powershell.exe → aspnet_compiler.exe). 없으면 \"관찰되지 않음\""
+        )
+
+    # 탐색/수집: hollows-hunter replaced + SMTP = 키로거/정보수집 판단
+    _hh_t = getattr(result, "hh_result", None)
+    _collect_field_hint = (
+        "키로거·API 후킹·파일 수집 등 직접 확인(HIGH)된 경우에만 기술. 없으면 \"관찰되지 않음\""
+    )
+    if _hh_t and not getattr(_hh_t, "error", ""):
+        _hh_susp = [
+            r for r in (getattr(_hh_t, "process_results", []) or [])
+            if getattr(r, "suspicious", 0) > 0
+        ]
+        if _hh_susp and _pcap_t and getattr(_pcap_t, "smtp_sessions", []):
+            _inj_names = ", ".join(
+                f"{getattr(r,'name','?')}(PID {getattr(r,'pid',0)})"
+                for r in _hh_susp[:3]
+            )
+            _collect_field_hint = (
+                f"hollows-hunter 대체 프로세스({_inj_names})가 SMTP로 데이터를 유출함 "
+                "→ 키로거/정보탈취로 판단. 인젝션된 프로세스명·PID와 SMTP 유출 사실을 함께 기술"
+            )
+
     # ── 분석 지시 ───────────────────────────────────────────────────────
     # 아래 템플릿을 LLM이 그대로 채워 넣도록 지시
     template = """---
@@ -1006,12 +1067,12 @@ LOW: 데이터에 없는 내용·순수 추측 → 기술 절대 금지
 
 행위 분석
 로더 / 스테이징: [{sample_name}의 역할과 드롭·로드한 페이로드 파일명·경로 직접 인용. 없으면 "관찰되지 않음"]
-실행 및 피벗 (LOLBin / 인터프리터): [사용된 시스템 도구명과 목적. 없으면 "관찰되지 않음"]
+실행 및 피벗 (LOLBin / 인터프리터): [{lolbin_field_hint}]
 지속성: [레지스트리 전체 키 경로·서비스명·스케줄 작업명 직접 인용. 없으면 "관찰되지 않음"]
 메모리 인젝션: [hollows-hunter·pe-sieve 탐지 프로세스명·PID·쉘코드 수 직접 인용. 없으면 "관찰되지 않음"]
 채굴 활동: [채굴 풀 도메인·연결 IP·포트·추정 알고리즘 인용. 없으면 "관찰되지 않음"]
-탐색 / 수집: [키로거·API 후킹·캡처 프로세스 등 직접 확인(HIGH)된 경우에만 기술. 없으면 "관찰되지 않음"]
-네트워크 / C2: [SMTP 세션이 있으면 해당 도메인:포트를 C2로 우선 기재. 없으면 외부 TCP 연결. 도메인·IP:포트·프로토콜 직접 인용. 없으면 "활동 없음"]
+탐색 / 수집: [{collect_field_hint}]
+네트워크 / C2: [{smtp_field_hint}]
 오류 / 크래시: [실행 중 관찰된 오류·비정상 종료 정보. 없으면 "관찰되지 않음"]
 
 확인된 IOC
@@ -1035,7 +1096,13 @@ C2 / 채굴 서버: [SMTP C2이면 "mail.도메인:포트 (SMTP)" 형식으로 �
             + tag_hint
         )
 
-    lines.append(template.format(tag_section=tag_section, sample_name=sample_name))
+    lines.append(template.format(
+        tag_section=tag_section,
+        sample_name=sample_name,
+        smtp_field_hint=_smtp_field_hint,
+        lolbin_field_hint=_lolbin_field_hint,
+        collect_field_hint=_collect_field_hint,
+    ))
 
     prompt = "\n".join(lines)
     # 데이터가 초과되면 중간 데이터를 잘라내되 템플릿(지시)은 항상 보존
