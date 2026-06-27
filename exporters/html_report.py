@@ -1431,6 +1431,11 @@ def _network_html(result) -> str:
         )
 
     # ── HTTP 요청 ──────────────────────────────────────────────
+    if pcap and not pcap.http_requests:
+        parts.append(
+            "<h3>HTTP 요청</h3>"
+            "<p style='color:#8b949e;font-size:.85rem;margin:.4rem 0'>관찰되지 않음</p>"
+        )
     if pcap and pcap.http_requests:
         _HTTP_LIMIT = 500
         rows = []

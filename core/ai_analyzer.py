@@ -22,10 +22,10 @@ from pathlib import Path
 
 
 OLLAMA_BASE_URL  = "http://localhost:11434"
-DEFAULT_MODEL    = "qwen2.5:14b-instruct-q8_0"
-# qwen2.5:14b-instruct-q8_0 num_ctx=32768 → 입력 여유 충분
-# 한국어 평균 1.3 chars/token → 안전 상한 약 15,000 자
-_MAX_PROMPT_CHARS = 15_000
+DEFAULT_MODEL    = "qwen2.5:14b"
+# qwen2.5:14b Q4 (CPU) → 입력 상한 보수적 유지
+# 한국어 평균 1.3 chars/token → 안전 상한 약 10,000 자
+_MAX_PROMPT_CHARS = 10_000
 
 
 # ── 결과 ─────────────────────────────────────────────────────────────────────
@@ -1216,7 +1216,7 @@ def _call_ollama(
         "stream": True,
         "options": {
             "temperature": 0.2,
-            "num_ctx":     16384,
+            "num_ctx":     8192,
             "num_predict": 4096,
         },
     }).encode("utf-8")

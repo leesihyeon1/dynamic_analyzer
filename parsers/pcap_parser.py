@@ -1190,9 +1190,11 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                             tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
 
             # --- HTTP 파싱 ---
-            if proto == "TCP" and Raw in pkt:
-                raw_bytes = bytes(pkt[Raw])
-                # scapy HTTP 레이어 우선
+            # scapy.layers.http 임포트 시 포트 80 패킷은 HTTPRequest 레이어로 자동
+            # 분해되어 Raw 레이어가 사라진다. ScapyHTTPRequest 체크를 Raw 유무와
+            # 독립적으로 수행해야 GET 같은 body-없는 요청도 수집할 수 있다.
+            if proto == "TCP":
+                raw_bytes = bytes(pkt[Raw]) if Raw in pkt else b""
                 if ScapyHTTPRequest is not None and ScapyHTTPRequest in pkt:
                     try:
                         hl = pkt[ScapyHTTPRequest]
@@ -1204,9 +1206,8 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         ct     = (getattr(hl, "Content_Type", None) or b"").decode(errors="replace")
                         auth   = (getattr(hl, "Authorization", None) or b"").decode(errors="replace")
                         cookie = bool(getattr(hl, "Cookie", None))
-                        # 바디
-                        body_raw = bytes(pkt[Raw])[raw_bytes.find(b"\r\n\r\n") + 4:]
-                        body_preview = body_raw[:512].decode(errors="replace").strip()
+                        # scapy HTTP 분해 시 Raw = 바디 그 자체
+                        body_preview = raw_bytes[:512].decode(errors="replace").strip()
                         http_list.append(HTTPRequest(
                             method=method, host=host, path=path,
                             user_agent=ua, content_length=cl,
@@ -1215,10 +1216,11 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                             dst_ip=dst_ip, dst_port=dst_port,
                         ))
                     except Exception:
-                        req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
-                        if req:
-                            http_list.append(req)
-                else:
+                        if raw_bytes:
+                            req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
+                            if req:
+                                http_list.append(req)
+                elif raw_bytes:
                     req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
                     if req:
                         http_list.append(req)
