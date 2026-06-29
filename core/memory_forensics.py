@@ -664,6 +664,14 @@ class VolatilityRunner:
             return {"columns": [str(c) for c in first], "rows": parsed[1:]}
         return {"columns": [], "rows": parsed}
 
+    # 빈 stdout이 정상 결과(탐지 대상 없음)인 플러그인 목록
+    # — 이 플러그인들은 stdout이 비어있어도 에러가 아니라 빈 리스트로 처리
+    _ALLOW_EMPTY_PLUGINS: frozenset[str] = frozenset({
+        "windows.connscan",   # 종료된 TCP 소켓이 없으면 빈 결과가 정상
+        "windows.netscan",    # 활성 소켓이 없으면 빈 결과가 정상
+        "windows.malfind",    # 의심 RWX 영역이 없으면 빈 결과가 정상
+    })
+
     def _run(self, plugin: str, extra: list[str] | None = None) -> dict:
         """플러그인 실행 → JSON dict 반환. 실패 시 RuntimeError 발생."""
         cmd = self.vol_cmd + [
@@ -710,6 +718,9 @@ class VolatilityRunner:
                     "`vol -f <dump> windows.info` 실행 시 자동 다운로드\n"
                     + stderr_tail[-400:]
                 )
+            # 빈 stdout이 정상인 플러그인 → 에러 없이 빈 결과 반환
+            if plugin in self._ALLOW_EMPTY_PLUGINS:
+                return {"columns": [], "rows": []}
             raise RuntimeError(
                 f"{plugin}: 출력 없음"
                 + (f"\n[stderr] {stderr_tail[-400:]}" if stderr_tail else "")
