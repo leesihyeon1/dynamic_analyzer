@@ -1237,13 +1237,14 @@ def run_memory_forensics(
 
     # ── 의심 프로세스 PE 추출 ─────────────────────────────────────────
     # malfind RWX 영역 + psxview 은닉 프로세스를 대상으로 windows.procdump 실행
-    # JIT/UWP FP 프로세스(explorer, SearchApp 등)는 제외
+    # 분석 도구만 제외 — 인젝션 대상이 될 수 없는 도구 자체
+    # 주의: explorer.exe·SearchApp.exe 등 JIT FP 프로세스는 제외하지 않음
+    #       악성코드가 이들에 인젝션했을 수 있으므로 malfind 탐지 시 덤프 필요
     _PROCDUMP_FP: frozenset[str] = frozenset({
-        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
-        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
-        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
-        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe",
-        "sihost.exe", "taskhostw.exe", "ctfmon.exe",
+        "hollows_hunter.exe", "hollows_hunter64.exe",
+        "pe_sieve.exe", "pe_sieve64.exe",
+        "picpick.exe", "procmon.exe", "procmon64.exe",
+        "processhacker.exe", "systeminformer.exe",
     })
     _pstree_names: dict[int, str] = {e.pid: e.name for e in result.pstree}
     pid_reasons: dict[int, str] = {}
