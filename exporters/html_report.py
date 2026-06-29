@@ -2325,6 +2325,8 @@ def _quick_scan_card_html(result) -> str:
         "taskhostw.exe", "ctfmon.exe",
         "picpick.exe", "processhacker.exe", "systeminformer.exe",
         "procmon.exe", "procmon64.exe",
+        "hollows_hunter.exe", "hollows_hunter64.exe",
+        "pe_sieve.exe", "pe_sieve64.exe",
     })
     hh_r = getattr(result, "hh_result", None)
     if hh_r and not getattr(hh_r, "error", None):
@@ -2599,6 +2601,8 @@ def _shellcode_html(result) -> str:
         # 분석 도구
         "picpick.exe", "processhacker.exe", "systeminformer.exe",
         "procmon.exe", "procmon64.exe",
+        "hollows_hunter.exe", "hollows_hunter64.exe",
+        "pe_sieve.exe", "pe_sieve64.exe",
     })
 
     if hh_r is None and not pe_list:
@@ -3142,11 +3146,30 @@ def generate_html_report(result, output_path: str) -> None:
     _ps_list = getattr(result, "pe_sieve_results",  None) or []
 
     # 의심 프로세스 수 집계 (pe-sieve / hollows-hunter 결과 기준)
+    # Windows 10/11 UWP/.NET JIT 오탐: PE인젝션·코드교체 없으면 FP로 제외
+    _SHC_FP_NAMES = frozenset({
+        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
+        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
+        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe", "sihost.exe",
+        "taskhostw.exe", "ctfmon.exe",
+        "picpick.exe", "processhacker.exe", "systeminformer.exe",
+        "procmon.exe", "procmon64.exe",
+        "hollows_hunter.exe", "hollows_hunter64.exe",
+        "pe_sieve.exe", "pe_sieve64.exe",
+    })
     shc_total       = 0
     shc_fp_excluded = 0
 
     if _hh and not _hh.error:
-        shc_total += len(_hh.suspicious_processes)
+        for _r in _hh.suspicious_processes:
+            _nm = getattr(_r, "name", "").lower()
+            _pe = getattr(_r, "implanted_pe", 0) or 0
+            _rp = getattr(_r, "replaced",     0) or 0
+            if _nm in _SHC_FP_NAMES and _pe == 0 and _rp == 0:
+                shc_fp_excluded += 1
+            else:
+                shc_total += 1
 
     for _r in _ps_list:
         if not _r.error and _r.suspicious > 0:

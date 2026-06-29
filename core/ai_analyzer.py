@@ -167,6 +167,10 @@ _HH_SYSTEM_FP_NAMES: frozenset[str] = frozenset({
     "systeminformer.exe",
     "procmon.exe",
     "procmon64.exe",
+    "hollows_hunter.exe",
+    "hollows_hunter64.exe",
+    "pe_sieve.exe",
+    "pe_sieve64.exe",
 })
 
 _DOMAIN_THREAT_LABELS: dict = {
