@@ -620,6 +620,7 @@ window.addEventListener('load', function() {
     'tbl-ioc-ip','tbl-ioc-domain','tbl-ioc-file','tbl-ioc-reg','tbl-ioc-url'
   ];
   tbls.forEach(function(id) { setupTableControls(id, 100); });
+  setupTableControls('tbl-vol-mutants', 400);
 });
 </script>"""
 
@@ -3673,13 +3674,13 @@ def _volatility_html(result) -> str:
             f"{rows}</table></div></div>"
         )
 
-    # ── handles (Mutant) ─────────────────────────────────────────────
+    # ── handles (Mutant) — 검색·페이지네이션 포함 ──────────────────────
     mutants = [h for h in handles if h.get("type") == "Mutant"]
     if mutants:
         susp_mut  = [h for h in mutants if h.get("suspicious")]
         other_mut = [h for h in mutants if not h.get("suspicious")]
-        # 의심 뮤텍스 먼저, 나머지는 20건 제한
-        display_mut = susp_mut + other_mut[:max(0, 30 - len(susp_mut))]
+        # 의심 뮤텍스 먼저, 전체 최대 2000건 (setupTableControls가 페이지 분할)
+        display_mut = (susp_mut + other_mut)[:2000]
         rows = ""
         for h in display_mut:
             is_susp  = h.get("suspicious", False)
@@ -3690,7 +3691,7 @@ def _volatility_html(result) -> str:
             if family:
                 analysis = f"<span style='color:#ff7b72;font-size:.74rem'>패밀리: {_e(family)}</span>"
             elif is_susp:
-                analysis = f"<span style='color:#ffa657;font-size:.74rem'>고엔트로피 랜덤 (H={entropy:.2f})</span>"
+                analysis = f"<span style='color:#ffa657;font-size:.74rem'>고엔트로피 (H={entropy:.2f})</span>"
             else:
                 analysis = f"<span style='color:#484f58;font-size:.74rem'>{entropy:.2f}</span>"
             rows += (
@@ -3710,16 +3711,22 @@ def _volatility_html(result) -> str:
         if random_cnt:
             badge_parts.append(f"<span style='color:#ffa657;font-size:.8rem'>고엔트로피 {random_cnt}건</span>")
         susp_badge = (" &nbsp;" + " &nbsp;".join(badge_parts)) if badge_parts else ""
-        note = (f"<p style='color:#484f58;font-size:.78rem'>(전체 {len(mutants)}건 중 표시)</p>"
-                if len(mutants) > len(display_mut) else "")
+        truncated_note = (
+            f"<p style='color:#484f58;font-size:.78rem'>"
+            f"전체 {len(mutants)}건 중 2000건 표시 — 검색으로 필터링 가능</p>"
+            if len(mutants) > 2000 else ""
+        )
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0;color:{hdr_color}'>뮤텍스 (Mutant) 핸들{susp_badge}</h4>"
             f"<p style='color:#8b949e;font-size:.78rem'>악성코드 패밀리 식별에 핵심 — "
-            f"패밀리 매칭(빨강) / 고엔트로피 랜덤(주황) 순으로 표시</p>"
-            f"<div style='overflow-x:auto'><table>"
+            f"패밀리 매칭(빨강) / 고엔트로피 랜덤(주황) 순으로 표시 &nbsp;|&nbsp; "
+            f"검색창으로 뮤텍스 이름 필터링 가능</p>"
+            f"{truncated_note}"
+            f"<div style='overflow-x:auto'>"
+            f"<table id='tbl-vol-mutants'>"
             f"<tr><th>PID</th><th>프로세스</th><th>뮤텍스 이름</th><th>엔트로피 / 패밀리</th></tr>"
-            f"{rows}</table></div>{note}</div>"
+            f"{rows}</table></div></div>"
         )
 
     # ── cmdline (비교용) ──────────────────────────────────────────────
