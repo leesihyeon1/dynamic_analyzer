@@ -142,6 +142,33 @@ _MINING_POOL_DOMAINS = frozenset({
     "xmr-us-east1.nanopool.org", "monero.herominers.com",
 })
 
+# Windows 10/11에서 hollows-hunter가 UWP / .NET JIT 때문에 오탐하는 시스템 프로세스.
+# 이 프로세스 이름(소문자)이 suspicious > 0 이더라도 FP 처리한다.
+_HH_SYSTEM_FP_NAMES: frozenset[str] = frozenset({
+    "dwm.exe",                      # Desktop Window Manager (UWP/DWM shellcode stubs)
+    "explorer.exe",                 # Windows Explorer (.NET JIT trampolines)
+    "searchapp.exe",                # Windows Search (UWP)
+    "searchui.exe",                 # Windows Search (older builds)
+    "lockapp.exe",                  # Lock Screen (UWP)
+    "shellexperiencehost.exe",      # Start Menu shell (UWP)
+    "startmenuexperiencehost.exe",  # Start Menu (Windows 11)
+    "runtimebroker.exe",            # UWP broker
+    "applicationframehost.exe",     # UWP app frame
+    "textinputhost.exe",            # Touch keyboard
+    "systemsettings.exe",           # Settings app (UWP)
+    "smartscreen.exe",              # SmartScreen filter
+    "wuauclt.exe",                  # Windows Update client
+    "sihost.exe",                   # Shell Infrastructure Host
+    "taskhostw.exe",                # Task Host Window
+    "ctfmon.exe",                   # CTF monitor (IME)
+    # 분석 도구 — FP가 아니라 원래부터 의심 대상이 아님
+    "picpick.exe",
+    "processhacker.exe",
+    "systeminformer.exe",
+    "procmon.exe",
+    "procmon64.exe",
+})
+
 _DOMAIN_THREAT_LABELS: dict = {
     "pool.hashvault.pro":          "★Monero 채굴 풀 (XMRig)★",
     "pool.minexmr.com":            "★Monero 채굴 풀★",
@@ -352,18 +379,9 @@ def _build_behavioral_text(result) -> str:
         sample_name = Path(result.config.sample_path).name
     pcap = getattr(result, "pcap_result", None)
 
-    # 로더 / 스테이징
-    try:
-        from parsers.procmon_csv import EventCategory as _EC2
-        _drop_files = list(dict.fromkeys([
-            ev.path for ev in (result.filtered_events or [])
-            if ev.category == _EC2.FILE
-            and ev.operation in ("WriteFile", "CreateFile")
-            and any(ev.path.lower().endswith(ext) for ext in (".ps1", ".vbs", ".bat", ".js", ".hta", ".exe", ".dll"))
-            and getattr(ev, "result", "") == "SUCCESS"
-        ]))[:4]
-    except Exception:
-        _drop_files = []
+    # 로더 / 스테이징 — ioc_extractor가 이미 분석 도구·시스템 경로를 걸러낸 결과를 사용
+    _ioc = getattr(result, "ioc_report", None)
+    _drop_files = (list(getattr(_ioc, "dropped_files", None) or []))[:4] if _ioc else []
     if _drop_files:
         _drops_str = ", ".join(_trunc(f, 70) for f in _drop_files[:2])
         parts.append(f"로더 / 스테이징: {sample_name}가 실행되어 페이로드를 드롭 — {_drops_str}")
@@ -407,7 +425,11 @@ def _build_behavioral_text(result) -> str:
     _pe_list = getattr(result, "pe_sieve_results", []) or []
     _hh_susp: list = []
     if _hh and not getattr(_hh, "error", ""):
-        _hh_susp = [r for r in (getattr(_hh, "process_results", []) or []) if getattr(r, "suspicious", 0) > 0]
+        _hh_susp = [
+            r for r in (getattr(_hh, "process_results", []) or [])
+            if getattr(r, "suspicious", 0) > 0
+            and getattr(r, "name", "").lower() not in _HH_SYSTEM_FP_NAMES
+        ]
     _pe_susp = [r for r in _pe_list if not getattr(r, "error", "") and getattr(r, "suspicious", 0) > 0]
     if _hh_susp:
         _total_shc  = sum(getattr(r, "implanted_shc", 0) for r in _hh_susp)
@@ -639,6 +661,16 @@ def _build_prompt(result) -> str:
                           "\\users\\public\\", "\\windows\\system32\\",
                           "\\windows\\syswow64\\")
         _SUSP_EXTS_PP  = {".exe", ".dll", ".bat", ".ps1", ".vbs", ".js", ".hta", ".tmp"}
+        # 분석 도구 경로 — 파일 행위 컨텍스트에서 제외
+        _ANALYSIS_TOOL_FRAGS_PP = (
+            "\\tools\\sysinternals\\", "\\tools\\systeminformer\\",
+            "\\tools\\processhacker\\", "\\tools\\die\\",
+            "procmon.exe", "procmon64.exe", "procexp.exe", "procexp64.exe",
+            "tshark.exe", "dumpcap.exe", "systeminformer.exe",
+            "zoomit.exe", "zoomit64.exe", "_mei", "hashmyfiles",
+            "imhex.exe", "hollows_hunter", "hollows-hunter", "pe-sieve",
+            "picpick.exe",
+        )
 
         _proc_act_lines: list[str] = []
 
@@ -657,7 +689,7 @@ def _build_prompt(result) -> str:
 
             _proc_act_lines.append(f"### {_pp_name} (PID {_pp_pid})")
 
-            # 파일 행위 (의심 경로/확장자 우선, 중복 제거)
+            # 파일 행위 (의심 경로/확장자 우선, 중복 제거, 분석 도구 경로 제외)
             _seen_paths: set[str] = set()
             _flines: list[str] = []
             for _ev in _fevs:
@@ -666,6 +698,8 @@ def _build_prompt(result) -> str:
                 _low  = _path.lower()
                 _ext  = ("." + _low.rsplit(".", 1)[-1]) if "." in _low else ""
                 if _path in _seen_paths:
+                    continue
+                if any(frag in _low for frag in _ANALYSIS_TOOL_FRAGS_PP):
                     continue
                 if any(f in _low for f in _SUSP_FRAGS_PP) or _ext in _SUSP_EXTS_PP:
                     _seen_paths.add(_path)
@@ -749,6 +783,7 @@ def _build_prompt(result) -> str:
         hh_proc_results = [
             r for r in (getattr(hh_r, "process_results", []) or [])
             if getattr(r, "suspicious", 0) > 0
+            and getattr(r, "name", "").lower() not in _HH_SYSTEM_FP_NAMES
         ]
 
     if pe_susp or hh_proc_results:
@@ -1062,8 +1097,8 @@ def _build_prompt(result) -> str:
             net_lines.append(f"### 외부 IP IOC ({len(ioc.ip_addresses)}개)")
             net_lines += [f"- {ip}" for ip in ioc.ip_addresses[:10]]
         if ioc.domains:
-            net_lines.append(f"### 도메인 IOC ({len(ioc.domains)}개)")
-            net_lines += [f"- {d}" for d in ioc.domains[:10]]
+            net_lines.append(f"### ★C2 의심 도메인 IOC ({len(ioc.domains)}개)★")
+            net_lines += [f"- ★{d}★" for d in ioc.domains[:10]]
         if ioc.urls:
             net_lines.append(f"### URL IOC ({len(ioc.urls)}개)")
             net_lines += [f"- {_trunc(u, 100)}" for u in ioc.urls[:8]]

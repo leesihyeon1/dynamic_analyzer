@@ -2316,11 +2316,26 @@ def _quick_scan_card_html(result) -> str:
         names = ", ".join(getattr(r, "name", f"PID {r.pid}") for r in pe_susp[:3])
         findings.append(("critical", f"메모리 인젝션·쉘코드 {len(pe_susp)}건", names))
 
+    # Windows 10/11 UWP/.NET JIT 오탐 프로세스 (hollows-hunter FP)
+    _HH_SYSTEM_FP = frozenset({
+        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
+        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
+        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe", "sihost.exe",
+        "taskhostw.exe", "ctfmon.exe",
+        "picpick.exe", "processhacker.exe", "systeminformer.exe",
+        "procmon.exe", "procmon64.exe",
+    })
     hh_r = getattr(result, "hh_result", None)
     if hh_r and not getattr(hh_r, "error", None):
-        hh_susp = getattr(hh_r, "suspicious_processes", []) or []
+        hh_susp_raw = getattr(hh_r, "suspicious_processes", []) or []
+        hh_susp = [p for p in hh_susp_raw
+                   if getattr(p, "name", "").lower() not in _HH_SYSTEM_FP]
         if hh_susp:
-            findings.append(("critical", f"프로세스 인젝션/할로잉 {len(hh_susp)}건", ""))
+            names = ", ".join(
+                f"{getattr(p,'name','')}(PID {getattr(p,'pid','')})" for p in hh_susp[:3]
+            )
+            findings.append(("critical", f"프로세스 인젝션/할로잉 {len(hh_susp)}건", names))
 
     # Volatility 숨김 프로세스
     mf = getattr(result, "mem_forensics", {}) or {}
@@ -2338,12 +2353,17 @@ def _quick_scan_card_html(result) -> str:
         findings.append(("high", f"레지스트리 지속성 {len(persist_reg)}건",
                           str(persist_reg[0][0])[-80:]))
 
-    # 외부 TCP 연결
+    # 외부 TCP 연결 (도메인 이름 우선 표시)
     if pcap:
         ext = [c for c in (getattr(pcap, "connections", []) or [])
                if not _is_private_ip_str(getattr(c, "dst_ip", ""))]
         if ext:
-            sample = ", ".join(f"{c.dst_ip}:{c.dst_port}" for c in ext[:3])
+            ip2dom = getattr(pcap, "ip_to_domain", {}) or {}
+            def _conn_label(c):
+                doms = ip2dom.get(getattr(c, "dst_ip", ""), [])
+                host = doms[0] if doms else getattr(c, "dst_ip", "?")
+                return f"{host}:{getattr(c, 'dst_port', '?')}"
+            sample = ", ".join(_conn_label(c) for c in ext[:3])
             findings.append(("high", f"외부 TCP 연결 {len(ext)}건", sample))
 
     # 드롭 실행 파일
@@ -2355,6 +2375,22 @@ def _quick_scan_card_html(result) -> str:
         if drop_exe:
             findings.append(("high", f"실행 파일 드롭 {len(drop_exe)}건",
                               str(drop_exe[0])[-80:]))
+
+    # IOC 의심 C2 도메인
+    if ioc and getattr(ioc, "domains", None):
+        _NOISY_SFXS = (
+            "microsoft.com", "windows.com", "windowsupdate.com", "akadns.net",
+            "msftncsi.com", "msedge.net", "azure.com", "live.com",
+            "office.com", "office365.com", "msn.com", "bing.com",
+            ".local", ".arpa", "wns.windows.com", "trafficmanager.net",
+        )
+        def _is_noisy(d):
+            lo = d.lower()
+            return any(lo == s or lo.endswith("." + s.lstrip(".")) for s in _NOISY_SFXS)
+        susp_doms = [d for d in ioc.domains if not _is_noisy(d)]
+        if susp_doms:
+            findings.append(("critical", f"C2 의심 도메인 {len(susp_doms)}개",
+                              ", ".join(susp_doms[:3])))
 
     # 외부 IP 조회
     _IP_LOOKUP = frozenset({"ip-api.com", "ipify.org", "api.ipify.org",
@@ -2552,7 +2588,18 @@ def _shellcode_html(result) -> str:
     hh_r    = getattr(result, "hh_result",        None)
     pe_list = getattr(result, "pe_sieve_results",  None) or []
 
-    _MEM_WL = frozenset()
+    # Windows 10/11에서 UWP / .NET JIT 때문에 HH가 오탐하는 시스템 프로세스.
+    # PE인젝션·코드교체가 없을 때만 노이즈로 처리 (_mem_is_noise 참조).
+    _MEM_WL = frozenset({
+        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
+        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
+        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe", "sihost.exe",
+        "taskhostw.exe", "ctfmon.exe",
+        # 분석 도구
+        "picpick.exe", "processhacker.exe", "systeminformer.exe",
+        "procmon.exe", "procmon64.exe",
+    })
 
     if hh_r is None and not pe_list:
         return (
@@ -2577,10 +2624,12 @@ def _shellcode_html(result) -> str:
                 f"hollows-hunter: {short_err}</p>"
             )
         else:
-            hh_scanned = hh_r.total_scanned
-            hh_susp    = len(hh_r.suspicious_processes)
-            hh_shc     = sum(r.implanted_shc for r in hh_r.process_results)
-            hh_pe_inj  = sum(r.implanted_pe  for r in hh_r.process_results)
+            hh_scanned   = hh_r.total_scanned
+            _hh_real     = [r for r in hh_r.suspicious_processes
+                            if not _mem_is_noise(r, _MEM_WL)]
+            hh_susp      = len(_hh_real)
+            hh_shc       = sum(r.implanted_shc for r in _hh_real)
+            hh_pe_inj    = sum(r.implanted_pe  for r in _hh_real)
 
     # ── pe-sieve 신규 프로세스 집계 ───────────────────────────────
     pe_valid   = [r for r in pe_list if not r.error]
