@@ -935,40 +935,75 @@ class VolatilityRunner:
             ))
         return results
 
+    # windows.procdump 가 생성하는 파일 확장자 패턴 (버전별 차이)
+    _PROCDUMP_GLOB_PATTERNS: tuple[str, ...] = ("*.dmp", "*.img", "*.exe")
+
     def procdump(
         self,
         pid_reasons: dict[int, str],
         pid_name_map: dict[int, str],
         output_dir: Path,
+        on_status=None,
     ) -> list[ProcDumpEntry]:
         """의심 PID의 PE를 메모리에서 추출 (windows.procdump)."""
         results: list[ProcDumpEntry] = []
         if not pid_reasons:
             return results
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        def _log(msg: str) -> None:
+            if on_status:
+                try:
+                    on_status(msg)
+                except Exception:
+                    pass
+
+        def _existing_dumps() -> set[str]:
+            found: set[str] = set()
+            for pat in self._PROCDUMP_GLOB_PATTERNS:
+                found.update(p.name for p in output_dir.glob(pat))
+            return found
+
         for pid, reason in pid_reasons.items():
-            before = {p.name for p in output_dir.glob("*.dmp")}
+            before = _existing_dumps()
+            # windows.procdump 는 바이너리 파일을 -o 에 씀
+            # -r json 을 사용하면 일부 버전에서 file-writer 핸들러가 비활성화됨 → 제외
             cmd = self.vol_cmd + [
                 "-f", str(self.dump_path),
-                "-r", "json",
                 "-o", str(output_dir),
             ]
             if self.symbols_path:
                 cmd += ["-s", str(self.symbols_path)]
             cmd += ["windows.procdump", "--pid", str(pid)]
+            _log(f"      procdump PID {pid} ({pid_name_map.get(pid, '?')}) 추출 중...")
             try:
-                subprocess.run(cmd, capture_output=True, timeout=self.timeout)
-            except Exception:
+                r = subprocess.run(
+                    cmd, capture_output=True, timeout=self.timeout,
+                    text=True, errors="replace",
+                )
+                if r.returncode not in (0, 1, 2):
+                    _log(f"      procdump PID {pid}: exit={r.returncode} — {(r.stderr or '')[-200:].strip()}")
+                    continue
+            except subprocess.TimeoutExpired:
+                _log(f"      procdump PID {pid}: 타임아웃")
                 continue
-            for dp in sorted(output_dir.glob("*.dmp")):
-                if dp.name not in before:
-                    results.append(ProcDumpEntry(
-                        pid=pid,
-                        name=pid_name_map.get(pid, f"pid_{pid}"),
-                        dump_path=str(dp),
-                        size=dp.stat().st_size,
-                        reason=reason,
-                    ))
+            except Exception as exc:
+                _log(f"      procdump PID {pid}: 오류 — {exc}")
+                continue
+            after = _existing_dumps()
+            new_files = after - before
+            if not new_files:
+                stderr_hint = (r.stderr or "")[-200:].strip()
+                _log(f"      procdump PID {pid}: 파일 미생성 — {stderr_hint or '출력 없음'}")
+            for fname in sorted(new_files):
+                dp = output_dir / fname
+                results.append(ProcDumpEntry(
+                    pid=pid,
+                    name=pid_name_map.get(pid, f"pid_{pid}"),
+                    dump_path=str(dp),
+                    size=dp.stat().st_size,
+                    reason=reason,
+                ))
         return results
 
     def warmup(self) -> tuple[bool, str]:
@@ -1202,19 +1237,29 @@ def run_memory_forensics(
 
     # ── 의심 프로세스 PE 추출 ─────────────────────────────────────────
     # malfind RWX 영역 + psxview 은닉 프로세스를 대상으로 windows.procdump 실행
+    # JIT/UWP FP 프로세스(explorer, SearchApp 등)는 제외
+    _PROCDUMP_FP: frozenset[str] = frozenset({
+        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
+        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
+        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe",
+        "sihost.exe", "taskhostw.exe", "ctfmon.exe",
+    })
+    _pstree_names: dict[int, str] = {e.pid: e.name for e in result.pstree}
     pid_reasons: dict[int, str] = {}
     for e in result.malfind:
         if e.protection in _SUSPICIOUS_PROTECTIONS and e.pid:
-            pid_reasons.setdefault(e.pid, f"malfind:{e.protection}")
+            pname = _pstree_names.get(e.pid, e.process or "").lower()
+            if pname not in _PROCDUMP_FP:
+                pid_reasons.setdefault(e.pid, f"malfind:{e.protection}")
     for e in result.psxview:
         if e.hidden and e.pid and e.pid not in pid_reasons:
             pid_reasons[e.pid] = "psxview:hidden"
 
     if pid_reasons:
-        pid_name_map = {e.pid: e.name for e in result.pstree}
         dumps_dir = output_dir / "procdumps"
         _st(f"[메모리] 의심 프로세스 PE 추출 중 ({len(pid_reasons)}개 PID)...")
-        result.procdumps = runner.procdump(pid_reasons, pid_name_map, dumps_dir)
+        result.procdumps = runner.procdump(pid_reasons, _pstree_names, dumps_dir, on_status=_st)
         _st(f"      추출 완료: {len(result.procdumps)}개 파일")
 
     return result
