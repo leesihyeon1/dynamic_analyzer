@@ -19,8 +19,12 @@ memory_forensics.py — 물리 메모리 덤프 + Volatility3 포렌식 연동
 """
 from __future__ import annotations
 
+import collections
+import ipaddress
 import json
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -175,6 +179,7 @@ class MalfindEntry:
     private_memory: bool
     hexdump:        str        # 앞 32 바이트 hex
     disasm:         str        # 앞 몇 개 인스트럭션
+    shellcode_type: str        = ""  # 쉘코드 유형 자동 분류
 
 
 @dataclass
@@ -200,6 +205,8 @@ class NetScanEntry:
     pid:          int
     owner:        str
     created:      str
+    suspicious:   bool         = False
+    susp_reason:  str          = ""
 
 
 @dataclass
@@ -211,10 +218,13 @@ class CmdlineEntry:
 
 @dataclass
 class HandleEntry:
-    pid:    int
-    name:   str
-    htype:  str    # Mutant, File, Key 등
-    hname:  str    # 핸들 이름
+    pid:      int
+    name:     str
+    htype:    str    # Mutant, File, Key 등
+    hname:    str    # 핸들 이름
+    entropy:  float  = 0.0   # Shannon 엔트로피 (랜덤 문자열 탐지)
+    family:   str    = ""    # 알려진 악성코드 패밀리명
+    suspicious: bool = False  # 엔트로피 기반 랜덤 문자열 or 패밀리 매칭
 
 
 @dataclass
@@ -277,6 +287,170 @@ class MemForensicsResult:
     procdumps:    list[ProcDumpEntry]  = field(default_factory=list)
     plugin_errors: dict[str, str]      = field(default_factory=dict)
     error:        str                  = ""
+
+
+# ── 분석 헬퍼 상수 ───────────────────────────────────────────────────────
+
+_KNOWN_MUTEX_FAMILIES: list[tuple[str, str]] = [
+    ("global\\msse",                 "Cobalt Strike"),
+    ("global\\{",                    "Cobalt Strike (Beacon)"),
+    ("global\\fsf",                  "Emotet"),
+    ("global\\gojoma",               "Emotet"),
+    ("global\\wncry@2ol7",           "WannaCry"),
+    ("mswingzonescachecountermutex", "WannaCry"),
+    ("global\\x2hkk",               "TrickBot"),
+    ("qbot",                         "Qakbot"),
+    ("qakbot",                       "Qakbot"),
+    ("njq8",                         "njRAT"),
+    ("remcos",                       "Remcos RAT"),
+    ("asyncmutex",                   "AsyncRAT"),
+    ("global\\frst",                 "Ursnif/Gozi"),
+    ("dridex",                       "Dridex"),
+    ("lokibot",                      "LokiBot"),
+    ("formbook",                     "FormBook"),
+]
+
+_PRIVATE_NETS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+]
+
+_C2_PORTS = frozenset({
+    4444, 4445, 4446, 4447, 4448, 4449, 4450,
+    5555, 6666, 7777, 8888, 9999,
+    31337, 31338, 31339,
+    1337, 13337,
+    9001, 9030, 9050, 9051,
+    2222, 3333, 6000,
+    1234, 12345,
+})
+
+_NORMAL_REMOTE_PORTS = frozenset({
+    80, 443, 8080, 8443, 53, 21, 22, 25, 587,
+    993, 994, 995, 110, 143, 465, 636, 5985, 5986,
+})
+
+
+# ── 분석 헬퍼 함수 ────────────────────────────────────────────────────────
+
+def _classify_shellcode(hexdump: str, disasm: str) -> str:
+    """malfind 결과에서 쉘코드 유형 자동 분류."""
+    h = hexdump.replace(" ", "").replace("\n", "").lower()
+    d = disasm.lower()
+
+    # PEB 워크 시그니처 — 위치독립 쉘코드 전형 시작 (x86/x64)
+    if "648b5230" in h or "648b4130" in h or "65488b52" in h:
+        return "PEB워크 쉘코드 (로더/인젝터)"
+
+    # Metasploit stager: FC E8 XX 00 00 00
+    if h.startswith("fce8") or "fce882000000" in h or "fce889000000" in h:
+        return "Metasploit 스테이저"
+
+    # NOP 슬레드: 0x90 반복
+    if len(h) >= 32 and h.count("90") >= 16:
+        return "NOP 슬레드 + 쉘코드"
+
+    # test + adc/add — 롤링 XOR 디코더 (0xAA XOR 키 패턴 포함)
+    if "test" in d and ("adc" in d or "add" in d):
+        return "롤링 XOR 디코더 스텁"
+
+    # xor + loop — 표준 XOR 디코더
+    if "xor" in d and "loop" in d:
+        return "XOR 디코더 스텁"
+
+    # call + pop — 위치독립 쉘코드 프롤로그
+    if "call" in d and "pop" in d:
+        return "위치독립 쉘코드 (call/pop 프롤로그)"
+
+    # 디스어셈 없음 = 아직 복호화되지 않은 버퍼
+    if not disasm.strip():
+        return "암호화 페이로드 버퍼 (미복호화)"
+
+    return "RWX 쉘코드 버퍼"
+
+
+def _shannon_entropy(s: str) -> float:
+    """Shannon 엔트로피 (bits per character)."""
+    if len(s) < 2:
+        return 0.0
+    cnt = collections.Counter(s)
+    total = len(s)
+    return -sum((c / total) * math.log2(c / total) for c in cnt.values())
+
+
+def _analyze_mutant(hname: str) -> tuple[float, str, bool]:
+    """
+    뮤텍스 이름 분석 → (entropy, family, is_suspicious).
+    family = 알려진 악성코드 패밀리명, "" = 미매칭.
+    is_suspicious = 패밀리 매칭 or 고엔트로피 랜덤 문자열.
+    """
+    if not hname or hname in ("-", "N/A", ""):
+        return 0.0, "", False
+
+    lower = hname.lower()
+    for pattern, family in _KNOWN_MUTEX_FAMILIES:
+        if pattern in lower:
+            return _shannon_entropy(hname), family, True
+
+    name_part = re.sub(r'^(global|local)\\', '', hname, flags=re.IGNORECASE)
+    entropy = _shannon_entropy(name_part)
+
+    is_random = (
+        entropy >= 3.5
+        and 6 <= len(name_part) <= 48
+        and bool(re.search(r'[a-zA-Z0-9]', name_part))
+        and not re.search(r'[가-힣\s]', name_part)
+        and not re.search(r'\.(exe|dll|sys|dat|tmp)$', name_part, re.IGNORECASE)
+    )
+    return entropy, "", is_random
+
+
+def _is_external_ip(addr: str) -> bool:
+    if not addr or addr in ("0.0.0.0", "::", "*", "-", ""):
+        return False
+    try:
+        ip = ipaddress.ip_address(addr)
+        if ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_link_local:
+            return False
+        return not any(ip in net for net in _PRIVATE_NETS)
+    except ValueError:
+        return False
+
+
+def _flag_suspicious_netscan(
+    foreign_addr: str, foreign_port: int, state: str,
+) -> tuple[bool, str]:
+    """netscan 항목 의심 여부 판정 → (suspicious, reason)."""
+    state_up = (state or "").upper()
+    if state_up in ("LISTEN", "CLOSED", "TIME_WAIT", "CLOSE_WAIT"):
+        return False, ""
+
+    if not _is_external_ip(foreign_addr):
+        return False, ""
+
+    reasons = []
+    if foreign_port in _C2_PORTS:
+        reasons.append(f"C2 포트 {foreign_port}")
+
+    if foreign_port not in _NORMAL_REMOTE_PORTS and 1024 <= foreign_port <= 49151:
+        reasons.append(f"비표준 포트 {foreign_port}")
+
+    if foreign_port > 49151:
+        reasons.append(f"고포트 {foreign_port}")
+
+    if reasons:
+        return True, " | ".join(reasons)
+
+    if state_up == "ESTABLISHED":
+        return True, f"외부 ESTABLISHED (:{foreign_port})"
+
+    return False, ""
 
 
 # ── 메모리 획득 헬퍼 ─────────────────────────────────────────────────────
@@ -599,6 +773,8 @@ class VolatilityRunner:
             pid = self._col_int(data, row, "PID") or self._col_int(data, row, "Pid")
             if pid_filter and pid not in pid_filter:
                 continue
+            hexdump = self._col(data, row, "Hexdump")[:64]
+            disasm  = self._col(data, row, "Disasm")[:256]
             results.append(MalfindEntry(
                 pid=pid,
                 process=self._col(data, row, "Process") or self._col(data, row, "ImageFileName"),
@@ -606,8 +782,9 @@ class VolatilityRunner:
                 end_vpn=self._col(data, row, "End VPN"),
                 protection=self._col(data, row, "Protection"),
                 private_memory=str(self._col(data, row, "PrivateMemory")).lower() in ("true", "1"),
-                hexdump=self._col(data, row, "Hexdump")[:64],
-                disasm=self._col(data, row, "Disasm")[:256],
+                hexdump=hexdump,
+                disasm=disasm,
+                shellcode_type=_classify_shellcode(hexdump, disasm),
             ))
         return results
 
@@ -633,16 +810,22 @@ class VolatilityRunner:
         for row in (data.get("rows") or []):
             lport = self._col(data, row, "LocalPort")
             fport = self._col(data, row, "ForeignPort")
+            foreign_addr = self._col(data, row, "ForeignAddr")
+            foreign_port = int(fport) if str(fport).isdigit() else 0
+            state        = self._col(data, row, "State")
+            susp, reason = _flag_suspicious_netscan(foreign_addr, foreign_port, state)
             results.append(NetScanEntry(
                 proto=self._col(data, row, "Proto"),
                 local_addr=self._col(data, row, "LocalAddr"),
                 local_port=int(lport) if str(lport).isdigit() else 0,
-                foreign_addr=self._col(data, row, "ForeignAddr"),
-                foreign_port=int(fport) if str(fport).isdigit() else 0,
-                state=self._col(data, row, "State"),
+                foreign_addr=foreign_addr,
+                foreign_port=foreign_port,
+                state=state,
                 pid=self._col_int(data, row, "PID") or self._col_int(data, row, "Pid"),
                 owner=self._col(data, row, "Owner"),
                 created=self._col(data, row, "Created"),
+                suspicious=susp,
+                susp_reason=reason,
             ))
         return results
 
@@ -675,11 +858,15 @@ class VolatilityRunner:
             hname = self._col(data, row, "Name")
             if not hname or hname in ("-", "N/A", ""):
                 continue
+            entropy, family, suspicious = _analyze_mutant(hname) if htype == "Mutant" else (0.0, "", False)
             results.append(HandleEntry(
                 pid=pid,
                 name=self._col(data, row, "Process") or self._col(data, row, "ImageFileName"),
                 htype=htype,
                 hname=hname,
+                entropy=round(entropy, 3),
+                family=family,
+                suspicious=suspicious,
             ))
         return results
 
@@ -1037,7 +1224,8 @@ def memforensics_to_dict(r: MemForensicsResult) -> dict:
             {"pid": e.pid, "process": e.process, "start_vpn": e.start_vpn,
              "end_vpn": e.end_vpn, "protection": e.protection,
              "private_memory": e.private_memory,
-             "hexdump": e.hexdump, "disasm": e.disasm}
+             "hexdump": e.hexdump, "disasm": e.disasm,
+             "shellcode_type": e.shellcode_type}
             for e in r.malfind
         ],
         "pstree": [
@@ -1050,7 +1238,8 @@ def memforensics_to_dict(r: MemForensicsResult) -> dict:
             {"proto": e.proto, "local": f"{e.local_addr}:{e.local_port}",
              "foreign": f"{e.foreign_addr}:{e.foreign_port}",
              "state": e.state, "pid": e.pid, "owner": e.owner,
-             "created": e.created}
+             "created": e.created,
+             "suspicious": e.suspicious, "susp_reason": e.susp_reason}
             for e in r.netscan
         ],
         "cmdline": [
@@ -1058,7 +1247,8 @@ def memforensics_to_dict(r: MemForensicsResult) -> dict:
             for e in r.cmdline
         ],
         "handles": [
-            {"pid": e.pid, "name": e.name, "type": e.htype, "handle_name": e.hname}
+            {"pid": e.pid, "name": e.name, "type": e.htype, "handle_name": e.hname,
+             "entropy": e.entropy, "family": e.family, "suspicious": e.suspicious}
             for e in r.handles
         ],
         "dlllist": [

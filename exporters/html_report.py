@@ -3425,11 +3425,16 @@ def _volatility_html(result) -> str:
         f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
         f"덤프 {dump_gb} GB &nbsp;|&nbsp; 분석 {vol_sec}s &nbsp;|&nbsp; "
         f"malfind <strong style='color:{'#ff7b72' if malfind else 'inherit'}'>{len(malfind)}</strong>건 &nbsp;|&nbsp; "
-        f"netscan {len(netscan)}건 &nbsp;|&nbsp; connscan {len(connscan)}건 &nbsp;|&nbsp; "
+        f"netscan {len(netscan)}건"
+        + (f" <span style='color:#ffa657'>({sum(1 for e in netscan if e.get('suspicious'))}건 의심)</span>"
+           if any(e.get("suspicious") for e in netscan) else "")
+        + f" &nbsp;|&nbsp; connscan {len(connscan)}건 &nbsp;|&nbsp; "
         f"psxview 은닉 <strong style='color:{'#ff7b72' if any(e.get('hidden') for e in psxview) else 'inherit'}'>"
         f"{sum(1 for e in psxview if e.get('hidden'))}</strong>건 &nbsp;|&nbsp; "
-        f"handles(Mutant) {len(handles)}건 &nbsp;|&nbsp; "
-        f"PE 추출 {len(procdumps)}건</p>",
+        f"handles(Mutant) {len([h for h in handles if h.get('type')=='Mutant'])}건"
+        + (f" <span style='color:#ffa657'>({sum(1 for h in handles if h.get('suspicious'))}건 의심)</span>"
+           if any(h.get("suspicious") for h in handles) else "")
+        + f" &nbsp;|&nbsp; PE 추출 {len(procdumps)}건</p>",
     ]
 
     # ── 플러그인 오류 표시 ────────────────────────────────────────────
@@ -3467,18 +3472,33 @@ def _volatility_html(result) -> str:
     # ── malfind ──────────────────────────────────────────────────────
     if malfind:
         rows = ""
+        _SHC_COLORS = {
+            "PEB워크": "#ff7b72",
+            "Metasploit": "#ff7b72",
+            "NOP": "#e3b341",
+            "롤링 XOR": "#e3b341",
+            "XOR 디코더": "#e3b341",
+            "위치독립": "#d2a8ff",
+            "암호화": "#8b949e",
+            "RWX": "#8b949e",
+        }
         for e in malfind[:50]:
             prot = _e(e.get("protection", ""))
             rw   = "PAGE_EXECUTE_READWRITE" in prot or "PAGE_EXECUTE_WRITECOPY" in prot
             prot_cell = (f"<span style='color:#ff7b72'>{prot}</span>" if rw
                          else f"<span style='color:#e3b341'>{prot}</span>")
+            sc_type = e.get("shellcode_type", "")
+            sc_color = next((v for k, v in _SHC_COLORS.items() if k in sc_type), "#8b949e")
+            sc_cell = (f"<span style='font-size:.75rem;color:{sc_color}'>{_e(sc_type)}</span>"
+                       if sc_type else "")
             rows += (
                 f"<tr>"
                 f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
                 f"<td class='mono'>{_e(e.get('process',''))}</td>"
                 f"<td class='mono' style='font-size:.78rem'>{_e(e.get('start_vpn',''))}</td>"
                 f"<td>{prot_cell}</td>"
-                f"<td class='mono' style='font-size:.75rem;max-width:280px;overflow:hidden;white-space:nowrap'>"
+                f"<td>{sc_cell}</td>"
+                f"<td class='mono' style='font-size:.75rem;max-width:240px;overflow:hidden;white-space:nowrap'>"
                 f"{_e(e.get('disasm','')[:80])}</td>"
                 f"</tr>"
             )
@@ -3488,7 +3508,7 @@ def _volatility_html(result) -> str:
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='color:#ff7b72;margin-top:0'>⚠ malfind — 주입 코드 탐지</h4>"
             f"<div style='overflow-x:auto'><table>"
-            f"<tr><th>PID</th><th>프로세스</th><th>주소</th><th>보호 속성</th><th>디스어셈블</th></tr>"
+            f"<tr><th>PID</th><th>프로세스</th><th>주소</th><th>보호 속성</th><th>쉘코드 유형</th><th>디스어셈블</th></tr>"
             f"{rows}</table></div>{note}</div>"
         )
 
@@ -3517,26 +3537,44 @@ def _volatility_html(result) -> str:
 
     # ── netscan ───────────────────────────────────────────────────────
     if netscan:
+        susp_conns  = [e for e in netscan if e.get("suspicious")]
+        other_conns = [e for e in netscan if not e.get("suspicious")]
+        # 의심 먼저, 나머지는 최대 20건
+        display_ns  = susp_conns + other_conns[:max(0, 40 - len(susp_conns))]
         rows = ""
-        for e in netscan[:40]:
+        for e in display_ns:
             state = _e(e.get("state", ""))
             state_style = "color:#ff7b72" if state == "ESTABLISHED" else "color:#8b949e"
+            is_susp = e.get("suspicious", False)
+            row_style = "background:#2d1f0f" if is_susp else ""
+            reason = _e(e.get("susp_reason", ""))
+            susp_td = (f"<span style='color:#ffa657;font-size:.74rem'>{reason}</span>"
+                       if is_susp else "<span style='color:#484f58;font-size:.74rem'>—</span>")
             rows += (
-                f"<tr>"
+                f"<tr style='{row_style}'>"
                 f"<td class='mono'>{_e(e.get('proto',''))}</td>"
                 f"<td class='mono'>{_e(e.get('local',''))}</td>"
-                f"<td class='mono' style='color:#e3b341'>{_e(e.get('foreign',''))}</td>"
+                f"<td class='mono' style='color:{'#ff7b72' if is_susp else '#e3b341'}'>"
+                f"{_e(e.get('foreign',''))}</td>"
                 f"<td style='{state_style}'>{state}</td>"
                 f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
                 f"<td class='mono'>{_e(e.get('owner',''))}</td>"
+                f"<td>{susp_td}</td>"
                 f"</tr>"
             )
+        susp_cnt = len(susp_conns)
+        hdr_color = "#ffa657" if susp_cnt else "inherit"
+        susp_badge = (f" &nbsp;<span style='color:#ffa657;font-size:.8rem'>"
+                      f"의심 {susp_cnt}건</span>" if susp_cnt else "")
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
-            f"<h4 style='margin-top:0'>네트워크 아티팩트 (메모리 기준)</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>이미 종료된 연결 포함 — tshark 누락분 보완</p>"
+            f"<h4 style='margin-top:0;color:{hdr_color}'>"
+            f"네트워크 아티팩트 (메모리 기준){susp_badge}</h4>"
+            f"<p style='color:#8b949e;font-size:.78rem'>이미 종료된 연결 포함 — "
+            f"외부 IP·비표준 포트 자동 플래깅 (주황색 행)</p>"
             f"<div style='overflow-x:auto'><table>"
-            f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th><th>PID</th><th>프로세스</th></tr>"
+            f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th>"
+            f"<th>PID</th><th>프로세스</th><th>의심 사유</th></tr>"
             f"{rows}</table></div></div>"
         )
 
@@ -3638,22 +3676,50 @@ def _volatility_html(result) -> str:
     # ── handles (Mutant) ─────────────────────────────────────────────
     mutants = [h for h in handles if h.get("type") == "Mutant"]
     if mutants:
-        rows = "".join(
-            f"<tr>"
-            f"<td class='mono' style='color:#79c0ff'>{h.get('pid','')}</td>"
-            f"<td class='mono'>{_e(h.get('name',''))}</td>"
-            f"<td class='mono' style='color:#d2a8ff'>{_e(h.get('handle_name',''))}</td>"
-            f"</tr>"
-            for h in mutants[:30]
-        )
+        susp_mut  = [h for h in mutants if h.get("suspicious")]
+        other_mut = [h for h in mutants if not h.get("suspicious")]
+        # 의심 뮤텍스 먼저, 나머지는 20건 제한
+        display_mut = susp_mut + other_mut[:max(0, 30 - len(susp_mut))]
+        rows = ""
+        for h in display_mut:
+            is_susp  = h.get("suspicious", False)
+            family   = h.get("family", "")
+            entropy  = h.get("entropy", 0.0)
+            row_style = "background:#1f2d1f" if family else ("background:#2d2d1f" if is_susp else "")
+            name_color = "#ff7b72" if family else ("#ffa657" if is_susp else "#d2a8ff")
+            if family:
+                analysis = f"<span style='color:#ff7b72;font-size:.74rem'>패밀리: {_e(family)}</span>"
+            elif is_susp:
+                analysis = f"<span style='color:#ffa657;font-size:.74rem'>고엔트로피 랜덤 (H={entropy:.2f})</span>"
+            else:
+                analysis = f"<span style='color:#484f58;font-size:.74rem'>{entropy:.2f}</span>"
+            rows += (
+                f"<tr style='{row_style}'>"
+                f"<td class='mono' style='color:#79c0ff'>{h.get('pid','')}</td>"
+                f"<td class='mono'>{_e(h.get('name',''))}</td>"
+                f"<td class='mono' style='color:{name_color}'>{_e(h.get('handle_name',''))}</td>"
+                f"<td>{analysis}</td>"
+                f"</tr>"
+            )
+        family_cnt = sum(1 for h in susp_mut if h.get("family"))
+        random_cnt = sum(1 for h in susp_mut if not h.get("family"))
+        hdr_color = "#ff7b72" if family_cnt else ("#ffa657" if random_cnt else "inherit")
+        badge_parts = []
+        if family_cnt:
+            badge_parts.append(f"<span style='color:#ff7b72;font-size:.8rem'>패밀리 매칭 {family_cnt}건</span>")
+        if random_cnt:
+            badge_parts.append(f"<span style='color:#ffa657;font-size:.8rem'>고엔트로피 {random_cnt}건</span>")
+        susp_badge = (" &nbsp;" + " &nbsp;".join(badge_parts)) if badge_parts else ""
+        note = (f"<p style='color:#484f58;font-size:.78rem'>(전체 {len(mutants)}건 중 표시)</p>"
+                if len(mutants) > len(display_mut) else "")
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
-            f"<h4 style='margin-top:0'>뮤텍스 (Mutant) 핸들</h4>"
+            f"<h4 style='margin-top:0;color:{hdr_color}'>뮤텍스 (Mutant) 핸들{susp_badge}</h4>"
             f"<p style='color:#8b949e;font-size:.78rem'>악성코드 패밀리 식별에 핵심 — "
-            f"알려진 뮤텍스 이름으로 VT/MISP 검색 권장</p>"
+            f"패밀리 매칭(빨강) / 고엔트로피 랜덤(주황) 순으로 표시</p>"
             f"<div style='overflow-x:auto'><table>"
-            f"<tr><th>PID</th><th>프로세스</th><th>뮤텍스 이름</th></tr>"
-            f"{rows}</table></div></div>"
+            f"<tr><th>PID</th><th>프로세스</th><th>뮤텍스 이름</th><th>엔트로피 / 패밀리</th></tr>"
+            f"{rows}</table></div>{note}</div>"
         )
 
     # ── cmdline (비교용) ──────────────────────────────────────────────
