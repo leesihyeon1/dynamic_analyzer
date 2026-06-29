@@ -49,6 +49,8 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .ev-registry { color: #d2a8ff; }
 .ev-process  { color: #ffa657; }
 .ev-network  { color: #56d364; }
+.attk-chip{display:inline-block;font-size:.62rem;font-family:monospace;padding:.08rem .3rem;border-radius:3px;background:#0d2137;color:#79c0ff;border:1px solid #1f4068;white-space:nowrap;cursor:default;vertical-align:middle;line-height:1.5}
+.attk-chip-more{background:#1c2128;color:#8b949e;border-color:#30363d}
 .pg-wrap{display:flex;align-items:center;gap:.75rem;padding:.6rem 0;flex-wrap:wrap;border-top:1px solid #21262d;margin-top:.25rem}
 .pg-info{color:#8b949e;font-size:.78rem;flex:1}
 .pg-btns{display:flex;gap:.2rem;flex-wrap:wrap}
@@ -642,6 +644,30 @@ _SOURCE_COLOR = {
 }
 
 
+def _attk_chips(keys: list, tag_map: dict, all_techs: list) -> str:
+    """ATT&CK 기법 칩 HTML 반환. keys 중 tag_map 에 있는 technique_id 를 표시."""
+    if not tag_map:
+        return ""
+    seen: set[str] = set()
+    tech_ids: list[str] = []
+    for key in keys:
+        k = (key or "").strip().lower()
+        for tid in tag_map.get(k, []):
+            if tid not in seen:
+                seen.add(tid)
+                tech_ids.append(tid)
+    if not tech_ids:
+        return ""
+    name_map = {t.technique_id: t.technique_name for t in all_techs}
+    chips = []
+    for tid in tech_ids[:3]:
+        tname = _e(name_map.get(tid, tid))
+        chips.append(f"<span class='attk-chip' title='{tname}'>{_e(tid)}</span>")
+    if len(tech_ids) > 3:
+        chips.append(f"<span class='attk-chip attk-chip-more'>+{len(tech_ids)-3}</span>")
+    return " ".join(chips)
+
+
 def _source_badges(sources: list) -> str:
     """출처 배지 HTML 반환. 빈 리스트면 '로컬룰' 배지 기본 표시."""
     if not sources:
@@ -749,6 +775,10 @@ def _file_events_html(result) -> tuple[str, int]:
     """(HTML 문자열, 실제 이벤트 총 개수) 반환."""
     from parsers.procmon_csv import EventCategory
 
+    _br      = getattr(result, "behavior_report", None)
+    _tag_map = getattr(_br, "tag_map", {}) if _br else {}
+    _techs   = getattr(_br, "techniques", []) if _br else []
+
     # 악성 체인 PID — 해당 프로세스는 CreateFile(열기/생성)까지 전부 표시
     chain_pids: set[int] = {p.pid for p in _compute_display_procs(result)[0]}
 
@@ -791,6 +821,8 @@ def _file_events_html(result) -> tuple[str, int]:
             f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
             if detail_str else ""
         )
+        _chips = _attk_chips([e.path], _tag_map, _techs)
+        _chips_td = f"<td style='white-space:nowrap'>{_chips}</td>" if _chips else "<td></td>"
         rows.append(
             f"<tr>"
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
@@ -798,6 +830,7 @@ def _file_events_html(result) -> tuple[str, int]:
             f"<td>{_b(e.operation, op_color.get(e.operation,'gray'))}{count_html}</td>"
             f"<td class='mono ev-file'>{_e(e.path[:120])}{detail_html}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
+            f"{_chips_td}"
             f"</tr>"
         )
     dedup_note = (
@@ -810,7 +843,7 @@ def _file_events_html(result) -> tuple[str, int]:
     html = (
         _trunc_notice(total, _FILE_LIMIT)
         + dedup_note
-        + "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th></tr>"
+        + "<table id='tbl-file'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>경로</th><th>결과</th><th>기법</th></tr>"
         + "".join(rows) + "</table>"
     )
     return html, total
@@ -861,6 +894,10 @@ def _registry_events_html(result) -> str:
     added    = list(reg_diff.get("added",    []))
     modified = list(reg_diff.get("modified", []))
 
+    _br      = getattr(result, "behavior_report", None)
+    _tag_map = getattr(_br, "tag_map", {}) if _br else {}
+    _techs   = getattr(_br, "techniques", []) if _br else []
+
     # winreg 스냅샷이 비어있으면 ProcMon 이벤트에서 변화 도출
     _from_procmon = False
     if not (added or modified) and events:
@@ -886,25 +923,27 @@ def _registry_events_html(result) -> str:
             proc = entry[3] if len(entry) > 3 else ""
             proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
                        if proc else "<td style='color:#8b949e'>-</td>")
+            _chips_td = f"<td style='white-space:nowrap'>{_attk_chips([k], _tag_map, _techs)}</td>"
             rows.append(f"<tr><td>{_b('추가','green')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td>"
-                     f"{proc_td}</tr>")
+                     f"{proc_td}{_chips_td}</tr>")
         for entry in modified[:_REG_DIFF_LIMIT]:
             k, n, nw = entry[0], entry[1], entry[3]
             proc = entry[4] if len(entry) > 4 else ""
             proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
                        if proc else "<td style='color:#8b949e'>-</td>")
+            _chips_td = f"<td style='white-space:nowrap'>{_attk_chips([k], _tag_map, _techs)}</td>"
             rows.append(f"<tr><td>{_b('변경','orange')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
                      f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td>"
-                     f"{proc_td}</tr>")
+                     f"{proc_td}{_chips_td}</tr>")
         parts.append(
             f"<h3>레지스트리 스냅샷 비교{_src_note}</h3>"
             + _trunc_notice(total_diff, _REG_DIFF_LIMIT)
-            + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th><th>프로세스</th></tr>"
+            + "<table id='tbl-reg-diff'><tr><th>변경</th><th>키 경로</th><th>값 이름</th><th>데이터</th><th>프로세스</th><th>기법</th></tr>"
             + "".join(rows) + "</table>"
         )
 
@@ -912,6 +951,7 @@ def _registry_events_html(result) -> str:
     if events:
         rows = []
         for e in events[:_REG_EV_LIMIT]:
+            _chips_td = f"<td style='white-space:nowrap'>{_attk_chips([e.path], _tag_map, _techs)}</td>"
             rows.append(
                 f"<tr>"
                 f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
@@ -919,12 +959,13 @@ def _registry_events_html(result) -> str:
                 f"<td>{_b(e.operation,'purple')}</td>"
                 f"<td class='mono ev-registry'>{_e(e.path[:100])}</td>"
                 f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.detail[:60])}</td>"
+                f"{_chips_td}"
                 f"</tr>"
             )
         parts.append(
             "<h3>ProcMon 레지스트리 이벤트</h3>"
             + _trunc_notice(len(events), _REG_EV_LIMIT)
-            + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th></tr>"
+            + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th><th>기법</th></tr>"
             + "".join(rows) + "</table>"
         )
 
@@ -1056,6 +1097,10 @@ def _extract_pids_from_labels(labels: list[str]) -> set[int]:
 
 def _network_html(result) -> str:
     pcap = result.pcap_result
+
+    _br      = getattr(result, "behavior_report", None)
+    _tag_map = getattr(_br, "tag_map", {}) if _br else {}
+    _techs   = getattr(_br, "techniques", []) if _br else []
 
     # pcap이 없어도 decrypted_requests / fakenet_result는 렌더링해야 하므로
     # 조기 리턴하지 않고 각 섹션을 독립적으로 처리한다.
@@ -1326,6 +1371,10 @@ def _network_html(result) -> str:
                     )
             else:
                 _reason = ""
+            _conn_chip_keys = [c.dst_ip] + [d for d in conn_doms[:2]]
+            _conn_chips = _attk_chips(_conn_chip_keys, _tag_map, _techs)
+            _conn_chips_td = (f"<td style='white-space:nowrap'>{_conn_chips}</td>"
+                              if _conn_chips else "<td></td>")
             _row_html = (
                 f"<tr>"
                 f"<td>{_b(c.proto, 'blue')}</td>"
@@ -1336,6 +1385,7 @@ def _network_html(result) -> str:
                 f"<td style='color:#8b949e'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
                 + _proc_cell(_conn_procs, _reason) +
+                f"{_conn_chips_td}"
                 f"</tr>"
             )
 
@@ -1359,7 +1409,7 @@ def _network_html(result) -> str:
         _tbl_header = (
             "<table id='tbl-net-conn'>"
             "<tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
-            "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
+            "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th><th>기법</th></tr>"
         )
         parts.append(
             "<h3>네트워크 연결 (송신량 순)</h3>"
@@ -1372,7 +1422,7 @@ def _network_html(result) -> str:
             _cdn_tbl_header = (
                 "<table style='width:100%;border-collapse:collapse;opacity:.65'>"
                 "<tr><th>프로토콜</th><th>출발지 IP</th><th>목적지 IP</th>"
-                "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th></tr>"
+                "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th><th>기법</th></tr>"
             )
             parts.append(
                 f"<details style='margin-top:.6rem;border:1px solid #30363d;"
@@ -1413,6 +1463,9 @@ def _network_html(result) -> str:
             _q_cls  = "" if (q.suspicious or _q_is_ddns) else "ev-network"
             _q_clr  = "color:#ff7b72" if q.suspicious else ("color:#ffa657" if _q_is_ddns else "")
             _q_rips = _e(", ".join(q.response_ips[:3])) if q.response_ips else "<span style='color:#8b949e;font-size:.72rem'>—</span>"
+            _dns_chips = _attk_chips([q.name], _tag_map, _techs)
+            _dns_chips_td = (f"<td style='white-space:nowrap'>{_dns_chips}</td>"
+                             if _dns_chips else "<td></td>")
             rows.append(
                 f"<tr>"
                 f"<td class='mono {_q_cls}' style='{_q_clr}'>{_e(q.name)}</td>"
@@ -1421,13 +1474,14 @@ def _network_html(result) -> str:
                 f"<td class='mono' style='color:#56d364;font-size:0.72rem'>{_q_rips}</td>"
                 f"<td>{susp_badges}</td>"
                 + _proc_cell(dns_procs) +
+                f"{_dns_chips_td}"
                 f"</tr>"
             )
         parts.append(
             "<h3>DNS 쿼리 (엔트로피 순)</h3>"
             + _trunc_notice(len(pcap.dns_queries), _DNS_LIMIT)
             + "<table id='tbl-net-dns'><tr><th>도메인</th><th>타입</th><th>엔트로피</th>"
-            "<th>응답 IP</th><th>의심</th><th>프로세스</th></tr>"
+            "<th>응답 IP</th><th>의심</th><th>프로세스</th><th>기법</th></tr>"
             + "".join(rows) + "</table>"
         )
 
@@ -2068,6 +2122,10 @@ def _process_html(result) -> str:
 
     _http_by_conn = _build_http_by_conn(result)
 
+    _br      = getattr(result, "behavior_report", None)
+    _tag_map = getattr(_br, "tag_map", {}) if _br else {}
+    _techs   = getattr(_br, "techniques", []) if _br else []
+
     rows = []
     for p in new_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
@@ -2080,6 +2138,8 @@ def _process_html(result) -> str:
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
         exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
                   if beh_btn else "<td style='width:26px'></td>")
+        _chips = _attk_chips([p.name, p.exe or ""], _tag_map, _techs)
+        _chips_td = f"<td style='white-space:nowrap'>{_chips}</td>" if _chips else "<td></td>"
         rows.append(
             f"<tr{tr_behrow}>"
             f"{exp_td}"
@@ -2087,10 +2147,11 @@ def _process_html(result) -> str:
             f"<td>{name_cell}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
+            f"{_chips_td}"
             f"</tr>{beh_detail_row}"
         )
     table_html = (
-        "<table id='tbl-process'><tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
+        "<table id='tbl-process'><tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
         + "".join(rows) + "</table>"
     )
 
@@ -2481,6 +2542,10 @@ def _all_procs_html(result, chain_pids: set) -> str:
 
     _http_by_conn2 = _build_http_by_conn(result)
 
+    _br2      = getattr(result, "behavior_report", None)
+    _tag_map2 = getattr(_br2, "tag_map", {}) if _br2 else {}
+    _techs2   = getattr(_br2, "techniques", []) if _br2 else []
+
     rows = []
     for p in table_procs:
         cmdline = " ".join(p.cmdline) if p.cmdline else ""
@@ -2494,6 +2559,8 @@ def _all_procs_html(result, chain_pids: set) -> str:
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
         exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
                   if beh_btn else "<td style='width:26px'></td>")
+        _chips2 = _attk_chips([p.name, p.exe or ""], _tag_map2, _techs2)
+        _chips2_td = f"<td style='white-space:nowrap'>{_chips2}</td>" if _chips2 else "<td></td>"
         rows.append(
             f"<tr{style}{tr_behrow}>"
             f"{exp_td}"
@@ -2501,13 +2568,14 @@ def _all_procs_html(result, chain_pids: set) -> str:
             f"<td>{name_cell}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
+            f"{_chips2_td}"
             f"</tr>{beh_detail_row}"
         )
 
     return (
         note
         + "<table id='tbl-process-all'>"
-        + "<tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th></tr>"
+        + "<tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
         + "".join(rows)
         + "</table>"
     )

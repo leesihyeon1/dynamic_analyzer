@@ -9,6 +9,25 @@ from parsers.pcap_parser import PcapResult
 
 
 # ---------------------------------------------------------------------------
+# FP allowlist — Windows JIT/UWP processes and analysis tools
+# HollowsHunter flags JIT stubs in these as shellcode (PE=0, replaced=0) → FP
+# Keep in sync with _HH_SYSTEM_FP_NAMES in ai_analyzer.py and html_report.py
+# ---------------------------------------------------------------------------
+
+_HH_FP_NAMES: frozenset[str] = frozenset({
+    "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
+    "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+    "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
+    "systemsettings.exe", "smartscreen.exe", "wuauclt.exe",
+    "sihost.exe", "taskhostw.exe", "ctfmon.exe",
+    "picpick.exe", "processhacker.exe", "systeminformer.exe",
+    "procmon.exe", "procmon64.exe",
+    "hollows_hunter.exe", "hollows_hunter64.exe",
+    "pe_sieve.exe", "pe_sieve64.exe",
+})
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -29,6 +48,7 @@ class BehaviorReport:
     suspicious_registry: list[str]            = field(default_factory=list)
     suspicious_network:  list[str]            = field(default_factory=list)
     suspicious_processes:list[str]            = field(default_factory=list)
+    tag_map:             dict[str, list[str]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +152,7 @@ def _classify_file_events(
                     process=ev.process,
                 )
                 report.suspicious_files.append(path)
+                _tag_entity(report.tag_map, lower, "T1547.001")
 
         # T1027 – executable/script dropped in AppData or Temp
         if op in _WRITE_CREATE_OPS:
@@ -146,6 +167,7 @@ def _classify_file_events(
                     process=ev.process,
                 )
                 report.suspicious_files.append(path)
+                _tag_entity(report.tag_map, lower, "T1027")
 
         # T1486 – ransomware-style extension
         if op == "WriteFile" and ext in _RANSOMWARE_EXTENSIONS:
@@ -157,6 +179,7 @@ def _classify_file_events(
                 process=ev.process,
             )
             report.suspicious_files.append(path)
+            _tag_entity(report.tag_map, lower, "T1486")
 
         # T1070.004 – self-deletion
         if op == "DeleteFile":
@@ -170,6 +193,7 @@ def _classify_file_events(
                     process=ev.process,
                 )
                 report.suspicious_files.append(path)
+                _tag_entity(report.tag_map, lower, "T1070.004")
 
         # T1555.003 – Credentials from Web Browsers
         # Exclude browser processes reading their own files
@@ -185,6 +209,7 @@ def _classify_file_events(
                     process=ev.process,
                 )
                 report.suspicious_files.append(path)
+                _tag_entity(report.tag_map, lower, "T1555.003")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +242,7 @@ def _classify_registry_events(
                 process=process,
             )
             report.suspicious_registry.append(path)
+            _tag_entity(report.tag_map, lower, "T1547.001")
 
         if "\\services\\" in lower:
             _add_evidence(
@@ -227,6 +253,7 @@ def _classify_registry_events(
                 process=process,
             )
             report.suspicious_registry.append(path)
+            _tag_entity(report.tag_map, lower, "T1543.003")
 
         if "winlogon" in lower and ("userinit" in det or "shell" in det):
             _add_evidence(
@@ -237,6 +264,7 @@ def _classify_registry_events(
                 process=process,
             )
             report.suspicious_registry.append(path)
+            _tag_entity(report.tag_map, lower, "T1547.004")
 
         if "appinit_dlls" in lower:
             _add_evidence(
@@ -247,6 +275,7 @@ def _classify_registry_events(
                 process=process,
             )
             report.suspicious_registry.append(path)
+            _tag_entity(report.tag_map, lower, "T1546.010")
 
         if "image file execution options" in lower and "debugger" in det:
             _add_evidence(
@@ -257,6 +286,7 @@ def _classify_registry_events(
                 process=process,
             )
             report.suspicious_registry.append(path)
+            _tag_entity(report.tag_map, lower, "T1546.012")
 
         # T1562.001 – Defender / AV disable via registry
         _defender_keys = (
@@ -273,6 +303,7 @@ def _classify_registry_events(
                 process=process,
             )
             report.suspicious_registry.append(path)
+            _tag_entity(report.tag_map, lower, "T1562.001")
 
     for ev in events:
         if ev.category == EventCategory.REGISTRY and ev.operation == "RegSetValue":
@@ -484,6 +515,7 @@ def _classify_process_events(
                     process=ev.process,
                 )
                 report.suspicious_processes.append(ev.detail or ev.path)
+                _tag_entity(report.tag_map, frag, tid)
                 break  # first match per event
 
         # PowerShell deep analysis — runs regardless of LOLBin match above
@@ -542,11 +574,18 @@ def _classify_injection(
         seen_pids.add(pid)
 
         pname        = getattr(r, "name", "") or f"PID {pid}"
+        pname_lower  = pname.lower()
         replaced     = getattr(r, "replaced", 0)
         implanted_pe = getattr(r, "implanted_pe", 0)
         implanted_shc = getattr(r, "implanted_shc", 0)
         hooked       = getattr(r, "hooked", 0)
-        ev_base      = f"{pname} (PID {pid}): susp={susp}"
+
+        # Windows JIT/UWP 및 분석 도구 오탐 제거:
+        # PE=0, replaced=0 조건에서 HH가 JIT 컴파일 스텁을 셸코드로 잘못 탐지함
+        if pname_lower in _HH_FP_NAMES and replaced == 0 and implanted_pe == 0:
+            return
+
+        ev_base = f"{pname} (PID {pid}): susp={susp}"
 
         # T1055.012 — Process Hollowing
         if replaced > 0 or implanted_pe > 0:
@@ -557,6 +596,7 @@ def _classify_injection(
                 process=pname,
             )
             report.suspicious_processes.append(f"Process Hollowing: {pname}")
+            _tag_entity(report.tag_map, pname_lower, "T1055.012")
 
         # T1055 — Shellcode injection
         if implanted_shc > 0:
@@ -567,8 +607,10 @@ def _classify_injection(
                 process=pname,
             )
             report.suspicious_processes.append(f"Shellcode 주입: {pname}")
+            _tag_entity(report.tag_map, pname_lower, "T1055")
 
         # T1056.001 — Keylogging (API hooks detected in suspicious process)
+        # Only flag real hooks in non-FP processes (FP processes already filtered above)
         if hooked > 0:
             _add_evidence(
                 technique_map, "T1056.001", "Keylogging", "Collection",
@@ -576,6 +618,7 @@ def _classify_injection(
                 reference="https://attack.mitre.org/techniques/T1056/001/",
                 process=pname,
             )
+            _tag_entity(report.tag_map, pname_lower, "T1056.001")
 
         # T1055 — generic (anything suspicious not covered above)
         if susp > 0 and replaced == 0 and implanted_pe == 0 and implanted_shc == 0:
@@ -585,6 +628,7 @@ def _classify_injection(
                 reference="https://attack.mitre.org/techniques/T1055/",
                 process=pname,
             )
+            _tag_entity(report.tag_map, pname_lower, "T1055")
 
     if hh_result:
         for r in (getattr(hh_result, "process_results", []) or []):
@@ -685,6 +729,8 @@ def _classify_network(
                           evidence=evidence,
                           reference="https://attack.mitre.org/techniques/T1048/")
             report.suspicious_network.append(f"SMTP: {evidence}")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1071.003")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1048")
 
         # FTP → Exfiltration
         elif conn.dst_port in (21, 990):
@@ -693,26 +739,31 @@ def _classify_network(
                           evidence=evidence,
                           reference="https://attack.mitre.org/techniques/T1048/")
             report.suspicious_network.append(f"FTP: {evidence}")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1048")
 
         elif conn.dst_port in (80, 8080):
             _add_evidence(technique_map, "T1071.001", "Web Protocols",
                           "Command and Control", evidence=evidence,
                           reference="https://attack.mitre.org/techniques/T1071/001/")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1071.001")
         elif conn.dst_port in (443, 8443):
             _add_evidence(technique_map, "T1071.001", "Web Protocols (HTTPS)",
                           "Command and Control", evidence=evidence,
                           reference="https://attack.mitre.org/techniques/T1071/001/")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1071.001")
         else:
             _add_evidence(technique_map, "T1095",
                           "Non-Application Layer Protocol", "Command and Control",
                           evidence=evidence,
                           reference="https://attack.mitre.org/techniques/T1095/")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1095")
 
         if conn.suspicious_port:
             _add_evidence(technique_map, "T1095",
                           "Non-Application Layer Protocol (의심 포트)", "Command and Control",
                           evidence=f"{conn.dst_ip}:{conn.dst_port} [{conn.proto}]",
                           reference="https://attack.mitre.org/techniques/T1095/")
+            _tag_entity(report.tag_map, conn.dst_ip, "T1095")
 
         report.suspicious_network.append(evidence)
 
@@ -728,6 +779,8 @@ def _classify_network(
                           evidence=f"SNI={tls.sni} → {tls.dst_ip}:{tls.dst_port}",
                           reference="https://attack.mitre.org/techniques/T1071/001/")
             report.suspicious_network.append(f"TLS SNI: {tls.sni}")
+            _tag_entity(report.tag_map, tls.sni.lower(), "T1071.001")
+            _tag_entity(report.tag_map, tls.dst_ip, "T1071.001")
 
     # DNS queries
     for q in pcap.dns_queries:
@@ -741,11 +794,13 @@ def _classify_network(
                           evidence=f"DNS: {q.name}",
                           reference="https://attack.mitre.org/techniques/T1016/")
             report.suspicious_network.append(f"GeoIP lookup: {q.name}")
+            _tag_entity(report.tag_map, q.name.lower(), "T1016")
             continue
 
         _add_evidence(technique_map, "T1071.004", "DNS", "Command and Control",
                       evidence=q.name,
                       reference="https://attack.mitre.org/techniques/T1071/004/")
+        _tag_entity(report.tag_map, q.name.lower(), "T1071.004")
 
     # DGA
     if pcap.suspicious_domains:
@@ -755,6 +810,7 @@ def _classify_network(
                           evidence=f"고엔트로피 도메인: {domain}",
                           reference="https://attack.mitre.org/techniques/T1568/002/")
             report.suspicious_network.append(f"DGA 의심: {domain}")
+            _tag_entity(report.tag_map, domain.lower(), "T1568.002")
 
     # DNS tunneling
     if pcap.dns_tunnel_suspects:
@@ -764,6 +820,7 @@ def _classify_network(
                           evidence=f"다수 서브도메인 쿼리: {base}",
                           reference="https://attack.mitre.org/techniques/T1071/004/")
             report.suspicious_network.append(f"DNS 터널링 의심: {base}")
+            _tag_entity(report.tag_map, base.lower(), "T1071.004")
 
     # Beaconing
     if pcap.beacon_candidates:
@@ -776,9 +833,15 @@ def _classify_network(
                           reference="https://attack.mitre.org/techniques/T1071/001/")
             report.suspicious_network.append(
                 f"비콘: {bc.dst_ip}:{bc.dst_port} ({bc.count}회, ~{bc.interval_avg}s 간격)")
+            _tag_entity(report.tag_map, bc.dst_ip, "T1071.001")
 
-    # Large transfer / exfiltration
-    external_ips = {c.dst_ip for c in pcap.connections if not _is_private_ip(c.dst_ip)}
+    # Large transfer / exfiltration — exclude analysis service IPs to reduce FPs
+    external_ips = {
+        c.dst_ip for c in pcap.connections
+        if not _is_private_ip(c.dst_ip)
+        and c.dst_ip not in _MULTICAST_IPS
+        and not any(_is_analysis_domain_bc(d) for d in pcap.ip_to_domain.get(c.dst_ip, []))
+    }
     large_transfers = [c for c in pcap.connections
                        if not _is_private_ip(c.dst_ip) and c.bytes_out > 100_000]
     if external_ips:
@@ -786,6 +849,8 @@ def _classify_network(
                       "Exfiltration Over C2 Channel", "Exfiltration",
                       evidence=", ".join(sorted(external_ips)),
                       reference="https://attack.mitre.org/techniques/T1041/")
+        for _ip in external_ips:
+            _tag_entity(report.tag_map, _ip, "T1041")
     for c in large_transfers:
         report.suspicious_network.append(
             f"대용량 전송: {c.dst_ip}:{c.dst_port} {c.bytes_out:,} bytes")
@@ -794,6 +859,16 @@ def _classify_network(
 # ---------------------------------------------------------------------------
 # Shared helper
 # ---------------------------------------------------------------------------
+
+def _tag_entity(tag_map: dict[str, list[str]], key: str, technique_id: str) -> None:
+    """Register key → technique_id mapping for per-tab inline annotation in HTML report."""
+    key = (key or "").strip().lower()
+    if not key:
+        return
+    lst = tag_map.setdefault(key, [])
+    if technique_id not in lst:
+        lst.append(technique_id)
+
 
 def _add_evidence(
     technique_map: dict[str, MitreTechnique],
