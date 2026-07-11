@@ -30,16 +30,35 @@ from typing import Optional
 # ── FakeNet-NG 설치 경로 탐색 ────────────────────────────────────────────
 
 _FAKENET_CANDIDATES: list[Path] = [
+    # FLARE VM (Chocolatey) 기본 경로
+    Path(r"C:\tools\fakenet-ng\fakenet.exe"),
+    Path(r"C:\tools\FakeNet-NG\fakenet.exe"),
+    Path(r"C:\tools\FakeNet\fakenet.exe"),
+    # FLARE VM 레거시 경로
+    Path(r"C:\flare-vm\fakenet-ng\fakenet.exe"),
+    # 수동 설치
     Path(r"C:\Tools\FakeNet-NG\fakenet.exe"),
     Path(r"C:\Tools\fakenet-ng\fakenet.exe"),
     Path(r"C:\Tools\FakeNet\fakenet.exe"),
     Path(r"C:\Program Files\FakeNet-NG\fakenet.exe"),
-    Path(r"C:\flare-vm\fakenet-ng\fakenet.exe"),
+    # Chocolatey shim 경로
+    Path(r"C:\ProgramData\chocolatey\bin\fakenet.exe"),
+    Path(r"C:\ProgramData\chocolatey\lib\fakenet-ng\tools\fakenet.exe"),
 ]
 
 _FAKENET_CONFIG_CANDIDATES: list[Path] = [
+    Path(r"C:\tools\fakenet-ng\configs\default.ini"),
+    Path(r"C:\tools\FakeNet-NG\configs\default.ini"),
     Path(r"C:\Tools\FakeNet-NG\configs\default.ini"),
     Path(r"C:\Tools\fakenet-ng\configs\default.ini"),
+]
+
+# FakeNet-NG 로그 탐색 추가 경로 (출력 디렉터리 외)
+_FAKENET_LOG_SEARCH_DIRS: list[Path] = [
+    Path(r"C:\tools\fakenet-ng"),
+    Path(r"C:\tools\FakeNet-NG"),
+    Path(r"C:\Tools\FakeNet-NG"),
+    Path(r"C:\flare-vm\fakenet-ng"),
 ]
 
 
@@ -114,7 +133,10 @@ class FakeNetResult:
 
 _RE_TIMESTAMP = re.compile(r"^\[[\d\-: .]+\]\s*")
 _RE_TAG       = re.compile(r"\[\s*(\w+)\s*\]")
+# DNS: "Resolving: malware.c2.com -> 127.0.0.1" 또는 "Resolved malware.c2.com to 127.0.0.1"
 _RE_DNS       = re.compile(r"Resolv(?:ing|ed)[:\s]+(\S+)\s*(?:->|to)\s*(\S+)", re.IGNORECASE)
+# DNS 포맷 2: "[DNS] Query: malware.c2.com"
+_RE_DNS2      = re.compile(r"Query[:\s]+(\S+)", re.IGNORECASE)
 _RE_HTTP_CONN = re.compile(
     r"(\d+\.\d+\.\d+\.\d+):(\d+)\s*->\s*"
     r"(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT)\s+(\S+)\s+HTTP",
@@ -122,6 +144,7 @@ _RE_HTTP_CONN = re.compile(
 )
 _RE_HOST_HDR  = re.compile(r"Host:\s*(\S+)", re.IGNORECASE)
 _RE_UA_HDR    = re.compile(r"User-Agent:\s*(.+)", re.IGNORECASE)
+_RE_CT_HDR    = re.compile(r"Content-Type:\s*([^\r\n]+)", re.IGNORECASE)
 _RE_TCP_CONN  = re.compile(r"(\d+\.\d+\.\d+\.\d+):(\d+)\s*->\s*\S+:(\d+)")
 
 
@@ -157,6 +180,14 @@ def parse_fakenet_log(log_path: Path) -> FakeNetResult:
                     queried_domain=domain,
                     resolved_to=resolved,
                 ))
+            else:
+                m2 = _RE_DNS2.search(body)
+                if m2:
+                    domain = m2.group(1).rstrip(".")
+                    result.dns_queries.append(FakeNetDnsEntry(
+                        queried_domain=domain,
+                        resolved_to="127.0.0.1",
+                    ))
 
         # ── HTTP / HTTPS ──────────────────────────────────────────────
         elif tag in ("HTTP", "HTTPS"):
@@ -174,13 +205,15 @@ def parse_fakenet_log(log_path: Path) -> FakeNetResult:
                     path=m.group(4),
                 )
             elif current_http:
-                # 헤더 라인
                 h = _RE_HOST_HDR.search(body)
                 if h:
                     current_http.host = h.group(1)
                 ua = _RE_UA_HDR.search(body)
                 if ua:
                     current_http.user_agent = ua.group(1).strip()
+                ct = _RE_CT_HDR.search(body)
+                if ct:
+                    current_http.content_type = ct.group(1).strip()[:120]
 
         # ── TCP (바이너리 세션) ───────────────────────────────────────
         elif tag == "TCP":
@@ -276,9 +309,15 @@ class FakeNetIntegrator:
         if self._log_path and self._log_path.exists():
             result = parse_fakenet_log(self._log_path)
         else:
-            # FakeNet-NG가 output_dir에 생성한 로그 파일 자동 탐색
-            logs = sorted(self.output_dir.glob("fakenet*.log"), key=lambda p: p.stat().st_mtime)
-            result = parse_fakenet_log(logs[-1]) if logs else FakeNetResult()
+            # output_dir 우선, 없으면 FakeNet-NG 설치 디렉터리도 탐색
+            log_candidates: list[Path] = list(self.output_dir.glob("fakenet*.log"))
+            if not log_candidates and self.fakenet_path:
+                for search_dir in [self.fakenet_path.parent, *_FAKENET_LOG_SEARCH_DIRS]:
+                    if search_dir.is_dir():
+                        log_candidates.extend(search_dir.glob("fakenet*.log"))
+                        log_candidates.extend(search_dir.glob("*.log"))
+            log_candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+            result = parse_fakenet_log(log_candidates[-1]) if log_candidates else FakeNetResult()
 
         result.pcap_path  = pcap_path
         result.elapsed_sec = elapsed

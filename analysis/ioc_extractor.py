@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 from parsers.procmon_csv import ProcMonEvent, EventCategory
 from parsers.pcap_parser import PcapResult
+# 레지스트리 지속성/보안 키 판정 — 레지스트리 탭·behavior_classifier 와 동일 기준
+from analysis.registry_relevance import is_persistence_key
 
 # RenameFile Detail 필드에서 목적지 경로 추출
 # ProcMon Detail 예시: "FileName: C:\Users\victim\evil.exe, Replace If Exists: True"
@@ -163,13 +165,7 @@ _ANALYSIS_TOOL_PATH_FRAGMENTS: tuple[str, ...] = (
     "pe-sieve",
 )
 
-# Registry path fragments that indicate persistence / injection
-_INTERESTING_REG_FRAGMENTS: tuple[str, ...] = (
-    "run",
-    "services",
-    "winlogon",
-    "appinit",
-)
+# 레지스트리 지속성/보안 키 판정은 analysis/registry_relevance.py 단일 소스 사용.
 
 # ─ 드롭 파일 감지 기준 ─────────────────────────────────────────────────
 # WriteFile  : 실제 데이터 기록 (result==SUCCESS 만 계산)
@@ -372,19 +368,29 @@ def extract_iocs(
 
     # ------------------------------------------------------------------
     # Registry keys (persistence-related)
+    # 소스 이원화 — winreg 스냅샷 diff 는 감시 범위가 제한적이므로
+    # ProcMon RegSetValue/RegCreateKey(전수 관찰)도 함께 수집해
+    # 레지스트리 탭·behavior_classifier 와 동일한 커버리지를 보장한다.
     # ------------------------------------------------------------------
     try:
-        added_entries = reg_diff.get("added", [])
-        for entry in added_entries:
-            try:
-                if isinstance(entry, dict):
-                    path = entry.get("path", "")
-                else:
-                    path = str(entry)
+        _REG_SET_OPS = {"RegSetValue", "RegCreateKey"}
 
-                lower = path.lower()
-                if any(frag in lower for frag in _INTERESTING_REG_FRAGMENTS):
+        # (1) winreg 스냅샷 diff
+        for entry in reg_diff.get("added", []):
+            try:
+                path = entry.get("path", "") if isinstance(entry, dict) else str(entry)
+                if is_persistence_key(path):
                     report.registry_keys.append(path)
+            except Exception:
+                continue
+
+        # (2) ProcMon 레지스트리 이벤트 (winreg 감시 범위 밖 지속성 키 보완)
+        #     filtered_events + injection_events(인젝션 대상 프로세스) 모두 포함
+        for ev in list(events) + list(injection_events or []):
+            try:
+                if ev.category == EventCategory.REGISTRY and ev.operation in _REG_SET_OPS:
+                    if is_persistence_key(ev.path or ""):
+                        report.registry_keys.append(ev.path)
             except Exception:
                 continue
 

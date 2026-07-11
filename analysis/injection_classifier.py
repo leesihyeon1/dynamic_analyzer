@@ -43,7 +43,8 @@ def _classify_module(mod: InjectedModule) -> tuple[str, str, str, str]:
 
     Returns (technique_id, technique_name, tactic, reference)
     """
-    if mod.is_shellcode or mod.implanted_count > 0 and not mod.dump_file.lower().endswith(".exe"):
+    if mod.is_shellcode or (mod.implanted_count > 0
+                            and not mod.dump_file.lower().endswith(".exe")):
         # 비-PE RX 메모리 → 쉘코드 인젝션
         return (
             "T1055",
@@ -52,14 +53,8 @@ def _classify_module(mod: InjectedModule) -> tuple[str, str, str, str]:
             "https://attack.mitre.org/techniques/T1055/",
         )
 
-    if mod.replaced > 0 if hasattr(mod, "replaced") else False:
-        # 모듈 교체 → Process Hollowing 가능성
-        return (
-            "T1055.012",
-            "Process Hollowing",
-            "Defense Evasion",
-            "https://attack.mitre.org/techniques/T1055/012/",
-        )
+    # 모듈 교체(Process Hollowing)는 모듈 단위가 아닌 프로세스 단위 필드
+    # (PeSieveResult.replaced)로만 판별 가능 — classify_injections()에서 처리.
 
     if mod.patches_count > 0:
         # IAT / inline hook
@@ -70,7 +65,7 @@ def _classify_module(mod: InjectedModule) -> tuple[str, str, str, str]:
             "https://attack.mitre.org/techniques/T1055/",
         )
 
-    if mod.implanted_pe > 0 if hasattr(mod, "implanted_pe") else mod.implanted_count > 0:
+    if mod.implanted_count > 0:
         # PE 삽입
         return (
             "T1055.002",
@@ -131,6 +126,17 @@ def classify_injections(
         results_to_process.extend(hh_result.suspicious_processes)
 
     for res in results_to_process:
+        # 모듈 교체 카운트 → Process Hollowing (프로세스 단위 판별)
+        if res.replaced > 0:
+            _add_evidence(
+                technique_map,
+                "T1055.012",
+                "Process Hollowing",
+                "Defense Evasion",
+                evidence=f"PID {res.pid}: replaced module {res.replaced}개",
+                reference="https://attack.mitre.org/techniques/T1055/012/",
+            )
+
         if not res.modules:
             continue
 

@@ -144,34 +144,8 @@ _MINING_POOL_DOMAINS = frozenset({
 
 # Windows 10/11에서 hollows-hunter가 UWP / .NET JIT 때문에 오탐하는 시스템 프로세스.
 # 이 프로세스 이름(소문자)이 suspicious > 0 이더라도 FP 처리한다.
-_HH_SYSTEM_FP_NAMES: frozenset[str] = frozenset({
-    "dwm.exe",                      # Desktop Window Manager (UWP/DWM shellcode stubs)
-    "explorer.exe",                 # Windows Explorer (.NET JIT trampolines)
-    "searchapp.exe",                # Windows Search (UWP)
-    "searchui.exe",                 # Windows Search (older builds)
-    "lockapp.exe",                  # Lock Screen (UWP)
-    "shellexperiencehost.exe",      # Start Menu shell (UWP)
-    "startmenuexperiencehost.exe",  # Start Menu (Windows 11)
-    "runtimebroker.exe",            # UWP broker
-    "applicationframehost.exe",     # UWP app frame
-    "textinputhost.exe",            # Touch keyboard
-    "systemsettings.exe",           # Settings app (UWP)
-    "smartscreen.exe",              # SmartScreen filter
-    "wuauclt.exe",                  # Windows Update client
-    "sihost.exe",                   # Shell Infrastructure Host
-    "taskhostw.exe",                # Task Host Window
-    "ctfmon.exe",                   # CTF monitor (IME)
-    # 분석 도구 — FP가 아니라 원래부터 의심 대상이 아님
-    "picpick.exe",
-    "processhacker.exe",
-    "systeminformer.exe",
-    "procmon.exe",
-    "procmon64.exe",
-    "hollows_hunter.exe",
-    "hollows_hunter64.exe",
-    "pe_sieve.exe",
-    "pe_sieve64.exe",
-})
+# 정의는 analysis/fp_allowlist.py 단일 소스 참조.
+from analysis.fp_allowlist import HH_SYSTEM_FP_NAMES as _HH_SYSTEM_FP_NAMES
 
 _DOMAIN_THREAT_LABELS: dict = {
     "pool.hashvault.pro":          "★Monero 채굴 풀 (XMRig)★",
@@ -326,6 +300,7 @@ def merge_ai_mitre(behavior_report, ai_techniques: list) -> None:
         return
     try:
         from analysis.behavior_classifier import MitreTechnique, _tactic_key
+        from analysis.attack_lookup import lookup_technique, normalize_tactic
     except ImportError:
         return
 
@@ -333,12 +308,21 @@ def merge_ai_mitre(behavior_report, ai_techniques: list) -> None:
     added = False
 
     for item in ai_techniques:
-        tid    = item.get("id", "")
-        tname  = item.get("name", "")
-        tactic = item.get("tactic", "")
-        tevid  = item.get("evidence", "")
-        if not tid or not tname or not tactic:
+        tid = (item.get("id", "") or "").strip()
+        # AI 환각 방지: 유효한 T-code 형식만 수용
+        if not tid or not tid.startswith("T"):
             continue
+
+        tevid = item.get("evidence", "")
+
+        # ── 정규화: AI 자유형 이름·전술 대신 정식 값을 우선 사용 ──────────
+        # 로컬 lookup 테이블에 있으면 그 이름·전술로 덮어써 표시 일관성 확보.
+        # 없으면 AI 값을 쓰되 전술 문자열(한국어·C2 등)을 표준 전술로 정규화.
+        canon_name, canon_tactic = lookup_technique(tid)
+        tname  = canon_name or (item.get("name", "") or "").strip() or tid
+        tactic = canon_tactic or normalize_tactic((item.get("tactic", "") or "").strip())
+        if not tactic:
+            tactic = "Unknown"
 
         ai_ev = f"[AI] {tevid}" if tevid else "[AI]"
 

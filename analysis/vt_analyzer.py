@@ -18,7 +18,7 @@ import urllib.request
 from typing import Any
 
 from analysis.behavior_classifier import MitreTechnique
-from analysis.attack_lookup import lookup_technique
+from analysis.attack_lookup import lookup_technique, normalize_tactic
 
 _VT_API_BASE = "https://www.virustotal.com/api/v3"
 
@@ -114,11 +114,14 @@ def _add_tech(
             if tag_tactic and not tactic:
                 tactic = tag_tactic
 
+    # tag 기반 전술(_tags_to_tactic)은 비표준 표기일 수 있으므로 정규화
+    tactic = normalize_tactic(tactic) or "Unknown"
+
     ref = f"https://attack.mitre.org/techniques/{tid.replace('.', '/')}/"
     technique_map[tid] = MitreTechnique(
         technique_id   = tid,
         technique_name = name or tid,
-        tactic         = tactic or "Unknown",
+        tactic         = tactic,
         evidence       = [evidence] if evidence else [],
         reference      = ref,
         sources        = ["VirusTotal"],

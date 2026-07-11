@@ -12,6 +12,7 @@ import re
 from typing import Optional
 
 from parsers.procmon_csv import ProcMonEvent, EventCategory
+from analysis.sensitive_paths import is_sensitive_read_path
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +103,16 @@ _SUSPICIOUS_WRITE_OPS: frozenset[str] = frozenset({"WriteFile", "CreateFile"})
 _DOUBLE_EXT_RE = re.compile(r"\.\w{2,4}\.\w{2,4}$", re.IGNORECASE)
 
 # Paths considered "suspicious" for WriteFile/CreateFile detection
+# 주의: raw string 은 백슬래시로 끝날 수 없어 과거 r"...\\" 로 쓴 결과
+# 리터럴에 이중 백슬래시가 들어가 실제 경로(구분자 1개)와 매칭되지 않았음.
+# → 일반 문자열 이스케이프로 단일 백슬래시 보장.
 _SUSPICIOUS_PATH_FRAGMENTS: tuple[str, ...] = (
-    r"%temp%",
-    r"%appdata%",
-    r"\appdata\roaming\\",
-    r"\appdata\local\temp\\",
+    "%temp%",
+    "%appdata%",
+    "\\appdata\\roaming\\",
+    "\\appdata\\local\\temp\\",
+    "\\windows\\temp\\",     # 관리자 권한 악성코드 흔한 드롭 위치
+    "\\users\\public\\",     # 공용 폴더 은닉
 )
 
 
@@ -183,19 +189,29 @@ def filter_events(
                 and is_suspicious_path(ev.path)
             )
 
+            # 자격증명 저장소 / anti-VM 아티팩트 ReadFile 은 노이즈로 제거하지 않고 보존
+            # (T1555.003 자격증명 탈취, T1497.001 anti-VM 점검 — 읽기 형태의 악성 행위)
+            sensitive_read = (
+                ev.operation == "ReadFile"
+                and is_sensitive_read_path(ev.path)
+            )
+
             # wmiprvse.exe 의 Process Create 는 WMI 경유 프로세스 생성(T1047)
             # 체인을 추적하기 위해 통과시킴 — 나머지 wmiprvse 이벤트는 계속 제거
             wmi_spawn = (
                 proc_lower == "wmiprvse.exe"
                 and ev.operation == "Process Create"
             )
-            if is_noisy_proc and not write_to_suspicious and not wmi_spawn:
+            if is_noisy_proc and not write_to_suspicious and not sensitive_read and not wmi_spawn:
                 continue
 
             # --- 3. Noisy operations ----------------------------------------
             if ev.operation in NOISY_OPERATIONS:
-                # Carve out: keep WriteFile/CreateFile on suspicious paths
+                # Carve out: keep WriteFile/CreateFile on suspicious paths,
+                # and ReadFile on credential / anti-VM paths
                 if ev.operation in _SUSPICIOUS_WRITE_OPS and is_suspicious_path(ev.path):
+                    pass  # keep
+                elif sensitive_read:
                     pass  # keep
                 else:
                     continue

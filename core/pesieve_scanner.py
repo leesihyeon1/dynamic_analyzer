@@ -191,8 +191,11 @@ class PeSieveScanner:
         #   구버전: <output_dir>/<pid>_<name>.json          (루트)
         #   신버전: <output_dir>/<pid>_<name>/<pid>_<name>.json  (서브디렉터리)
         # → rglob 으로 재귀 탐색
+        # "{pid}*.json" 패턴은 PID 47이 476_*.json 에도 매치되므로
+        # "<pid>_..." 또는 정확히 "<pid>.json" 형태만 허용
         candidates = sorted(
-            self.output_dir.rglob(f"{pid}*.json"),
+            (p for p in self.output_dir.rglob("*.json")
+             if p.name.startswith(f"{pid}_") or p.stem == str(pid)),
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )

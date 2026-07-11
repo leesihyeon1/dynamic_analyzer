@@ -3,11 +3,20 @@ HTML 동적 분석 보고서 생성 (다크 테마)
 """
 from __future__ import annotations
 
+import base64 as _base64
 import hashlib
 import html as _html
 import json as _json
+import re as _re
 from datetime import datetime
 from pathlib import Path
+
+# HH/pe-sieve JIT·UWP 오탐 화이트리스트 — analysis/fp_allowlist.py 단일 소스
+from analysis.fp_allowlist import HH_SYSTEM_FP_NAMES as _HH_FP_ALLOWLIST
+# 자격증명/anti-VM ReadFile 표시 판정 — analysis/sensitive_paths.py 단일 소스
+from analysis.sensitive_paths import is_sensitive_read_path
+# 레지스트리 지속성/보안 키 관심도 판정 — analysis/registry_relevance.py 단일 소스
+from analysis.registry_relevance import registry_key_interest
 
 _CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -683,6 +692,127 @@ def _b(text: str, color: str = "gray") -> str:
 def _e(text: str) -> str:
     return _html.escape(str(text))
 
+
+# PowerShell -EncodedCommand / -enc / -e <base64> 패턴
+_PS_ENC_RE = _re.compile(
+    r'-e(?:nc(?:odedcommand)?)?\s+([A-Za-z0-9+/]{16,}={0,2})',
+    _re.IGNORECASE,
+)
+
+
+def _decode_ps_enc(cmdline: str) -> str:
+    """PowerShell -EncodedCommand base64 를 디코딩. 실패/미해당 시 빈 문자열.
+
+    PowerShell 인코딩 명령은 UTF-16LE 로 저장되므로 그 기준으로 디코딩한다.
+    """
+    m = _PS_ENC_RE.search(cmdline or "")
+    if not m:
+        return ""
+    b64 = m.group(1)
+    # base64 는 4의 배수 길이여야 함 — 패딩 보정
+    b64 += "=" * (-len(b64) % 4)
+    try:
+        raw = _base64.b64decode(b64, validate=False)
+    except Exception:
+        return ""
+    # UTF-16LE 우선, 실패 시 UTF-8 폴백
+    for enc in ("utf-16-le", "utf-8"):
+        try:
+            text = raw.decode(enc)
+            # 인쇄 가능 문자 비율이 낮으면 잘못된 디코딩으로 간주
+            if text and sum(c.isprintable() or c in "\r\n\t" for c in text) / len(text) > 0.8:
+                return text.strip()
+        except Exception:
+            continue
+    return ""
+
+
+def _cmdline_html(cmdline, limit: int = 160) -> str:
+    """명령줄을 안전하게 렌더링한다 (프로세스 탭 트리·테이블 공통).
+
+    - 전체 명령줄은 title 툴팁으로 보존 (잘려도 hover 로 전량 확인)
+    - 잘리면 '[전체 N자]' 표시로 손실을 명시
+    - PowerShell -EncodedCommand 는 디코딩 결과를 별도 줄로 노출 (IOC 손실 방지)
+    """
+    if isinstance(cmdline, (list, tuple)):
+        full = " ".join(cmdline)
+    else:
+        full = cmdline or ""
+    if not full:
+        return ""
+
+    shown  = full[:limit]
+    trunc  = len(full) > limit
+    body   = _e(shown) + ("…" if trunc else "")
+    note   = (f"<span style='color:#6e7681;font-size:.68rem'> [전체 {len(full):,}자]</span>"
+              if trunc else "")
+    html   = f"<span title='{_e(full)}'>{body}</span>{note}"
+
+    decoded = _decode_ps_enc(full)
+    if decoded:
+        d_shown = decoded[:400]
+        d_note  = "…" if len(decoded) > 400 else ""
+        html += (
+            f"<div style='margin-top:2px;color:#ff7b72;font-size:.68rem;white-space:pre-wrap' "
+            f"title='{_e(decoded)}'>🔓 -enc 디코딩: {_e(d_shown)}{d_note}</div>"
+        )
+    return html
+
+
+def _suspicious_pid_set(result) -> set:
+    """pe-sieve / hollows-hunter 가 인젝션 의심으로 판정한 PID 집합."""
+    susp: set[int] = set()
+    for r in (getattr(result, "pe_sieve_results", None) or []):
+        if not getattr(r, "error", False) and getattr(r, "suspicious", 0) > 0:
+            susp.add(r.pid)
+    hh = getattr(result, "hh_result", None)
+    if hh and not getattr(hh, "error", None):
+        for pr in getattr(hh, "process_results", []):
+            if getattr(pr, "suspicious", 0) > 0:
+                susp.add(pr.pid)
+    return susp
+
+
+def _proc_sort_key(p, susp_pids: set, tag_map: dict, techs: list) -> tuple:
+    """프로세스 악성도 정렬 키. 낮을수록 위(더 위험).
+
+    0 = 인젝션 의심(pe-sieve/HH)  1 = ATT&CK 기법 매핑됨  2 = 그 외
+    동순위는 PID 오름차순.
+    """
+    if p.pid in susp_pids:
+        tier = 0
+    elif _attk_chips([p.name, getattr(p, "exe", "") or ""], tag_map, techs):
+        tier = 1
+    else:
+        tier = 2
+    return (tier, p.pid)
+
+
+def _proc_timing_html(p, start_time: float) -> str:
+    """프로세스 생성 타이밍 배지. 분석 시작 대비 상대 초로 표시.
+
+    - create_time 있음 & 분석 시작 이후: "⏱ +N.Ns" (실행 타임라인)
+    - create_time 있음 & 분석 시작 이전: "분석 전 생성" (인젝션된 기존 프로세스 등)
+    - create_time 0: 스냅샷 수집 전 종료된 단명 프로세스 (로더·인젝터 신호)
+    """
+    ct = getattr(p, "create_time", 0.0) or 0.0
+    if ct <= 0:
+        note = getattr(p, "note", "")
+        if note:
+            return (f"<span style='color:#ffa657;font-size:.68rem' "
+                    f"title='{_e(note)}'>⏱ 단명 (스냅샷 전 종료)</span>")
+        return ""
+    if start_time and ct >= start_time:
+        label = f"+{ct - start_time:.1f}s"
+    elif start_time and ct < start_time:
+        label = "분석 전 생성"
+    else:
+        try:
+            label = datetime.fromtimestamp(ct).strftime("%H:%M:%S")
+        except Exception:
+            return ""
+    return f"<span style='color:#6e7681;font-size:.68rem'>⏱ {label}</span>"
+
 def _tb(val, color: str = "gray") -> str:
     """탭 배지 (숫자 0 이나 빈 값이면 생략)"""
     if not val:
@@ -739,22 +869,33 @@ def _section_html(result) -> str:
     status_html = _ext_integration_status_html(result)
     if not techs:
         return status_html + "<p class='alert alert-success'>탐지된 MITRE 기법 없음</p>"
+    _EV_LIMIT = 5
     rows = []
     for t in techs:
-        color = _TACTIC_COLOR.get(t.tactic, "gray")
-        ref   = t.reference or f"https://attack.mitre.org/techniques/{t.technique_id.replace('.','/')}/"
+        # 미등록 ID 방어: 이름·전술이 비면 폴백 (외부/AI 소스가 빈 값을 줄 수 있음)
+        tname  = t.technique_name or t.technique_id
+        tactic = t.tactic or "Unknown"
+        color  = _TACTIC_COLOR.get(tactic, "gray")
+        ref    = t.reference or f"https://attack.mitre.org/techniques/{t.technique_id.replace('.','/')}/"
         evidence_html = "".join(
             f"<div class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(ev[:120])}</div>"
-            for ev in t.evidence[:5]
+            for ev in t.evidence[:_EV_LIMIT]
         )
+        # 근거 잘림 안내: 5건 초과 시 잔여 건수 표시 (전체는 JSON)
+        if len(t.evidence) > _EV_LIMIT:
+            evidence_html += (
+                f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>"
+                f"+{len(t.evidence) - _EV_LIMIT}건 더 — 전체는 "
+                f"<code>_dynamic_report.json</code> 참조</div>"
+            )
         # sources 필드는 구버전 JSON 호환을 위해 getattr 사용
         src_badges = _source_badges(getattr(t, "sources", []) or [])
         rows.append(
             f"<tr>"
             f"<td><a href='{_e(ref)}' target='_blank' style='color:#f97583;text-decoration:none'>"
             f"{_e(t.technique_id)}</a></td>"
-            f"<td>{_e(t.technique_name)}</td>"
-            f"<td>{_b(t.tactic, color)}</td>"
+            f"<td>{_e(tname)}</td>"
+            f"<td>{_b(tactic, color)}</td>"
             f"<td style='white-space:nowrap'>{src_badges}</td>"
             f"<td>{evidence_html}</td>"
             f"</tr>"
@@ -762,7 +903,7 @@ def _section_html(result) -> str:
     return (
         status_html
         + "<table id='tbl-mitre'>"
-        "<tr><th>ID</th><th>기법</th><th>전술</th><th>출처</th><th>근거 (최대 5건)</th></tr>"
+        "<tr><th>ID</th><th>기법</th><th>전술</th><th>출처</th><th>근거</th></tr>"
         + "".join(rows) + "</table>"
     )
 
@@ -785,7 +926,11 @@ def _file_events_html(result) -> tuple[str, int]:
     events = [
         e for e in result.filtered_events
         if e.category == EventCategory.FILE
-        and e.operation in (_FILE_OPS_CHAIN if e.pid in chain_pids else _FILE_OPS)
+        and (
+            e.operation in (_FILE_OPS_CHAIN if e.pid in chain_pids else _FILE_OPS)
+            # 필터가 보존한 자격증명/anti-VM ReadFile 은 표시부에서도 노출 (T1555/T1497)
+            or (e.operation == "ReadFile" and is_sensitive_read_path(e.path))
+        )
     ]
     total = len(events)
     if not events:
@@ -807,6 +952,7 @@ def _file_events_html(result) -> tuple[str, int]:
     op_color = {
         "WriteFile": "blue", "DeleteFile": "red",
         "RenameFile": "yellow", "SetEndOfFile": "gray", "CreateFile": "purple",
+        "ReadFile": "orange",
     }
     for item in deduped_events[:_FILE_LIMIT]:
         e     = item["event"]
@@ -947,27 +1093,66 @@ def _registry_events_html(result) -> str:
             + "".join(rows) + "</table>"
         )
 
-    # ProcMon 이벤트
+    # ProcMon 이벤트 — 지속성/보안 키(고관심) vs 나머지(저관심) 2계층 분리
     if events:
-        rows = []
-        for e in events[:_REG_EV_LIMIT]:
-            _chips_td = f"<td style='white-space:nowrap'>{_attk_chips([e.path], _tag_map, _techs)}</td>"
-            rows.append(
+        # 관심도 분류: 지속성·보안 키이거나 ATT&CK 근거(tag_map 매칭)면 고관심
+        hi: list = []   # (event, interest_label, chips_html)
+        lo: list = []
+        for e in events:
+            interest = registry_key_interest(e.path)
+            chips    = _attk_chips([e.path], _tag_map, _techs)
+            if interest or chips:
+                hi.append((e, interest, chips))
+            else:
+                lo.append(e)
+
+        def _reg_row(e, extra_td: str = "") -> str:
+            return (
                 f"<tr>"
                 f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
                 f"<td class='mono'>{_e(e.process)}</td>"
                 f"<td>{_b(e.operation,'purple')}</td>"
                 f"<td class='mono ev-registry'>{_e(e.path[:100])}</td>"
                 f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.detail[:60])}</td>"
-                f"{_chips_td}"
+                f"{extra_td}"
                 f"</tr>"
             )
-        parts.append(
-            "<h3>ProcMon 레지스트리 이벤트</h3>"
-            + _trunc_notice(len(events), _REG_EV_LIMIT)
-            + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th><th>키 경로</th><th>상세</th><th>기법</th></tr>"
-            + "".join(rows) + "</table>"
-        )
+
+        # ── 고관심: 지속성/보안 키 (기본 펼침, 사유 컬럼) ──────────────
+        if hi:
+            hi_rows = []
+            for e, interest, chips in hi[:_REG_EV_LIMIT]:
+                reason = _b(interest, "red") if interest else ""
+                extra  = f"<td style='white-space:nowrap'>{reason}{(' ' + chips) if chips else ''}</td>"
+                hi_rows.append(_reg_row(e, extra))
+            parts.append(
+                "<h3>지속성 · 보안 관련 레지스트리 변경 "
+                "<span style='font-size:.75rem;color:#6e7681'>(자동실행·서비스·인젝션·보안 무력화)</span></h3>"
+                + _trunc_notice(len(hi), _REG_EV_LIMIT)
+                + "<table id='tbl-reg-key'><tr><th>시각</th><th>프로세스</th><th>작업</th>"
+                "<th>키 경로</th><th>상세</th><th>관심 사유</th></tr>"
+                + "".join(hi_rows) + "</table>"
+            )
+
+        # ── 저관심: 나머지 (기본 접힘) ────────────────────────────────
+        if lo:
+            lo_rows = []
+            for e in lo[:_REG_EV_LIMIT]:
+                chips_td = f"<td style='white-space:nowrap'>{_attk_chips([e.path], _tag_map, _techs)}</td>"
+                lo_rows.append(_reg_row(e, chips_td))
+            lo_table = (
+                _trunc_notice(len(lo), _REG_EV_LIMIT)
+                + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th>"
+                "<th>키 경로</th><th>상세</th><th>기법</th></tr>"
+                + "".join(lo_rows) + "</table>"
+            )
+            parts.append(
+                f"<details style='margin-top:.6rem'>"
+                f"<summary style='cursor:pointer;color:#8b949e;font-size:.85rem'>"
+                f"그 외 레지스트리 이벤트 {len(lo):,}건 (지속성·보안 무관 — 펼치기)</summary>"
+                f"<div style='margin-top:.5rem'>{lo_table}</div>"
+                f"</details>"
+            )
 
     return "\n".join(parts) if parts else "<p class='alert alert-success'>레지스트리 변경 없음</p>"
 
@@ -1095,6 +1280,54 @@ def _extract_pids_from_labels(labels: list[str]) -> set[int]:
     return pids
 
 
+def _execution_verdict_banner(br) -> str:
+    """실행 진단 배너 — 네트워크 탭 최상단에 표시."""
+    if not br:
+        return ""
+    verdict  = getattr(br, "execution_verdict", "UNKNOWN")
+    details  = getattr(br, "execution_details", [])
+    if verdict == "UNKNOWN" and not details:
+        return ""
+
+    _CFG = {
+        "CONFIRMED": ("#56d364", "#0d2119", "✅ 실행 확인됨",
+                      "악성코드가 정상 실행되어 네트워크 활동이 관찰됩니다."),
+        "PARTIAL":   ("#e3b341", "#2d2a0a", "⚠️ 부분 실행",
+                      "일부 활동이 확인되었으나 C2 통신은 성공하지 못했습니다."),
+        "EVADED":    ("#ff7b72", "#2d1117", "🚫 VM/Sandbox 탐지 우회 의심",
+                      "Anti-VM 체크 탐지 후 네트워크 코드 진입 전 종료한 것으로 추정됩니다. "
+                      "FLARE VM 아티팩트를 제거하거나 다른 환경에서 재분석을 권장합니다."),
+        "FAILED":    ("#8b949e", "#21262d", "❓ 샘플 실행 실패 의심",
+                      "이벤트가 거의 없어 샘플이 제대로 실행되지 않은 것으로 추정됩니다. "
+                      "아키텍처(x86/x64) 불일치, 의존 DLL 누락, 실행 권한 문제를 확인하세요."),
+        "UNKNOWN":   ("#8b949e", "#21262d", "❓ 실행 여부 불명확",
+                      "이벤트는 있으나 네트워크 활동이 없습니다. "
+                      "긴 Sleep 후 C2 접속 또는 조건부 실행(특정 파일·레지스트리 필요) 가능성을 확인하세요."),
+    }
+    color, bg, title, desc = _CFG.get(verdict, _CFG["UNKNOWN"])
+
+    detail_html = ""
+    if details:
+        items = "".join(
+            f"<li style='color:#8b949e;font-size:.78rem;margin:.1rem 0'>{_e(d)}</li>"
+            for d in details
+        )
+        detail_html = f"<ul style='margin:.5rem 0 0 1rem;padding:0'>{items}</ul>"
+
+    return (
+        f"<div style='border:1px solid {color};border-left:4px solid {color};"
+        f"background:{bg};border-radius:6px;padding:.8rem 1rem;margin-bottom:1.2rem'>"
+        f"<div style='display:flex;align-items:center;gap:.6rem;margin-bottom:.3rem'>"
+        f"<span style='color:{color};font-weight:700;font-size:.9rem'>{title}</span>"
+        f"<span style='color:#8b949e;font-size:.76rem;font-style:italic'>"
+        f"execution_verdict = {verdict}</span>"
+        f"</div>"
+        f"<p style='color:#cdd9e5;font-size:.82rem;margin:0'>{_e(desc)}</p>"
+        f"{detail_html}"
+        f"</div>"
+    )
+
+
 def _network_html(result) -> str:
     pcap = result.pcap_result
 
@@ -1187,6 +1420,9 @@ def _network_html(result) -> str:
 
     parts = []
 
+    # ── 실행 진단 배너 ──────────────────────────────────────────────────
+    parts.append(_execution_verdict_banner(_br))
+
     # pcap 없으면 기본 안내 배너만 추가 (decrypted/fakenet은 계속 처리)
     if not pcap:
         parts.append("<p class='alert alert-info'>tshark 캡처 없음 — PCAP 기반 섹션 생략</p>")
@@ -1207,6 +1443,40 @@ def _network_html(result) -> str:
             f"<tr><td>외부 고유 IP</td><td>{s.unique_dst_ips}</td></tr>"
             f"<tr><td>고유 도메인</td><td>{s.unique_domains}</td></tr>"
             f"</table></div>"
+        )
+
+    # ── C2 연결 시도 실패 (SYN without SYN-ACK) ─────────────────────────
+    attempted = getattr(pcap, "attempted_connections", []) if pcap else []
+    if attempted:
+        rows = []
+        for ac in attempted[:200]:
+            ac_procs = (proc_lookup.get(("TCP", ac.dst_ip, ac.dst_port), [])
+                        or ip_proc_lookup.get(ac.dst_ip, []))
+            port_badge = _b("의심포트", "red") if ac.suspicious_port else ""
+            ac_domains = combined_domains.get(ac.dst_ip, [])
+            domain_str = _e(", ".join(ac_domains[:2])) if ac_domains else ""
+            rows.append(
+                f"<tr>"
+                f"<td class='mono ev-network'>{_e(ac.dst_ip)}"
+                + (f"<br><span style='color:#8b949e;font-size:.72rem'>{domain_str}</span>"
+                   if domain_str else "")
+                + f"</td>"
+                f"<td class='mono'>{ac.dst_port}</td>"
+                f"<td style='color:#8b949e'>{ac.count}회</td>"
+                f"<td>{port_badge}</td>"
+                + _proc_cell(ac_procs) +
+                f"</tr>"
+            )
+        parts.append(
+            "<h3 style='color:#ffa657'>⚠️ C2 연결 시도 실패 (SYN without SYN-ACK)</h3>"
+            "<p style='color:#8b949e;font-size:.82rem;margin-bottom:.5rem'>"
+            "TCP SYN을 전송했지만 SYN-ACK가 없음 — C2 서버 오프라인이거나 IP 차단. "
+            "상용 샌드박스에서 탐지되는 C2가 FLARE VM에서만 응답 없을 때 이 목록에 나타납니다."
+            "</p>"
+            + _trunc_notice(len(attempted), 200)
+            + "<table id='tbl-net-syn'><tr><th>목적지 IP</th><th>포트</th><th>시도</th>"
+            "<th>포트 의심</th><th>프로세스</th></tr>"
+            + "".join(rows) + "</table>"
         )
 
     # ── 비콘 탐지 ──────────────────────────────────────────────
@@ -1912,6 +2182,7 @@ def _process_tree_html(result) -> str:
     new_procs, _excl = _compute_display_procs(result)
     snapshot   = getattr(result, "proc_after_snapshot", {}) or {}
     sample_pid = getattr(result, "sample_pid", None)
+    _start_time = getattr(result, "start_time", 0.0) or 0.0
 
     if not new_procs:
         return ""
@@ -1978,13 +2249,14 @@ def _process_tree_html(result) -> str:
         # 이름·경로·커맨드라인
         name = f"PID {pid}"
         exe  = ""
-        cmd  = ""
+        cmd_html = ""
         if proc:
             name = getattr(proc, "name", "") or name
             exe  = getattr(proc, "exe",  "") or ""
             cl   = getattr(proc, "cmdline", []) or []
+            # exe 는 아래 별도 줄에 표시되므로 명령줄은 인자(argv[1:])만
             if len(cl) > 1:
-                cmd = " ".join(cl[1:])[:160]
+                cmd_html = _cmdline_html(cl[1:], 160)
 
         # 노드 스타일
         if is_suspicious:
@@ -2039,8 +2311,11 @@ def _process_tree_html(result) -> str:
         )
         if exe:
             html += f"<div class='pt-meta'>{_e(exe)}</div>"
-        if cmd:
-            html += f"<div class='pt-meta' style='color:#484f58'>▸ {_e(cmd)}</div>"
+        if cmd_html:
+            html += f"<div class='pt-meta' style='color:#484f58'>▸ {cmd_html}</div>"
+        _timing = _proc_timing_html(proc, _start_time) if proc else ""
+        if _timing:
+            html += f"<div class='pt-meta'>{_timing}</div>"
 
         if has_children:
             html += f"<div class='pt-children' id='{uid}'>"
@@ -2126,27 +2401,39 @@ def _process_html(result) -> str:
     _tag_map = getattr(_br, "tag_map", {}) if _br else {}
     _techs   = getattr(_br, "techniques", []) if _br else []
 
+    # 악성도 정렬: 인젝션 의심 → ATT&CK 기법 → 그 외
+    _susp_pids  = _suspicious_pid_set(result)
+    _start_time = getattr(result, "start_time", 0.0) or 0.0
+    new_procs = sorted(new_procs, key=lambda p: _proc_sort_key(p, _susp_pids, _tag_map, _techs))
+
     rows = []
     for p in new_procs:
-        cmdline = " ".join(p.cmdline) if p.cmdline else ""
+        cmd_html = _cmdline_html(p.cmdline, 120)
         beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors, _http_by_conn)
         badges = _activity_badges_html(behaviors.get(p.pid))
-        name_cell = (
-            f"<div class='mono ev-process'>{_e(p.name)}</div>"
-            f"<div style='margin-top:2px'>{badges}</div>"
-        ) if badges else f"<div class='mono ev-process'>{_e(p.name)}</div>"
+        timing = _proc_timing_html(p, _start_time)
+        _meta = ""
+        if badges:
+            _meta += f"<div style='margin-top:2px'>{badges}</div>"
+        if timing:
+            _meta += f"<div style='margin-top:1px'>{timing}</div>"
+        name_cell = f"<div class='mono ev-process'>{_e(p.name)}</div>{_meta}"
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
+        # 인젝션 의심 프로세스 행 배경 강조
+        row_attr = tr_behrow
+        if p.pid in _susp_pids:
+            row_attr += " style='background:rgba(248,81,73,.09)'"
         exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
                   if beh_btn else "<td style='width:26px'></td>")
         _chips = _attk_chips([p.name, p.exe or ""], _tag_map, _techs)
         _chips_td = f"<td style='white-space:nowrap'>{_chips}</td>" if _chips else "<td></td>"
         rows.append(
-            f"<tr{tr_behrow}>"
+            f"<tr{row_attr}>"
             f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
             f"<td>{name_cell}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
-            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
+            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{cmd_html}</td>"
             f"{_chips_td}"
             f"</tr>{beh_detail_row}"
         )
@@ -2378,17 +2665,7 @@ def _quick_scan_card_html(result) -> str:
         findings.append(("critical", f"메모리 인젝션·쉘코드 {len(pe_susp)}건", names))
 
     # Windows 10/11 UWP/.NET JIT 오탐 프로세스 (hollows-hunter FP)
-    _HH_SYSTEM_FP = frozenset({
-        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
-        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
-        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
-        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe", "sihost.exe",
-        "taskhostw.exe", "ctfmon.exe",
-        "picpick.exe", "processhacker.exe", "systeminformer.exe",
-        "procmon.exe", "procmon64.exe",
-        "hollows_hunter.exe", "hollows_hunter64.exe",
-        "pe_sieve.exe", "pe_sieve64.exe",
-    })
+    _HH_SYSTEM_FP = _HH_FP_ALLOWLIST
     hh_r = getattr(result, "hh_result", None)
     if hh_r and not getattr(hh_r, "error", None):
         hh_susp_raw = getattr(hh_r, "suspicious_processes", []) or []
@@ -2487,6 +2764,17 @@ def _quick_scan_card_html(result) -> str:
             names += f" 외 {len(new_procs)-4}개"
         findings.append(("info", f"신규 프로세스 {len(new_procs)}개", names))
 
+    # 실행 진단 verdict
+    br2 = result.behavior_report
+    if br2:
+        verdict2 = getattr(br2, "execution_verdict", "UNKNOWN")
+        if verdict2 == "EVADED":
+            findings.append(("high", "VM/Sandbox 탐지 우회 의심",
+                              "Anti-VM 체크 탐지 · 네트워크 활동 없음"))
+        elif verdict2 == "FAILED":
+            findings.append(("medium", "샘플 실행 실패 의심",
+                              "이벤트 극소 또는 네트워크 없음"))
+
     if not findings:
         return ""
 
@@ -2546,16 +2834,32 @@ def _all_procs_html(result, chain_pids: set) -> str:
     _tag_map2 = getattr(_br2, "tag_map", {}) if _br2 else {}
     _techs2   = getattr(_br2, "techniques", []) if _br2 else []
 
+    # 악성도 정렬 + 생성 타이밍
+    _susp_pids2  = _suspicious_pid_set(result)
+    _start_time2 = getattr(result, "start_time", 0.0) or 0.0
+    table_procs = sorted(
+        table_procs, key=lambda p: _proc_sort_key(p, _susp_pids2, _tag_map2, _techs2)
+    )
+
     rows = []
     for p in table_procs:
-        cmdline = " ".join(p.cmdline) if p.cmdline else ""
+        cmd_html = _cmdline_html(p.cmdline, 120)
         beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors, _http_by_conn2)
         badges = _activity_badges_html(behaviors.get(p.pid))
-        name_cell = (
-            f"<div class='mono ev-process'>{_e(p.name)}</div>"
-            f"<div style='margin-top:2px'>{badges}</div>"
-        ) if badges else f"<div class='mono ev-process'>{_e(p.name)}</div>"
-        style = "" if p.pid in chain_pids else " style='opacity:.45'"
+        timing = _proc_timing_html(p, _start_time2)
+        _meta = ""
+        if badges:
+            _meta += f"<div style='margin-top:2px'>{badges}</div>"
+        if timing:
+            _meta += f"<div style='margin-top:1px'>{timing}</div>"
+        name_cell = f"<div class='mono ev-process'>{_e(p.name)}</div>{_meta}"
+        # 의심 행 배경 강조, 체인 외부는 흐리게 (의심이 우선)
+        if p.pid in _susp_pids2:
+            style = " style='background:rgba(248,81,73,.09)'"
+        elif p.pid not in chain_pids:
+            style = " style='opacity:.45'"
+        else:
+            style = ""
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
         exp_td = (f"<td style='width:26px;padding:.2rem .1rem;text-align:center'>{beh_btn}</td>"
                   if beh_btn else "<td style='width:26px'></td>")
@@ -2567,7 +2871,7 @@ def _all_procs_html(result, chain_pids: set) -> str:
             f"<td class='mono'>{p.pid}</td>"
             f"<td>{name_cell}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
-            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(cmdline[:120])}</td>"
+            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{cmd_html}</td>"
             f"{_chips2_td}"
             f"</tr>{beh_detail_row}"
         )
@@ -2660,18 +2964,7 @@ def _shellcode_html(result) -> str:
 
     # Windows 10/11에서 UWP / .NET JIT 때문에 HH가 오탐하는 시스템 프로세스.
     # PE인젝션·코드교체가 없을 때만 노이즈로 처리 (_mem_is_noise 참조).
-    _MEM_WL = frozenset({
-        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
-        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
-        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
-        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe", "sihost.exe",
-        "taskhostw.exe", "ctfmon.exe",
-        # 분석 도구
-        "picpick.exe", "processhacker.exe", "systeminformer.exe",
-        "procmon.exe", "procmon64.exe",
-        "hollows_hunter.exe", "hollows_hunter64.exe",
-        "pe_sieve.exe", "pe_sieve64.exe",
-    })
+    _MEM_WL = _HH_FP_ALLOWLIST
 
     if hh_r is None and not pe_list:
         return (
@@ -2838,7 +3131,46 @@ def _shellcode_html(result) -> str:
     return "\n".join(parts)
 
 
-def _ioc_html(result) -> str:
+def _ioc_plaintext(ioc, sample_sha256: str = "") -> dict:
+    """IOC 를 카테고리별 순수 텍스트로 반환 (클립보드 복사용).
+
+    key: hash/ip/domain/url/file/reg 및 종합 'all'. 빈 카테고리는 생략.
+    """
+    cats: dict[str, str] = {}
+    if sample_sha256:
+        cats["hash"] = sample_sha256
+    if getattr(ioc, "ip_addresses", None):
+        cats["ip"] = "\n".join(ioc.ip_addresses)
+    if getattr(ioc, "domains", None):
+        cats["domain"] = "\n".join(ioc.domains)
+    if getattr(ioc, "urls", None):
+        cats["url"] = "\n".join(ioc.urls)
+    if getattr(ioc, "dropped_files", None):
+        cats["file"] = "\n".join(ioc.dropped_files)
+    if getattr(ioc, "registry_keys", None):
+        cats["reg"] = "\n".join(ioc.registry_keys)
+
+    _HDR = {
+        "hash": "[Sample SHA256]", "ip": "[IPs]", "domain": "[Domains]",
+        "url": "[URLs]", "file": "[Dropped Files]", "reg": "[Registry Keys]",
+    }
+    blocks = [f"{_HDR[k]}\n{cats[k]}" for k in ("hash", "ip", "domain", "url", "file", "reg")
+              if k in cats]
+    cats["all"] = "\n\n".join(blocks)
+    return cats
+
+
+def _ioc_copy_btn(key: str) -> str:
+    """카테고리별 IOC 복사 버튼 (해당 섹션 제목 옆)."""
+    return (
+        "<button onclick=\"copyIOC('" + key + "',this)\" "
+        "style='margin-left:.5rem;background:#21262d;border:1px solid #30363d;"
+        "color:#8b949e;border-radius:4px;padding:.1rem .5rem;font-size:.68rem;"
+        "cursor:pointer;font-weight:400;vertical-align:middle'>📋 복사</button>"
+    )
+
+
+def _ioc_html(result, sample_sha256: str = "") -> str:
     ioc  = result.ioc_report
     pcap = result.pcap_result
     if not ioc:
@@ -2846,6 +3178,34 @@ def _ioc_html(result) -> str:
     parts = []
 
     _IOC_LIMIT = 1000
+
+    # ── IOC 복사 UI (전체 + 카테고리별) ──────────────────────────
+    _ioc_texts = _ioc_plaintext(ioc, sample_sha256)
+    if _ioc_texts.get("all"):
+        _texts_js = _json.dumps(_ioc_texts, ensure_ascii=False).replace("</", "<\\/")
+        _copy_js = (
+            "<script>var IOC_TEXTS=" + _texts_js + ";"
+            "function copyIOC(k,b){var t=(IOC_TEXTS||{})[k]||'';if(!t)return;"
+            "var o=b.textContent;function d(){b.textContent='✓ 복사됨';"
+            "setTimeout(function(){b.textContent=o;},1500);}"
+            "if(navigator.clipboard&&navigator.clipboard.writeText){"
+            "navigator.clipboard.writeText(t).then(d,f);}else{f();}"
+            "function f(){var a=document.createElement('textarea');a.value=t;"
+            "a.style.position='fixed';a.style.left='-9999px';document.body.appendChild(a);"
+            "a.focus();a.select();try{document.execCommand('copy');d();}catch(e){}"
+            "document.body.removeChild(a);}}</script>"
+        )
+        parts.append(
+            "<div style='margin-bottom:.8rem;display:flex;align-items:center;"
+            "gap:.6rem;flex-wrap:wrap'>"
+            "<button onclick=\"copyIOC('all',this)\" style='background:#1f6feb;border:none;"
+            "color:#fff;border-radius:5px;padding:.35rem .9rem;font-size:.8rem;"
+            "cursor:pointer;font-weight:600'>\U0001F4CB 전체 IOC 복사</button>"
+            "<span style='color:#6e7681;font-size:.74rem'>"
+            "IP·도메인·URL·드롭파일·"
+            "레지스트리를 텍스트로 클립보드에 복사</span>"
+            "</div>" + _copy_js
+        )
 
     # ── IP→도메인 종합 매핑 (DNS 응답 + TLS SNI) ──────────────────
     combined_dom: dict[str, list[str]] = {}
@@ -2926,7 +3286,7 @@ def _ioc_html(result) -> str:
             )
         geo_ips_js = _json.dumps(pub_ips[:100])
         parts.append(
-            "<h3>외부 IP</h3>"
+            "<h3>외부 IP" + _ioc_copy_btn("ip") + "</h3>"
             + _trunc_notice(len(ioc.ip_addresses), _IOC_LIMIT)
             + "<table id='tbl-ioc-ip'>"
             + "<tr><th>IP 주소</th><th>연관 도메인</th><th>포트</th><th>국가 / 기관</th><th>프로세스</th></tr>"
@@ -3040,7 +3400,7 @@ def _ioc_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3>도메인</h3>"
+            "<h3>도메인" + _ioc_copy_btn("domain") + "</h3>"
             + _trunc_notice(len(ioc.domains), _IOC_LIMIT)
             + "<table id='tbl-ioc-domain'>"
             + "<tr><th>도메인</th><th>프로세스</th></tr>"
@@ -3059,14 +3419,15 @@ def _ioc_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3>드롭된 파일</h3>"
+            "<h3>드롭된 파일" + _ioc_copy_btn("file") + "</h3>"
             + _trunc_notice(len(ioc.dropped_files), _IOC_LIMIT)
             + "<table id='tbl-ioc-file'>"
             + "<tr><th>파일 경로</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )
 
-    parts.append(_list_table("레지스트리 키", ioc.registry_keys, "키 경로", "tbl-ioc-reg"))
+    parts.append(_list_table("레지스트리 키" + (_ioc_copy_btn("reg") if ioc.registry_keys else ""),
+                              ioc.registry_keys, "키 경로", "tbl-ioc-reg"))
 
     # ── URL (프로세스 매핑 포함) ───────────────────────────────────
     if ioc.urls:
@@ -3080,7 +3441,7 @@ def _ioc_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3>URL</h3>"
+            "<h3>URL" + _ioc_copy_btn("url") + "</h3>"
             + _trunc_notice(len(ioc.urls), _IOC_LIMIT)
             + "<table id='tbl-ioc-url'>"
             + "<tr><th>URL</th><th>프로세스</th></tr>"
@@ -3215,17 +3576,7 @@ def generate_html_report(result, output_path: str) -> None:
 
     # 의심 프로세스 수 집계 (pe-sieve / hollows-hunter 결과 기준)
     # Windows 10/11 UWP/.NET JIT 오탐: PE인젝션·코드교체 없으면 FP로 제외
-    _SHC_FP_NAMES = frozenset({
-        "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
-        "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
-        "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
-        "systemsettings.exe", "smartscreen.exe", "wuauclt.exe", "sihost.exe",
-        "taskhostw.exe", "ctfmon.exe",
-        "picpick.exe", "processhacker.exe", "systeminformer.exe",
-        "procmon.exe", "procmon64.exe",
-        "hollows_hunter.exe", "hollows_hunter64.exe",
-        "pe_sieve.exe", "pe_sieve64.exe",
-    })
+    _SHC_FP_NAMES = _HH_FP_ALLOWLIST
     shc_total       = 0
     shc_fp_excluded = 0
 
@@ -3506,7 +3857,7 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-ioc" class="tab-panel">
 
   <h2>💀 IOC 목록</h2>
-  {_ioc_html(result)}
+  {_ioc_html(result, sample_sha256)}
 
 </div>
 
@@ -3632,6 +3983,27 @@ def _volatility_html(result) -> str:
             sc_color = next((v for k, v in _SHC_COLORS.items() if k in sc_type), "#8b949e")
             sc_cell = (f"<span style='font-size:.75rem;color:{sc_color}'>{_e(sc_type)}</span>"
                        if sc_type else "")
+            disasm_raw  = e.get("disasm", "")
+            hexdump_raw = e.get("hexdump", "")
+            disasm_lines = disasm_raw.splitlines()
+            disasm_first = _e(disasm_lines[0]) if disasm_lines else ""
+            disasm_rest  = _e("\n".join(disasm_lines[1:])) if len(disasm_lines) > 1 else ""
+            disasm_cell  = (
+                f"<details style='max-width:480px'>"
+                f"<summary class='mono' style='font-size:.75rem;cursor:pointer;color:#c9d1d9;list-style:none'>"
+                f"&#9658; {disasm_first}</summary>"
+                f"<pre style='font-size:.72rem;margin:.35rem 0 0;padding:.4rem .5rem;"
+                f"background:#0d1117;border-radius:4px;color:#c9d1d9;"
+                f"white-space:pre;overflow-x:auto;max-height:320px;overflow-y:auto'>"
+                f"{disasm_rest}</pre>"
+                + (f"<pre style='font-size:.70rem;margin:.25rem 0 0;padding:.35rem .5rem;"
+                   f"background:#0d1117;border-radius:4px;color:#484f58;"
+                   f"white-space:pre;overflow-x:auto'>hexdump:\n{_e(hexdump_raw)}</pre>"
+                   if hexdump_raw else "")
+                + f"</details>"
+                if disasm_rest else
+                f"<span class='mono' style='font-size:.75rem;color:#c9d1d9'>{disasm_first}</span>"
+            )
             rows += (
                 f"<tr>"
                 f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
@@ -3639,8 +4011,7 @@ def _volatility_html(result) -> str:
                 f"<td class='mono' style='font-size:.78rem'>{_e(e.get('start_vpn',''))}</td>"
                 f"<td>{prot_cell}</td>"
                 f"<td>{sc_cell}</td>"
-                f"<td class='mono' style='font-size:.75rem;max-width:240px;overflow:hidden;white-space:nowrap'>"
-                f"{_e(e.get('disasm','')[:80])}</td>"
+                f"<td style='font-size:.75rem'>{disasm_cell}</td>"
                 f"</tr>"
             )
         note = (f"<p style='color:#484f58;font-size:.78rem'>(전체 {len(malfind)}건 중 50건 표시)</p>"

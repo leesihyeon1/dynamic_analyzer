@@ -784,8 +784,8 @@ class VolatilityRunner:
             pid = self._col_int(data, row, "PID") or self._col_int(data, row, "Pid")
             if pid_filter and pid not in pid_filter:
                 continue
-            hexdump = self._col(data, row, "Hexdump")[:64]
-            disasm  = self._col(data, row, "Disasm")[:256]
+            hexdump = self._col(data, row, "Hexdump")[:512]
+            disasm  = self._col(data, row, "Disasm")[:4096]
             results.append(MalfindEntry(
                 pid=pid,
                 process=self._col(data, row, "Process") or self._col(data, row, "ImageFileName"),
@@ -980,6 +980,7 @@ class VolatilityRunner:
                 r = subprocess.run(
                     cmd, capture_output=True, timeout=self.timeout,
                     text=True, errors="replace",
+                    cwd=str(output_dir),
                 )
                 if r.returncode not in (0, 1, 2):
                     _log(f"      procdump PID {pid}: exit={r.returncode} — {(r.stderr or '')[-200:].strip()}")
@@ -1242,7 +1243,9 @@ def run_memory_forensics(
     #       악성코드가 이들에 인젝션했을 수 있으므로 malfind 탐지 시 덤프 필요
     _PROCDUMP_FP: frozenset[str] = frozenset({
         "hollows_hunter.exe", "hollows_hunter64.exe",
+        "hollows-hunter.exe", "hollows-hunter64.exe",
         "pe_sieve.exe", "pe_sieve64.exe",
+        "pe-sieve.exe", "pe-sieve64.exe",
         "picpick.exe", "procmon.exe", "procmon64.exe",
         "processhacker.exe", "systeminformer.exe",
     })

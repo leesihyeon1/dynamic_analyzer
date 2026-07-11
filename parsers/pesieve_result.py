@@ -71,7 +71,7 @@ class PeSieveResult:
 
     @property
     def has_findings(self) -> bool:
-        return self.suspicious > 0 or bool(self.error) is False and self.suspicious > 0
+        return self.suspicious > 0 and not self.error
 
 
 @dataclass

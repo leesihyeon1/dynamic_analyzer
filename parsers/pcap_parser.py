@@ -268,6 +268,15 @@ class FtpSession:
 
 
 @dataclass
+class AttemptedConnection:
+    """TCP SYN 전송 후 SYN-ACK 없음 — C2가 응답하지 않는 연결 시도."""
+    dst_ip:          str
+    dst_port:        int
+    count:           int  = 1
+    suspicious_port: bool = False
+
+
+@dataclass
 class BeaconCandidate:
     """주기적 C2 연결 패턴 후보"""
     dst_ip:        str
@@ -290,17 +299,18 @@ class PcapSummary:
 
 @dataclass
 class PcapResult:
-    connections:        list[NetworkConnection] = field(default_factory=list)
-    dns_queries:        list[DNSQuery]          = field(default_factory=list)
-    raw_dns_queries:    list[DnsRawQuery]       = field(default_factory=list)
-    http_requests:      list[HTTPRequest]       = field(default_factory=list)
-    tls_info:           list[TLSInfo]           = field(default_factory=list)
-    beacon_candidates:  list[BeaconCandidate]   = field(default_factory=list)
-    smtp_sessions:      list[SmtpSession]       = field(default_factory=list)
-    ftp_sessions:       list[FtpSession]        = field(default_factory=list)
-    suspicious_domains: list[str]               = field(default_factory=list)
-    dns_tunnel_suspects:list[str]               = field(default_factory=list)
-    summary:            PcapSummary             = field(default_factory=PcapSummary)
+    connections:          list[NetworkConnection]  = field(default_factory=list)
+    dns_queries:          list[DNSQuery]           = field(default_factory=list)
+    raw_dns_queries:      list[DnsRawQuery]        = field(default_factory=list)
+    http_requests:        list[HTTPRequest]        = field(default_factory=list)
+    tls_info:             list[TLSInfo]            = field(default_factory=list)
+    beacon_candidates:    list[BeaconCandidate]    = field(default_factory=list)
+    smtp_sessions:        list[SmtpSession]        = field(default_factory=list)
+    ftp_sessions:         list[FtpSession]         = field(default_factory=list)
+    attempted_connections:list[AttemptedConnection]= field(default_factory=list)
+    suspicious_domains:   list[str]               = field(default_factory=list)
+    dns_tunnel_suspects:  list[str]               = field(default_factory=list)
+    summary:              PcapSummary             = field(default_factory=PcapSummary)
     # 역참조용
     raw_ips:     set[str] = field(default_factory=set)
     raw_domains: set[str] = field(default_factory=set)
@@ -954,6 +964,44 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         except Exception:
             continue
 
+    # ── Pass 4: TCP SYN 시도 (C2 연결 시도 탐지) ──────────────────────────
+    _syn_map:     dict[tuple[str, int], int] = defaultdict(int)
+    _syn_ack_set: set[tuple[str, int]]       = set()
+
+    P4_syn = ["ip.dst", "tcp.dstport"]
+    for row in _run_tshark_fields(
+        tshark_path, pcap_path, P4_syn, display_filter="tcp.flags == 0x002",
+    ):
+        try:
+            ip = row[0].strip() if len(row) > 0 else ""
+            pt = row[1].strip() if len(row) > 1 else ""
+            if ip and pt.isdigit() and not _is_private_ip(ip):
+                _syn_map[(ip, int(pt))] += 1
+        except Exception:
+            continue
+
+    P4_ack = ["ip.src", "tcp.srcport"]
+    for row in _run_tshark_fields(
+        tshark_path, pcap_path, P4_ack, display_filter="tcp.flags == 0x012",
+    ):
+        try:
+            ip = row[0].strip() if len(row) > 0 else ""
+            pt = row[1].strip() if len(row) > 1 else ""
+            if ip and pt.isdigit() and not _is_private_ip(ip):
+                _syn_ack_set.add((ip, int(pt)))
+        except Exception:
+            continue
+
+    tshark_attempted: list[AttemptedConnection] = [
+        AttemptedConnection(
+            dst_ip=ip, dst_port=pt, count=cnt,
+            suspicious_port=(pt in SUSPICIOUS_PORTS),
+        )
+        for (ip, pt), cnt in _syn_map.items()
+        if (ip, pt) not in _syn_ack_set
+    ]
+    tshark_attempted.sort(key=lambda x: (-x.suspicious_port, -x.count))
+
     # ── 공통 후처리 ──────────────────────────────────────────────────
     # no_response 플래그: A/AAAA 쿼리인데 응답 IP가 없는 경우
     for q in dns_seen.values():
@@ -987,6 +1035,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         http_requests=http_list,
         tls_info=tls_list,
         beacon_candidates=_detect_beacons(beacon_ts),
+        attempted_connections=tshark_attempted,
         suspicious_domains=sorted(set(suspicious_domains)),
         dns_tunnel_suspects=sorted(set(dns_tunnel_suspects)),
         summary=summary,
@@ -1044,6 +1093,9 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     # C2 프로토콜 페이로드 수집: connection key → 누적 바이트
     smtp_raw: dict[tuple, bytearray] = defaultdict(bytearray)
     ftp_raw:  dict[tuple, bytearray] = defaultdict(bytearray)
+    # TCP SYN 추적: (server_ip, server_port) → SYN 카운트 / SYN-ACK 수신 집합
+    syn_map:     dict[tuple[str, int], int] = defaultdict(int)
+    syn_ack_set: set[tuple[str, int]]       = set()
 
     for pkt in packets:
         try:
@@ -1075,6 +1127,14 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                 proto    = "TCP"
                 dst_port = pkt[TCP].dport
                 src_port = pkt[TCP].sport
+                # TCP SYN/SYN-ACK 추적 (외부 C2 연결 시도 탐지)
+                _tcp_flags = int(pkt[TCP].flags)
+                if (_tcp_flags & 0x12) == 0x02 and not _is_private_ip(dst_ip):
+                    # SYN only (SYN=1, ACK=0) — client→server
+                    syn_map[(dst_ip, dst_port)] += 1
+                elif (_tcp_flags & 0x12) == 0x12 and not _is_private_ip(src_ip):
+                    # SYN-ACK — server(src_ip:src_port) responded
+                    syn_ack_set.add((src_ip, src_port))
             elif UDP in pkt:
                 proto    = "UDP"
                 dst_port = pkt[UDP].dport
@@ -1282,6 +1342,17 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
         if s:
             ftp_sessions.append(s)
 
+    # --- TCP SYN 미응답 연결 시도 ---
+    attempted_connections: list[AttemptedConnection] = [
+        AttemptedConnection(
+            dst_ip=ip, dst_port=pt, count=cnt,
+            suspicious_port=(pt in SUSPICIOUS_PORTS),
+        )
+        for (ip, pt), cnt in syn_map.items()
+        if (ip, pt) not in syn_ack_set
+    ]
+    attempted_connections.sort(key=lambda x: (-x.suspicious_port, -x.count))
+
     # --- 요약 ---
     summary = PcapSummary(
         total_packets=total_packets,
@@ -1308,6 +1379,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
         beacon_candidates=beacon_candidates,
         smtp_sessions=smtp_sessions,
         ftp_sessions=ftp_sessions,
+        attempted_connections=attempted_connections,
         suspicious_domains=sorted(set(suspicious_domains)),
         dns_tunnel_suspects=sorted(set(dns_tunnel_suspects)),
         summary=summary,

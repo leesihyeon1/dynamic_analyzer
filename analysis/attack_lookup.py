@@ -278,3 +278,93 @@ def lookup_technique(technique_id: str) -> tuple[str, str]:
     알 수 없는 ID면 ("", "") 반환.
     """
     return _LOOKUP.get(technique_id, ("", ""))
+
+
+# ---------------------------------------------------------------------------
+# 전술(Tactic) 킬체인 순서 + 정규화
+# ---------------------------------------------------------------------------
+
+# ATT&CK Enterprise 전술 킬체인 순서 (단일 소스).
+# behavior_classifier 의 정렬, html_report 의 색상 매핑이 이 순서를 따른다.
+TACTICS: tuple[str, ...] = (
+    "Reconnaissance",
+    "Resource Development",
+    "Initial Access",
+    "Execution",
+    "Persistence",
+    "Privilege Escalation",
+    "Defense Evasion",
+    "Credential Access",
+    "Discovery",
+    "Lateral Movement",
+    "Collection",
+    "Command and Control",
+    "Exfiltration",
+    "Impact",
+)
+
+# 비표준 전술 표기(한국어·축약·변형) → 표준 영어 전술명.
+# CAPA/VirusTotal/AI 등 외부 소스가 자유형 전술 문자열을 줄 때 정규화한다.
+# 키는 소문자.
+_TACTIC_ALIASES: dict[str, str] = {
+    # 한국어
+    "정찰":            "Reconnaissance",
+    "리소스 개발":      "Resource Development",
+    "자원 개발":        "Resource Development",
+    "초기 접근":        "Initial Access",
+    "초기 침투":        "Initial Access",
+    "실행":            "Execution",
+    "지속성":          "Persistence",
+    "지속":            "Persistence",
+    "권한 상승":        "Privilege Escalation",
+    "방어 회피":        "Defense Evasion",
+    "방어 우회":        "Defense Evasion",
+    "자격 증명 접근":    "Credential Access",
+    "자격증명 접근":     "Credential Access",
+    "탐색":            "Discovery",
+    "발견":            "Discovery",
+    "수평 이동":        "Lateral Movement",
+    "측면 이동":        "Lateral Movement",
+    "수집":            "Collection",
+    "명령 및 제어":      "Command and Control",
+    "명령 및 제어(c2)":  "Command and Control",
+    "명령 제어":        "Command and Control",
+    "유출":            "Exfiltration",
+    "반출":            "Exfiltration",
+    "영향":            "Impact",
+    # 영어 축약·변형
+    "c2":                 "Command and Control",
+    "commandandcontrol":  "Command and Control",
+    "command & control":  "Command and Control",
+    "command and control (c2)": "Command and Control",
+    "privesc":            "Privilege Escalation",
+    "privilege-escalation": "Privilege Escalation",
+    "defenseevasion":     "Defense Evasion",
+    "defense-evasion":    "Defense Evasion",
+    "credentialaccess":   "Credential Access",
+    "credential-access":  "Credential Access",
+    "lateralmovement":    "Lateral Movement",
+    "lateral-movement":   "Lateral Movement",
+    "initialaccess":      "Initial Access",
+    "initial-access":     "Initial Access",
+    "resourcedevelopment": "Resource Development",
+    "resource-development": "Resource Development",
+}
+
+# 표준 전술명 소문자 → 정식 표기 (대소문자만 다른 경우 복원용)
+_CANONICAL_BY_LOWER: dict[str, str] = {t.lower(): t for t in TACTICS}
+
+
+def normalize_tactic(tactic: str) -> str:
+    """자유형 전술 문자열을 표준 ATT&CK 전술명으로 정규화한다.
+
+    매칭 실패 시 원본 문자열을 그대로 반환한다(호출부에서 폴백 처리).
+    """
+    if not tactic:
+        return ""
+    key = " ".join(tactic.strip().lower().split())  # 내부 연속 공백 정리
+    if key in _CANONICAL_BY_LOWER:
+        return _CANONICAL_BY_LOWER[key]
+    if key in _TACTIC_ALIASES:
+        return _TACTIC_ALIASES[key]
+    return tactic

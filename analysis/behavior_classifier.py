@@ -6,25 +6,22 @@ from dataclasses import dataclass, field
 
 from parsers.procmon_csv import ProcMonEvent, EventCategory
 from parsers.pcap_parser import PcapResult
+# 자격증명/anti-VM 경로는 analysis/sensitive_paths.py 단일 소스 사용
+# (노이즈 필터의 ReadFile carve-out 과 동일 기준 공유)
+from analysis.sensitive_paths import (
+    BROWSER_CRED_PATH_FRAGMENTS as _BROWSER_CRED_PATH_FRAGMENTS,
+    BROWSER_CRED_FILENAMES as _BROWSER_CRED_FILENAMES,
+    ANTI_VM_FILE_FRAGMENTS as _ANTI_VM_FILE_FRAGMENTS,
+)
 
 
 # ---------------------------------------------------------------------------
 # FP allowlist — Windows JIT/UWP processes and analysis tools
 # HollowsHunter flags JIT stubs in these as shellcode (PE=0, replaced=0) → FP
-# Keep in sync with _HH_SYSTEM_FP_NAMES in ai_analyzer.py and html_report.py
+# 정의는 analysis/fp_allowlist.py 단일 소스 참조.
 # ---------------------------------------------------------------------------
 
-_HH_FP_NAMES: frozenset[str] = frozenset({
-    "dwm.exe", "explorer.exe", "searchapp.exe", "searchui.exe",
-    "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
-    "runtimebroker.exe", "applicationframehost.exe", "textinputhost.exe",
-    "systemsettings.exe", "smartscreen.exe", "wuauclt.exe",
-    "sihost.exe", "taskhostw.exe", "ctfmon.exe",
-    "picpick.exe", "processhacker.exe", "systeminformer.exe",
-    "procmon.exe", "procmon64.exe",
-    "hollows_hunter.exe", "hollows_hunter64.exe",
-    "pe_sieve.exe", "pe_sieve64.exe",
-})
+from analysis.fp_allowlist import HH_SYSTEM_FP_NAMES as _HH_FP_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -49,25 +46,23 @@ class BehaviorReport:
     suspicious_network:  list[str]            = field(default_factory=list)
     suspicious_processes:list[str]            = field(default_factory=list)
     tag_map:             dict[str, list[str]] = field(default_factory=dict)
+    # 실행 진단
+    execution_verdict:  str       = "UNKNOWN"   # CONFIRMED / PARTIAL / EVADED / FAILED / UNKNOWN
+    execution_details:  list[str] = field(default_factory=list)  # 판정 근거 목록
+    # 분류기 실패 기록 (예외로 스킵된 카테고리 — 조용한 누락 방지)
+    classify_errors:    list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Tactic ordering (full ATT&CK kill chain)
+# 순서는 analysis/attack_lookup.py 의 TACTICS 단일 소스를 따른다.
+# (이전에는 Reconnaissance·Resource Development·Initial Access 가 누락돼
+#  해당 전술 기법이 킬체인 순서를 무시하고 표 맨 아래로 밀리는 버그가 있었음)
 # ---------------------------------------------------------------------------
 
-_TACTIC_ORDER: dict[str, int] = {
-    "Execution":            0,
-    "Persistence":          1,
-    "Privilege Escalation": 2,
-    "Defense Evasion":      3,
-    "Credential Access":    4,
-    "Discovery":            5,
-    "Lateral Movement":     6,
-    "Collection":           7,
-    "Command and Control":  8,
-    "Exfiltration":         9,
-    "Impact":               10,
-}
+from analysis.attack_lookup import TACTICS as _TACTICS
+
+_TACTIC_ORDER: dict[str, int] = {tactic: idx for idx, tactic in enumerate(_TACTICS)}
 
 
 def _tactic_key(technique: MitreTechnique) -> int:
@@ -97,19 +92,28 @@ _RANSOMWARE_EXTENSIONS: frozenset[str] = frozenset(
 
 _WRITE_CREATE_OPS: frozenset[str] = frozenset({"WriteFile", "CreateFile"})
 
-# Browser credential paths — T1555.003
-_BROWSER_CRED_PATH_FRAGMENTS: tuple[str, ...] = (
-    "\\google\\chrome\\user data\\default\\login data",
-    "\\google\\chrome\\user data\\default\\cookies",
-    "\\google\\chrome\\user data\\default\\web data",
-    "\\microsoft\\edge\\user data\\default\\login data",
-    "\\microsoft\\edge\\user data\\default\\cookies",
-    "\\microsoft\\credentials\\",
-    "\\microsoft\\protect\\",
+# Anti-VM/Sandbox 탐지 패턴 — T1497.001
+_ANTI_VM_REG_FRAGMENTS: tuple[str, ...] = (
+    "vmware, inc", "vmware tools", "vmware virtual",
+    "\\services\\vboxsf", "\\services\\vmhgfs", "\\services\\vmmouse",
+    "\\services\\vmrawdsk", "\\services\\vmusbmouse", "\\services\\vmvss",
+    "\\services\\vmx_svga", "\\services\\vmxnet", "\\services\\vmxnet3",
+    "oracle\\virtualbox", "\\hardware\\acpi\\dsdt\\vbox__",
+    "\\hardware\\acpi\\fadt\\vbox__", "\\hardware\\acpi\\rsdt\\vbox__",
+    "vbox gim", "innotek gmbh", "qemu",
+    "\\system\\currentcontrolset\\services\\netkvm",
+    "parallels", "prl_tools", "\\software\\xen", "xentools",
 )
-_BROWSER_CRED_FILENAMES: frozenset[str] = frozenset(
-    {"logins.json", "key4.db", "key3.db", "signons.sqlite"}
-)
+_REG_READ_OPS: frozenset[str] = frozenset({
+    "RegOpenKey", "RegQueryKey", "RegQueryValue",
+    "RegEnumKey", "RegEnumValue",
+})
+_FILE_READ_OPS: frozenset[str] = frozenset({
+    "ReadFile", "QueryInformation",
+    "QueryBasicInformationFile", "QueryAttributesFile",
+})
+
+# Browser credential paths (T1555.003) 는 analysis/sensitive_paths.py 참조
 _BROWSER_PROC_NAMES: frozenset[str] = frozenset(
     {"chrome.exe", "chromium.exe", "msedge.exe", "firefox.exe",
      "opera.exe", "brave.exe", "iexplore.exe"}
@@ -194,6 +198,18 @@ def _classify_file_events(
                 )
                 report.suspicious_files.append(path)
                 _tag_entity(report.tag_map, lower, "T1070.004")
+
+        # T1497.001 – Virtualization/Sandbox Evasion: VM 아티팩트 파일 접근
+        if op in _FILE_READ_OPS and any(frag in lower for frag in _ANTI_VM_FILE_FRAGMENTS):
+            _add_evidence(
+                technique_map, "T1497.001",
+                "Virtualization/Sandbox Evasion: System Checks", "Defense Evasion",
+                evidence=path,
+                reference="https://attack.mitre.org/techniques/T1497/001/",
+                process=ev.process,
+            )
+            report.suspicious_files.append(path)
+            _tag_entity(report.tag_map, lower, "T1497.001")
 
         # T1555.003 – Credentials from Web Browsers
         # Exclude browser processes reading their own files
@@ -306,8 +322,23 @@ def _classify_registry_events(
             _tag_entity(report.tag_map, lower, "T1562.001")
 
     for ev in events:
-        if ev.category == EventCategory.REGISTRY and ev.operation == "RegSetValue":
+        if ev.category != EventCategory.REGISTRY:
+            continue
+        if ev.operation == "RegSetValue":
             _check_reg_path(ev.path, ev.detail, process=ev.process)
+        # T1497.001 – VM 아티팩트 레지스트리 쿼리 (Anti-VM 체크)
+        if ev.operation in _REG_READ_OPS:
+            _lower = ev.path.lower()
+            if any(frag in _lower for frag in _ANTI_VM_REG_FRAGMENTS):
+                _add_evidence(
+                    technique_map, "T1497.001",
+                    "Virtualization/Sandbox Evasion: System Checks", "Defense Evasion",
+                    evidence=ev.path,
+                    reference="https://attack.mitre.org/techniques/T1497/001/",
+                    process=ev.process,
+                )
+                report.suspicious_registry.append(ev.path)
+                _tag_entity(report.tag_map, _lower, "T1497.001")
 
     for entry in reg_diff.get("added", []):
         try:
@@ -835,6 +866,19 @@ def _classify_network(
                 f"비콘: {bc.dst_ip}:{bc.dst_port} ({bc.count}회, ~{bc.interval_avg}s 간격)")
             _tag_entity(report.tag_map, bc.dst_ip, "T1071.001")
 
+    # TCP SYN without SYN-ACK — C2 응답 없음 (FLARE VM 환경에서 C2 오프라인)
+    for ac in getattr(pcap, "attempted_connections", []):
+        port_note = " [의심 포트]" if ac.suspicious_port else ""
+        evidence  = f"{ac.dst_ip}:{ac.dst_port} (응답 없음, {ac.count}회 시도){port_note}"
+        _add_evidence(
+            technique_map, "T1095",
+            "Non-Application Layer Protocol (C2 응답 없음)", "Command and Control",
+            evidence=evidence,
+            reference="https://attack.mitre.org/techniques/T1095/",
+        )
+        report.suspicious_network.append(f"[C2 시도 실패] {evidence}")
+        _tag_entity(report.tag_map, ac.dst_ip, "T1095")
+
     # Large transfer / exfiltration — exclude analysis service IPs to reduce FPs
     external_ips = {
         c.dst_ip for c in pcap.connections
@@ -915,30 +959,24 @@ def classify_behaviors(
     report        = BehaviorReport()
     technique_map: dict[str, MitreTechnique] = {}
 
-    try:
-        _classify_file_events(events, technique_map, report)
-    except Exception:
-        pass
+    def _run(label: str, fn, *args) -> None:
+        """분류기를 실행하되 예외 시 조용히 삼키지 않고 report에 기록한다.
 
-    try:
-        _classify_registry_events(events, reg_diff, technique_map, report)
-    except Exception:
-        pass
+        한 분류기의 예외로 해당 카테고리 기법이 통째로 누락되면
+        MITRE 탭이 조용히 불완전해지므로 원인을 남긴다.
+        """
+        try:
+            fn(*args)
+        except Exception as exc:
+            report.classify_errors.append(
+                f"{label} 분류 실패: {type(exc).__name__}: {exc}"
+            )
 
-    try:
-        _classify_process_events(events, technique_map, report)
-    except Exception:
-        pass
-
-    try:
-        _classify_network(pcap, technique_map, report)
-    except Exception:
-        pass
-
-    try:
-        _classify_injection(hh_result, pe_sieve_results, technique_map, report)
-    except Exception:
-        pass
+    _run("파일",       _classify_file_events,     events, technique_map, report)
+    _run("레지스트리",  _classify_registry_events, events, reg_diff, technique_map, report)
+    _run("프로세스",    _classify_process_events,  events, technique_map, report)
+    _run("네트워크",    _classify_network,         pcap, technique_map, report)
+    _run("인젝션",      _classify_injection,       hh_result, pe_sieve_results, technique_map, report)
 
     report.suspicious_files     = list(dict.fromkeys(report.suspicious_files))
     report.suspicious_registry  = list(dict.fromkeys(report.suspicious_registry))
@@ -947,4 +985,98 @@ def classify_behaviors(
 
     report.techniques = sorted(technique_map.values(), key=_tactic_key)
 
+    # ── 실행 진단 ──────────────────────────────────────────────────────────
+    report.execution_verdict, report.execution_details = _assess_execution(
+        events, pcap, technique_map, proc_diff,
+    )
+
     return report
+
+
+def _assess_execution(
+    events: list[ProcMonEvent],
+    pcap: PcapResult,
+    technique_map: dict[str, MitreTechnique],
+    proc_diff: dict,
+) -> tuple[str, list[str]]:
+    """샘플이 제대로 실행되었는지, 탐지 우회 가능성이 있는지 판정.
+
+    Returns
+    -------
+    (verdict, details)
+      verdict : "CONFIRMED" | "PARTIAL" | "EVADED" | "FAILED" | "UNKNOWN"
+      details : 판정 근거 문자열 목록
+    """
+    details: list[str] = []
+
+    total_events   = len(events)
+    new_procs      = proc_diff.get("new_processes", []) if proc_diff else []
+    non_wl_procs   = [p for p in new_procs if not getattr(p, "whitelisted", False)]
+
+    has_anti_vm    = "T1497.001" in technique_map
+    has_dns        = bool(pcap and pcap.dns_queries)
+    has_conn       = bool(pcap and pcap.connections
+                         and any(not _is_private_ip(c.dst_ip) for c in pcap.connections))
+    has_attempted  = bool(pcap and getattr(pcap, "attempted_connections", []))
+    has_beacon     = bool(pcap and pcap.beacon_candidates)
+    has_smtp_ftp   = bool(pcap and (pcap.smtp_sessions or pcap.ftp_sessions))
+    has_network    = has_dns or has_conn or has_attempted or has_beacon or has_smtp_ftp
+
+    # 이벤트 수 요약
+    details.append(f"ProcMon 이벤트 {total_events:,}건")
+    details.append(f"신규 프로세스 {len(non_wl_procs)}개 (비화이트리스트)")
+
+    if has_anti_vm:
+        vm_evidence = technique_map["T1497.001"].evidence[:3]
+        details.append(f"Anti-VM 체크 탐지 ({len(technique_map['T1497.001'].evidence)}건): "
+                       + " / ".join(vm_evidence))
+
+    if has_dns:
+        details.append(f"DNS 쿼리 {len(pcap.dns_queries)}건")
+    if has_conn:
+        ext = [c for c in pcap.connections if not _is_private_ip(c.dst_ip)]
+        details.append(f"외부 TCP/UDP 연결 {len(ext)}건")
+    if has_attempted:
+        details.append(f"C2 연결 시도(미응답) {len(pcap.attempted_connections)}건")
+    if has_beacon:
+        details.append(f"비콘 패턴 {len(pcap.beacon_candidates)}건")
+
+    # ── 판정 ──────────────────────────────────────────────────────────────
+    if has_anti_vm and not has_network:
+        # Anti-VM 체크 후 네트워크 코드 진입 전 종료 — 이벤트 수와 무관하게 우선 판정
+        verdict = "EVADED"
+        details.append("→ 판정: VM/Sandbox 탐지 후 조기 종료 의심 (T1497.001)")
+        details.append("  확인: Anti-VM 우회(FakeNet DHCP, MAC 변경), FLARE VM 아티팩트 제거")
+
+    elif total_events < 15 and not non_wl_procs:
+        # 거의 아무것도 일어나지 않음
+        verdict = "FAILED"
+        details.append("→ 판정: 샘플 실행 실패 의심 (이벤트 극소, 신규 프로세스 없음)")
+        details.append("  확인: 아키텍처 불일치(x86/x64), 의존 DLL 누락, 실행 경로 오류")
+
+    elif not has_network and total_events < 100:
+        # 이벤트는 있지만 네트워크가 전무하고 이벤트도 적음
+        verdict = "FAILED"
+        details.append("→ 판정: 실행 실패 또는 극초기 종료 (네트워크 없음, 이벤트 적음)")
+        details.append("  확인: 관리자 권한 필요, UAC 프롬프트 미처리, 실행 락 파일")
+
+    elif has_attempted and not has_conn and not has_dns:
+        # SYN만 있고 DNS도 없음 — IP 직접 접속 시도, 서버 오프라인
+        verdict = "PARTIAL"
+        details.append("→ 판정: C2 IP 직접 접속 시도 (DNS 없음, SYN만 관찰)")
+        details.append("  확인: C2 IP가 오프라인 / 방화벽 차단 — FakeNet으로 트래픽 캡처 시도")
+
+    elif has_network and (has_beacon or has_smtp_ftp or has_conn):
+        verdict = "CONFIRMED"
+        details.append("→ 판정: 실행 확인됨 (네트워크 활동 관찰)")
+
+    elif has_network:
+        verdict = "PARTIAL"
+        details.append("→ 판정: 부분 실행 (네트워크 활동 있으나 C2 응답 없음)")
+
+    else:
+        verdict = "UNKNOWN"
+        details.append("→ 판정: 불명확 (이벤트 있음, 네트워크 없음)")
+        details.append("  확인: 장기 Sleep 후 C2 접속 / 조건부 실행 (특정 파일·레지스트리 필요)")
+
+    return verdict, details

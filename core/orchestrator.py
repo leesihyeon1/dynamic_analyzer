@@ -99,27 +99,24 @@ def _kill_analysis_tool(
             pass
 
 
-# ── 의심 DLL 로드 경로 ────────────────────────────────────────────────────
-# 거의 항상 악성: Temp 계열 디렉터리에서 DLL을 로드하는 기존 프로세스
-# 주의: 백슬래시를 이중 이스케이프(\\)로 표기해야 path.lower() in 비교가 정확히 동작함
-_INJECT_SUSP: tuple[str, ...] = (
-    "\\appdata\\local\\temp\\",
-    "\\windows\\temp\\",
-    "\\users\\public\\",
-    "\\recycle",              # 휴지통 경유 은닉
-)
+# ── 의심 DLL 로드 경로 판정 ────────────────────────────────────────────────
+# 경로 상수·판정 함수는 analysis/injection_paths.py 단일 소스를 사용한다.
+# (실시간 감시 core/process_watcher.py 와 동일 기준 공유)
+from analysis.injection_paths import is_suspicious_module_path
 
-# 시스템 정상 경로 — 여기서 로드되면 무시
-_INJECT_SAFE: tuple[str, ...] = (
-    "\\windows\\system32\\",
-    "\\windows\\syswow64\\",
-    "\\windows\\winsxs\\",
-    "\\program files\\",
-    "\\program files (x86)\\",
-    "\\windows\\microsoft.net\\",
-    "\\windows\\assembly\\",
-    "\\windows\\fonts\\",
-)
+
+def _pesieve_rank(pr) -> tuple:
+    """PeSieveResult 정렬 키. 재스캔 결과 중 대표값 선택에 사용.
+
+    에러 결과보다 정상 결과를, 그중 suspicious·인젝션 카운트가 큰 것을 우선한다.
+    """
+    if getattr(pr, "error", ""):
+        return (-1, 0, 0)
+    return (
+        0,
+        getattr(pr, "suspicious", 0) or 0,
+        (getattr(pr, "implanted_pe", 0) or 0) + (getattr(pr, "implanted_shc", 0) or 0),
+    )
 
 
 def _find_injection_targets(
@@ -136,10 +133,7 @@ def _find_injection_targets(
             continue
         if ev.pid in already_scanned or ev.pid in sample_pids:
             continue
-        path_lower = ev.path.lower()
-        if any(safe in path_lower for safe in _INJECT_SAFE):
-            continue
-        if any(susp in path_lower for susp in _INJECT_SUSP):
+        if is_suspicious_module_path(ev.path):
             target_pids.add(ev.pid)
     return target_pids
 
@@ -173,8 +167,7 @@ def _scan_procmon_once(
         # ── 인젝션 탐지 (PROCESS / Load Image) ──────────────────────
         if cat == EventCategory.PROCESS and ev.operation == "Load Image" and ev.pid != 0:
             if ev.pid not in already_scanned and ev.pid not in sample_pids:
-                pl = ev.path.lower()
-                if not any(s in pl for s in _INJECT_SAFE) and any(s in pl for s in _INJECT_SUSP):
+                if is_suspicious_module_path(ev.path):
                     inject_pids.add(ev.pid)
 
         # ── 네트워크 맵 (TCP/UDP outbound/inbound) ───────────────────
@@ -207,6 +200,61 @@ def _scan_procmon_once(
         key=lambda c: (-c.event_count, c.process.lower(), c.remote_ip),
     )
     return inject_pids, net_map
+
+
+def _find_suspicious_activity_pids(events: list, known_pids: set) -> set:
+    """악성 "행위"를 보인 프로세스 PID 를 procmon_events 전체에서 찾아 반환.
+
+    focus_pids(all_pids) 밖의 프로세스라도 실제 악성 신호를 보이면 그 PID 를
+    편입해, 미탐지 인젝션 대상·서비스(services.exe)가 생성한 프로세스 등의
+    파일·레지스트리 이벤트가 focus 필터에서 통째로 누락되는 것을 방지한다.
+
+    신호(하나라도 해당하면 편입):
+      - 의심 경로(Temp/AppData 등)에 파일 쓰기/생성
+      - 자격증명 저장소 / anti-VM 아티팩트 읽기
+      - 의심 경로 모듈(DLL) 로드
+      - Run/RunOnce 레지스트리 값 설정(지속성)
+    정상 프로세스는 이 조건을 거의 만족하지 않으므로 오탐 편입이 적다.
+    """
+    from parsers.procmon_csv import EventCategory
+    from analysis.noise_filter import is_suspicious_path
+    from analysis.sensitive_paths import is_sensitive_read_path
+    from analysis.injection_paths import is_suspicious_module_path
+    from analysis.registry_relevance import is_persistence_key
+    from core.process_tracker import _ANALYSIS_TOOL_PROC_NAMES
+
+    _WRITE_OPS = {"WriteFile", "CreateFile"}
+    _REG_SET_OPS = {"RegSetValue", "RegCreateKey"}
+
+    found: set[int] = set()
+    for ev in events:
+        pid = ev.pid
+        if pid == 0 or pid in known_pids or pid in found:
+            continue
+        if (getattr(ev, "process", "") or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
+            continue
+
+        cat = ev.category
+        op  = ev.operation
+        path = ev.path or ""
+        hit = False
+
+        if cat == EventCategory.FILE:
+            if op in _WRITE_OPS and is_suspicious_path(path):
+                hit = True
+            elif op == "ReadFile" and is_sensitive_read_path(path):
+                hit = True
+        elif cat == EventCategory.PROCESS and op == "Load Image":
+            if is_suspicious_module_path(path):
+                hit = True
+        elif cat == EventCategory.REGISTRY and op in _REG_SET_OPS:
+            # 지속성/보안/하이재킹 키 (Run·서비스·IFEO·AppInit·Defender 등)
+            if is_persistence_key(path):
+                hit = True
+
+        if hit:
+            found.add(pid)
+    return found
 
 
 def _merge_external_techniques(report, new_techs: list) -> None:
@@ -623,11 +671,13 @@ def run_analysis(
 
     from core.process_watcher import ProcessWatcher
     watcher = ProcessWatcher(
-        initial_pids  = set(proc_before.keys()),
-        scanner       = ps_scanner,
-        on_result     = _rt_callback,
-        dump_mode     = 3,   # raw dump — PE + 쉘코드 모두 추출
-        poll_interval = 1.0,
+        initial_pids    = set(proc_before.keys()),
+        scanner         = ps_scanner,
+        on_result       = _rt_callback,
+        dump_mode       = 3,     # raw dump — PE + 쉘코드 모두 추출
+        poll_interval   = 1.0,
+        rescan_interval = 5.0,   # injection 신호 검사 + 신규 프로세스 재스캔 주기
+        max_rescans     = 3,     # 언패킹/지연 인젝션 대응 (clean 프로세스 최대 재스캔)
     )
     watcher.start()
     if watcher.available:
@@ -636,7 +686,8 @@ def run_analysis(
             if watcher.detection_mode == "wmi_etw"
             else "psutil 폴링 (1초 간격)"
         )
-        status(f"      [실시간] 신규 프로세스 감시 시작 — {_mode_label}")
+        status(f"      [실시간] 신규 프로세스 감시 시작 — {_mode_label}"
+               f" + injection 신호/재스캔 (5초 주기)")
 
     elapsed = 0
     interval = 5
@@ -681,9 +732,17 @@ def run_analysis(
     with _rt_lock:
         rt_snapshot = list(_rt_results)
 
+    # 같은 PID 가 재스캔으로 여러 결과를 낼 수 있으므로 PID별 "가장 의심스러운"
+    # 결과 하나만 채택한다 (에러<정상, suspicious·인젝션 카운트 큰 것 우선).
+    _rt_best: dict = {}
+    for _pid, _raw in rt_snapshot:
+        _pr = parse_pesieve(_raw)
+        _prev = _rt_best.get(_pr.pid)
+        if _prev is None or _pesieve_rank(_pr) > _pesieve_rank(_prev):
+            _rt_best[_pr.pid] = _pr
+
     rt_suspicious = 0
-    for pid, raw in rt_snapshot:
-        pr = parse_pesieve(raw)
+    for pr in _rt_best.values():
         result.pe_sieve_results.append(pr)
         if pr.suspicious > 0:
             rt_suspicious += 1
@@ -693,7 +752,7 @@ def run_analysis(
             if pr.implanted_shc:
                 inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
             inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
-            status(f"      [실시간] PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
+            status(f"      [실시간] PID {pr.pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
 
     if watcher.available:
         status(f"      [실시간] 완료: 의심 {rt_suspicious}개 PID"
@@ -999,6 +1058,19 @@ def run_analysis(
         if _infra_cnt:
             status(f"      브라우저 인프라 서브프로세스 {_infra_cnt}개 분류 (리포트 기본 접힘)")
 
+        # ── focus 밖 악성 신호 프로세스 편입 ──────────────────────────────
+        # all_pids(샘플·자식·인젝션·실시간·단명 보완) 밖이라도 실제 악성 행위를
+        # 보인 프로세스를 focus 에 추가 — 미탐지 인젝션 대상·서비스 생성 프로세스
+        # 등의 파일·레지스트리 이벤트가 focus 필터에서 통째로 누락되는 것을 방지.
+        if result.all_pids:
+            _susp_pids = _find_suspicious_activity_pids(
+                result.procmon_events, result.all_pids
+            )
+            if _susp_pids:
+                result.all_pids.update(_susp_pids)
+                status(f"      [보완] 악성 신호 프로세스 {len(_susp_pids)}개 focus 편입 "
+                       f"(PID {sorted(_susp_pids)})")
+
         # 포커스 PID 기반 필터 (단명 프로세스 보완 후 실행)
         result.filtered_events = filter_events(
             result.procmon_events,
@@ -1122,7 +1194,7 @@ def run_analysis(
             with ThreadPoolExecutor(max_workers=_ps3_workers) as _ps3_pool:
                 _ps3_futures = {
                     _ps3_pool.submit(
-                        ps_scanner.scan_pid, _pid, dump_mode=3, shellcode=True, hooks=True
+                        ps_scanner.scan_pid, _pid, dump_mode=3, shellcode=1
                     ): _pid
                     for _pid in _alive_inject
                 }
@@ -1179,6 +1251,11 @@ def run_analysis(
         hh_result=result.hh_result,
         pe_sieve_results=result.pe_sieve_results,
     )
+    # 분류기 예외(카테고리 통째 누락)를 조용히 넘기지 않고 표면화
+    for _cerr in getattr(result.behavior_report, "classify_errors", []):
+        result.errors.append(_cerr)
+        status(f"      [경고] {_cerr}")
+
     result.ioc_report = extract_iocs(
         result.filtered_events,
         result.pcap_result,
