@@ -1,7 +1,7 @@
 # dynamic_analyzer
 
 Windows 악성코드 동적 분석 자동화 도구.  
-ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 · Ollama 를 조합해 **Noriben.py** 스타일로 동작하며,  
+ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 · LLM(NVIDIA NIM / Ollama) 을 조합해 **Noriben.py** 스타일로 동작하며,  
 실행 한 줄로 샘플 모니터링 → MITRE ATT&CK 매핑 → HTML/JSON 리포트까지 자동 생성합니다.
 
 ---
@@ -24,7 +24,7 @@ ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 �
 | **쉘코드 덤프 재분석** | pe-sieve/HH가 덤프한 `.shc`·`.bin` 파일에 YARA + CAPA `--shellcode` 적용, 오탐 필터링 포함 |
 | **물리 메모리 덤프** | winpmem / DumpIt으로 RAM 전체 덤프 (`--memdump`) |
 | **Volatility3 포렌식** | malfind · pstree · netscan · cmdline · handles · dlllist 병렬 실행, 오류 원인 리포트 포함 |
-| **AI 행위 분석** | Ollama (qwen2.5:7b 기본) 기반 — 악성코드 패밀리 추정 · 위협 수준 · 행위 분석 · C2 패턴 한국어 자동 생성 |
+| **AI 행위 분석** | NVIDIA NIM 우선 → Ollama 폴백 — 악성코드 패밀리 추정 · 위협 수준 · 행위 분석 · C2 패턴 한국어 자동 생성 |
 | **CAPA 정적 분석** | 샘플 바이너리에 CAPA 적용 → ATT&CK 기법 자동 추출 |
 | **VirusTotal 연동** | SHA256 기반 샌드박스 ATT&CK 기법 조회 (API 키 선택 설정) |
 | **프로세스↔네트워크 매핑** | ProcMon TCP/UDP 이벤트 기반, 프로세스별 외부 연결 집계 |
@@ -70,7 +70,8 @@ yara-python    # 선택 — 쉘코드 YARA 스캔
 | **winpmem** / **DumpIt** | `C:\Tools\winpmem\` 또는 PATH | `--memdump` 사용 불가 |
 | **Volatility3** (`vol.py` / `vol3`) | `C:\Tools\volatility3\` 또는 PATH | 메모리 포렌식 스킵 |
 | **FakeNet-NG** (`FakeNet.exe`) | PATH 또는 `--fakenet-path` 명시 | FakeNet 기능 스킵 |
-| **Ollama** | `http://localhost:11434` | AI 분석 스킵 |
+| **NVIDIA NIM** (API 키) | 환경변수 `NVIDIA_API_KEY` | Ollama 로 폴백 |
+| **Ollama** | `http://localhost:11434` | (NVIDIA도 없으면) AI 분석 스킵 |
 
 ---
 
@@ -143,18 +144,112 @@ python analyzer.py malware.exe --fakenet
 python analyzer.py malware.exe --fakenet --fakenet-path C:\Tools\FakeNet\FakeNet.exe
 ```
 
-### AI 행위 분석 (Ollama)
+### AI 행위 분석 (NVIDIA NIM / Ollama)
+
+기본값은 `--ai-provider auto` — **NVIDIA 를 먼저 시도하고, 키가 없거나 연결에 실패하면 Ollama 로 자동 폴백**합니다.
+둘 다 사용할 수 없으면 AI 분석만 건너뛰고 나머지 분석은 그대로 진행됩니다.
+
+AI 분석은 **기본 활성화**이며 `--no-ai` 로 끕니다.
 
 ```powershell
-# Ollama가 실행 중이면 자동 활성화 — 분석 종료 후 AI 탭에 결과 표시
-python analyzer.py malware.exe --ai
+# 1) NVIDIA 무료 API 키 설정 (https://build.nvidia.com 에서 발급)
+$env:NVIDIA_API_KEY = "nvapi-..."
 
-# 모델 지정 (기본: qwen2.5:7b)
-python analyzer.py malware.exe --ai --ai-model qwen2.5:14b
+# 2) 실행 — NVIDIA 우선, 실패 시 Ollama 폴백
+python analyzer.py malware.exe
+
+# 프로바이더 고정
+python analyzer.py malware.exe --ai-provider nvidia
+python analyzer.py malware.exe --ai-provider ollama   # 격리망: 외부 전송 없음
+
+# 모델 지정 (NVIDIA 기본: qwen/qwen2.5-72b-instruct / Ollama 기본: 실행 중인 모델 자동 감지)
+python analyzer.py malware.exe --ai-model meta/llama-3.3-70b-instruct
+python analyzer.py malware.exe --ai-provider ollama --ai-model qwen2.5:14b
+
+# AI 분석 비활성화
+python analyzer.py malware.exe --no-ai
 ```
+
+> ⚠️ **NVIDIA 사용 시 프롬프트가 외부로 전송됩니다.**
+> 프롬프트에는 파일 경로·프로세스명·C2 IP·해시·호스트명이 포함될 수 있습니다.
+> 검체 데이터를 외부로 내보낼 수 없는 환경에서는 반드시 `--ai-provider ollama` 를 사용하거나
+> `config.json` 의 `ai.provider` 를 `"ollama"` 로 고정하세요.
+
+> **API 키 우선순위**: `--ai-api-key` > 환경변수 `NVIDIA_API_KEY` > `config.json` 의 `ai.nvidia.api_key`
+> (설정 파일 평문 저장을 피하려면 환경변수를 쓰세요.)
+> 무료 크레딧·레이트리밋 정책은 https://build.nvidia.com 에서 확인하세요.
 
 > **Ollama 설치**: https://ollama.com  
 > 모델 다운로드: `ollama pull qwen2.5:7b`
+
+프롬프트 입력 상한은 프로바이더별로 다릅니다 — Ollama 10,000자 / NVIDIA 40,000자
+(`config.json` 의 `ai.*.max_prompt_chars`). NVIDIA 쪽이 128k 컨텍스트라 잘려나가는 증거가 적습니다.
+
+#### 모델 선택 기준
+
+출력이 전부 한국어 서술이고, MITRE 기법을 `T1055.012|Process Hollowing|Defense Evasion|근거`
+파이프 형식으로 뽑아 **실제 리포트에 병합**하므로 — 한국어 품질 · 형식 준수 · 낮은 추측성 순으로 중요합니다.
+
+| 모델 | 한국어 | 형식 준수 | 추측 억제 | 비고 |
+|---|:---:|:---:|:---:|---|
+| `qwen/qwen2.5-72b-instruct` | ◎ | ◎ | ○ | **기본값 · 권장** |
+| `meta/llama-3.3-70b-instruct` | ○ | ◎ | ○ | 한국어가 다소 번역투 |
+| `deepseek-ai/deepseek-r1` | ○ | △ | △ | 실행 흐름 추론 강함. 느리고 크레딧 소모 큼 |
+| `nvidia/llama-3.1-nemotron-70b-instruct` | △ | ◎ | ○ | 영어 중심 |
+| `*-coder-*` 계열 | △ | ○ | ○ | **부적합** — 코드 생성이 아닌 한국어 위협 서술 작업 |
+
+reasoning 모델(`deepseek-r1` 등)은 `<think>` 블록이 자동 제거되고, 사고 과정이 `max_tokens` 를
+소진해 빈 응답이 되는 것을 막기 위해 상한이 자동으로 16384 로 올라갑니다
+(`config.json` 의 `ai.nvidia.max_tokens` 로 수동 지정 가능).
+
+사용 가능한 모델 목록은 카탈로그에서 직접 확인하세요:
+
+```bash
+python -c "import os; from core.ai_analyzer import list_nvidia_models as L; print('\n'.join(L('https://integrate.api.nvidia.com/v1', os.environ['NVIDIA_API_KEY'])))"
+```
+
+### 관련도 등급 · 베이스라인 차감
+
+분석 VM 은 샘플과 무관하게 배경 활동을 만듭니다. Windows Update 가 한 번 돌면
+프로세스 80여 개 · 드롭 파일 170여 개 · HTTP 75건이 리포트에 들어와 정작 샘플이
+남긴 아티팩트를 덮어버립니다. 이를 막기 위해 관측 항목마다 3단계 등급을 매깁니다.
+
+| 등급 | 의미 | 리포트 기본 표시 |
+|---|---|---|
+| **1 계보** | 샘플 프로세스와 그 자손이 직접 발생시킨 행위 | 펼침 |
+| **2 의심** | 계보 밖이지만 환경 배경으로 설명되지 않는 행위 — 주입·측면 이동 가능성 | 펼침 |
+| **3 배경** | 베이스라인 또는 알려진 OS 배경 활동 (Windows Update·Defender·텔레메트리) | 숨김 |
+
+> **데이터는 하나도 삭제되지 않습니다.** 등급은 HTML 리포트의 표시만 제어하고,
+> 상단 `계보만 / 계보+의심 / 전체 표시` 버튼으로 언제든 되돌릴 수 있습니다.
+> JSON 리포트에는 항상 전부 들어가며 각 항목에 `relevance_tier` 가 붙습니다.
+
+판정 순서는 계보 확정 → 배경 제거 → **남는 것은 전부 의심** 입니다.
+"모르면 배경" 이 아니라 "모르면 의심" 이어야 놓치지 않습니다.
+
+#### 베이스라인 수집 (권장)
+
+내장 OS 배경 프로파일만으로도 동작하지만, 해당 VM 에서 실제로 수집한
+베이스라인이 훨씬 정확합니다. 샘플 없이 한 번 공회전시켜 저장합니다.
+
+```powershell
+# 1) 베이스라인 수집 — 샘플 없이 모니터링만 (Windows Update 가 도는 시간을 충분히 확보)
+python analyzer.py --baseline-capture --timeout 600
+
+# 2) 이후 분석은 baseline/<hostname>.json 을 자동 적용
+python analyzer.py malware.exe
+
+# 특정 베이스라인 지정 / 비활성화
+python analyzer.py malware.exe --baseline baseline/vm01.json
+python analyzer.py malware.exe --no-baseline
+```
+
+베이스라인은 호스트별로 저장됩니다(VM 마다 배경 활동이 다름). Defender 서명
+버전과 업데이트 대상이 계속 바뀌므로 14일이 지나면 재수집 경고가 표시됩니다.
+
+경로는 정규화 후 비교합니다 — `C:\Windows\TEMP\{GUID}\`, `appx.<랜덤>.tmp`,
+버전 번호, 사용자 디렉터리명처럼 실행마다 달라지는 요소는 와일드카드로 치환되므로
+원문이 매번 달라도 같은 배경 활동으로 인식됩니다.
 
 ### PCAP 분석
 
@@ -240,7 +335,7 @@ python analyzer.py malware.exe --memdump --ai
                         IOC 추출 (SMTP/FTP C2 IP 포함)
                         물리 메모리 덤프 (winpmem) ← --memdump
                         Volatility3 병렬 실행 (malfind·pstree·netscan·cmdline·handles·dlllist)
-                        Ollama AI 행위 분석 (qwen2.5:7b) ← --ai
+                        AI 행위 분석 (NVIDIA NIM → Ollama 폴백) ← 기본 ON, --no-ai 로 비활성화
         │
         ▼
       리포트             results/<이름>_<timestamp>/
@@ -270,7 +365,7 @@ python analyzer.py malware.exe --memdump --ai
 | 🌐 **네트워크** | 외부 연결·DNS·TLS SNI·HTTP·SMTP/FTP·HTTPS 복호화·FakeNet-NG |
 | 🧠 **메모리** | pe-sieve/HH 인젝션 탐지 + Volatility3 포렌식 (malfind·pstree·netscan·handles) |
 | 🔎 **IOC** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL (프로세스 매핑 포함) |
-| 🤖 **AI 분석** | Ollama 행위 분석 — 패밀리 추정·위협 수준·행위 요약·C2 패턴 (한국어) |
+| 🤖 **AI 분석** | LLM 행위 분석 — 패밀리 추정·위협 수준·행위 요약·C2 패턴 (한국어), 사용된 프로바이더/모델 표기 |
 | 🕵️ **Hunt** | abuse.ch 실시간 IOC 조회 (MalwareBazaar·ThreatFox·URLhaus·Feodo) |
 
 ---
@@ -296,8 +391,9 @@ dynamic_analyzer/
 │   ├── tls_keylog.py         # SSLKEYLOGFILE 기반 TLS 세션 키 수집
 │   ├── fakenet_integrator.py # FakeNet-NG 실행 + 결과 파싱
 │   ├── memory_forensics.py   # winpmem 메모리 덤프 + Volatility3 포렌식
-│   ├── ai_analyzer.py        # Ollama 기반 AI 행위 분석 (qwen2.5:7b)
+│   ├── ai_analyzer.py        # AI 행위 분석 (NVIDIA NIM / Ollama 공통)
 │   ├── config_loader.py      # config.json 로더
+│   ├── baseline.py           # 환경 노이즈 베이스라인 수집·저장·차감
 │   └── vm_setup.py           # 캡처 최적화 레지스트리 정책 자동 적용
 │
 ├── parsers/
@@ -306,7 +402,8 @@ dynamic_analyzer/
 │   └── pesieve_result.py     # pe-sieve / hollows-hunter JSON 파싱
 │
 ├── analysis/
-│   ├── noise_filter.py       # 시스템·분석 도구 노이즈 제거
+│   ├── noise_filter.py       # 시스템·분석 도구 노이즈 제거 (이벤트 단위)
+│   ├── relevance.py          # 관련도 3단계 등급 (계보/의심/배경) 부여
 │   ├── behavior_classifier.py # MITRE ATT&CK 매핑
 │   ├── ioc_extractor.py      # IOC 추출 (SMTP/FTP C2 IP 포함)
 │   ├── process_network_map.py # 프로세스↔네트워크 연결 매핑

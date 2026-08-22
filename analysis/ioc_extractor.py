@@ -104,13 +104,17 @@ def _is_noisy_domain(domain: str) -> bool:
 # Executable / script extensions that indicate a dropped payload
 _DROPPED_EXTENSIONS: frozenset[str] = frozenset({
     # PE 실행 파일
-    ".exe", ".dll", ".scr", ".com", ".pif",
+    ".exe", ".dll", ".scr", ".com", ".pif", ".sys", ".ocx", ".cpl", ".ax",
     # 스크립트
-    ".bat", ".ps1", ".vbs", ".js", ".hta", ".wsf", ".jse", ".vbe",
+    ".bat", ".ps1", ".vbs", ".js", ".hta", ".wsf", ".jse", ".vbe", ".cmd",
     # 인스톨러 / 링크
-    ".msi", ".lnk",
+    ".msi", ".lnk", ".url",
     # 임시 파일 (temp→exe rename 패턴)
     ".tmp",
+    # 암호화 페이로드 / 설정 — DLL 사이드로딩 체인의 3번째 파일.
+    # 실행 파일과 DLL 옆에 함께 떨어져 DLL 이 읽어 복호화하는 용도로 쓰인다.
+    # 확장자만 보고 무해하다고 판단하면 체인의 핵심을 놓친다.
+    ".dat", ".bin", ".pmt", ".enc", ".pak", ".blob", ".cfg", ".db", ".cache",
 })
 
 # WriteFile 대상: 기존 시스템 파일 쓰기는 대부분 정상 업데이트이므로 제외

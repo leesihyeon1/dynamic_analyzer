@@ -69,6 +69,7 @@ class ProcMonController:
         self.csv_path: Path = self.output_dir / "procmon.csv"
 
         self._proc: subprocess.Popen | None = None
+        self.export_error: str = ""   # export_csv() 실패 원인 (호출부가 확인)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -140,21 +141,54 @@ class ProcMonController:
                     pass
             return False
 
-    def export_csv(self) -> bool:
+    def export_timeout_for(self, pml_bytes: int) -> int:
+        """PML 크기에 맞춘 CSV 변환 타임아웃(초).
+
+        수백만 이벤트짜리 로그는 변환에 수 분이 걸린다. 고정 60초로는
+        대용량 캡처에서 반드시 실패하므로 크기에 비례해 늘린다.
+        기준: 100MB 당 약 120초, 최소 300초 · 최대 1800초.
+        """
+        mb = max(pml_bytes, 0) / (1024 * 1024)
+        return int(min(max(300, 120 * (mb / 100) + 120), 1800))
+
+    def export_csv(self, timeout: int | None = None) -> bool:
         """Export the captured .pml log to CSV.
 
         Opens the backing file via ProcMon and instructs it to save a CSV
-        representation.  Blocks for up to 60 seconds.
+        representation.
+
+        타임아웃은 PML 크기에 따라 자동 산정된다(``timeout`` 으로 상한 지정 가능).
+        실패 원인은 :attr:`export_error` 에 남는다 — 호출부가 반드시 확인할 것.
+        변환이 중간에 끊기면 ProcMon 이 잘린 CSV 를 남기므로, 호출부가
+        ``csv_path.exists()`` 만 보고 성공으로 오인하지 않도록 사전에 삭제한다.
 
         Returns
         -------
         bool
-            *True* if the CSV was produced, *False* otherwise.
+            *True* if a non-empty CSV was produced, *False* otherwise.
         """
+        self.export_error = ""
         if not self.available:
+            self.export_error = "ProcMon 실행 파일을 찾을 수 없음"
             return False
         if not self.pml_path.exists():
+            self.export_error = f"PML 로그 없음: {self.pml_path}"
             return False
+
+        pml_size = self.pml_path.stat().st_size
+        if pml_size == 0:
+            self.export_error = "PML 로그가 비어 있음 (캡처가 시작되지 않았을 수 있음)"
+            return False
+
+        # 이전 실행이나 중단된 변환이 남긴 CSV 제거 —
+        # 남아 있으면 변환 실패를 '이벤트 0건'으로 오인하게 된다.
+        try:
+            if self.csv_path.exists():
+                self.csv_path.unlink()
+        except Exception:
+            pass
+
+        tmo = timeout or self.export_timeout_for(pml_size)
         try:
             result = subprocess.run(
                 [
@@ -167,8 +201,34 @@ class ProcMonController:
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=60,
+                timeout=tmo,
             )
-            return result.returncode == 0
-        except Exception:
+        except subprocess.TimeoutExpired:
+            self.export_error = (
+                f"CSV 변환 타임아웃 ({tmo}초, PML {pml_size / 1024 / 1024:.0f}MB). "
+                f"--timeout 을 줄여 캡처량을 낮추거나 ProcMon 필터를 좁히세요."
+            )
+            # 잘린 CSV 는 0건으로 오인되므로 제거
+            try:
+                if self.csv_path.exists():
+                    self.csv_path.unlink()
+            except Exception:
+                pass
             return False
+        except Exception as exc:
+            self.export_error = f"CSV 변환 실행 실패: {exc}"
+            return False
+
+        if result.returncode != 0:
+            self.export_error = f"ProcMon 종료 코드 {result.returncode}"
+            return False
+        if not self.csv_path.exists():
+            self.export_error = "변환은 끝났으나 CSV 파일이 생성되지 않음"
+            return False
+        if self.csv_path.stat().st_size < 200:      # 헤더만 있는 수준
+            self.export_error = (
+                f"CSV 가 비어 있음 ({self.csv_path.stat().st_size}바이트) — "
+                f"ProcMon 필터가 모든 이벤트를 걸렀을 수 있습니다."
+            )
+            return False
+        return True

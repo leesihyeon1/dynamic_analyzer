@@ -28,6 +28,26 @@ _DEFAULTS: dict = {
         "api_key": "",
         "timeout": 20,
     },
+    "ai": {
+        # provider: auto(NVIDIA 우선 → Ollama 폴백) | nvidia | ollama
+        "enabled":  True,
+        "provider": "auto",
+        "timeout":  600,
+        "nvidia": {
+            "base_url":         "https://integrate.api.nvidia.com/v1",
+            "model":            "qwen/qwen2.5-72b-instruct",
+            # 권장: 환경변수 NVIDIA_API_KEY 사용 (여기 평문 저장 금지)
+            "api_key":          "",
+            "max_prompt_chars": 40000,
+            # 0 = 모델 종류에 따라 자동 (일반 4096 / reasoning 16384)
+            "max_tokens":       0,
+        },
+        "ollama": {
+            "base_url":         "http://localhost:11434",
+            "model":            "auto",   # auto: 실행 중인 모델 자동 감지
+            "max_prompt_chars": 10000,
+        },
+    },
     "hunt": {
         "serve_port": 18080,
         "services": {
@@ -100,3 +120,8 @@ def load_config(path: str | Path | None = None) -> dict:
 def get_hunt_cfg(path: str | Path | None = None) -> dict:
     """Hunt 탭 설정(hunt 섹션)만 반환합니다."""
     return load_config(path)["hunt"]
+
+
+def get_ai_cfg(path: str | Path | None = None) -> dict:
+    """AI 분석 설정(ai 섹션)만 반환합니다."""
+    return load_config(path)["ai"]

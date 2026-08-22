@@ -38,3 +38,16 @@ desktop.ini
 *.tmp
 *.bak
 *.log
+
+# ── 자격증명 · 호스트별 산출물 (커밋 금지) ──────────────────────
+# config.json 에는 VirusTotal / NVIDIA API 키가 평문으로 들어갑니다.
+# 저장소에는 config.example.json 만 두고 실제 설정은 로컬에만 둡니다.
+config.json
+
+# 베이스라인은 VM 별 환경 프로파일 — 호스트명·경로·내부 IP 를 담습니다.
+baseline/
+
+# 분석 산출물
+*.html
+*_dynamic_report.json
+dumps/

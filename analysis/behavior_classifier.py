@@ -20,6 +20,7 @@ class MitreTechnique:
     evidence:       list[str] = field(default_factory=list)
     reference:      str = ""
     sources:        list[str] = field(default_factory=list)
+    relevance_tier: int = 0   # 1=샘플 계보 2=상관 의심 3=환경 배경 (analysis.relevance)
 
 
 @dataclass
@@ -197,6 +198,50 @@ _REG_RUN_KEYS: tuple[str, ...] = (
 )
 
 
+# ── T1543.003 (Windows Service) 판정 ─────────────────────────────────────────
+# "\services\" 부분 문자열만 보면 서비스 생성과 무관한 키가 대량으로 걸린다.
+# 특히 BAM/DAM(Background/Desktop Activity Moderator)은 프로그램이 실행될
+# 때마다 커널이 실행 기록을 남기는 곳이라, 정상 실행조차 "서비스 생성"으로
+# 오탐된다. 실제 서비스 등록·변경을 나타내는 값 이름일 때만 매핑한다.
+
+# 서비스 생성/변경을 실제로 나타내는 값 이름
+_SERVICE_PERSIST_VALUES: frozenset[str] = frozenset({
+    "imagepath", "servicedll", "start", "type", "objectname",
+    "displayname", "failureactions", "servicemain", "delayedautostart",
+    "requiredprivileges", "userservicedll",
+})
+
+# 서비스 하위지만 등록 행위가 아닌 경로 (실행 기록·네트워크 설정·PnP 등)
+_SERVICE_NOISE_FRAGMENTS: tuple[str, ...] = (
+    "\\services\\bam\\",        # Background Activity Moderator — 실행 기록
+    "\\services\\dam\\",        # Desktop Activity Moderator
+    "\\services\\tcpip\\", "\\services\\tcpip6\\",
+    "\\services\\netbt\\",
+    "\\services\\dnscache\\",
+    "\\services\\lanmanserver\\", "\\services\\lanmanworkstation\\",
+    "\\services\\policies\\",
+    "\\linkage\\", "\\enum\\", "\\security\\", "\\performance\\",
+)
+
+
+def _is_service_persistence_key(path_lower: str) -> bool:
+    """레지스트리 경로가 실제 Windows 서비스 등록·변경을 나타내면 True."""
+    if "\\services\\" not in path_lower:
+        return False
+    if any(frag in path_lower for frag in _SERVICE_NOISE_FRAGMENTS):
+        return False
+
+    tail = path_lower.split("\\services\\", 1)[1].strip("\\")
+    if not tail:
+        return False
+
+    leaf = tail.rsplit("\\", 1)[-1]
+    if leaf in _SERVICE_PERSIST_VALUES:
+        return True
+    # Services\<새이름> 키 자체의 생성도 서비스 등록 신호
+    return "\\" not in tail
+
+
 def _classify_registry_events(
     events: list[ProcMonEvent],
     reg_diff: dict,
@@ -218,7 +263,7 @@ def _classify_registry_events(
             )
             report.suspicious_registry.append(path)
 
-        if "\\services\\" in lower:
+        if _is_service_persistence_key(lower):
             _add_evidence(
                 technique_map, "T1543.003",
                 "Windows Service", "Persistence",
@@ -530,6 +575,8 @@ def _classify_injection(
     report: BehaviorReport,
 ) -> None:
     """Map hollows-hunter / pe-sieve findings to MITRE T1055 injection techniques."""
+    from core.process_tracker import _ANALYSIS_TOOL_PROC_NAMES
+
     seen_pids: set[int] = set()
 
     def _handle(r) -> None:
@@ -542,6 +589,11 @@ def _classify_injection(
         seen_pids.add(pid)
 
         pname        = getattr(r, "name", "") or f"PID {pid}"
+        # 분석 도구 자신(hollows_hunter.exe, pe-sieve.exe, procmon.exe 등)은
+        # 스캐너가 자기 메모리를 훑으며 남기는 아티팩트를 주입으로 오탐한다.
+        # 리포트에 T1055/T1056 근거로 올라오면 안 되므로 여기서 제외한다.
+        if pname.lower() in _ANALYSIS_TOOL_PROC_NAMES:
+            return
         replaced     = getattr(r, "replaced", 0)
         implanted_pe = getattr(r, "implanted_pe", 0)
         implanted_shc = getattr(r, "implanted_shc", 0)
@@ -795,6 +847,20 @@ def _classify_network(
 # Shared helper
 # ---------------------------------------------------------------------------
 
+# 분석 도구가 자기 자신을 남긴 흔적 — 근거로 올리면 안 된다.
+# (예: Explorer 가 Temp 에 푼 Procmon64.exe 가 T1027 난독화 근거로 잡히는 문제)
+_ANALYSIS_ARTIFACT_TOKENS: tuple[str, ...] = (
+    "procmon", "procexp", "pe-sieve", "pe_sieve", "hollows_hunter",
+    "hollows-hunter", "systeminformer", "processhacker", "tshark",
+    "dumpcap", "wireshark", "zoomit", "winpmem", "volatility",
+)
+
+
+def _is_analysis_artifact_evidence(text: str) -> bool:
+    t = (text or "").lower()
+    return any(tok in t for tok in _ANALYSIS_ARTIFACT_TOKENS)
+
+
 def _add_evidence(
     technique_map: dict[str, MitreTechnique],
     technique_id: str,
@@ -805,6 +871,9 @@ def _add_evidence(
     source: str = "로컬룰",
     process: str = "",
 ) -> None:
+    # 분석 도구 흔적은 근거에서 제외 — 발생 프로세스와 대상 경로 모두 확인
+    if _is_analysis_artifact_evidence(process) or _is_analysis_artifact_evidence(evidence):
+        return
     if process and evidence:
         evidence = f"[{process}] {evidence}"
     if technique_id in technique_map:

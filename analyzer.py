@@ -170,6 +170,65 @@ def _list_interfaces() -> None:
         console.print(f"[red]인터페이스 조회 실패: {e}[/red]")
 
 
+def _list_ai_models(base_url: str = "", api_key: str = "") -> None:
+    """NVIDIA NIM 카탈로그의 사용 가능한 모델 목록 출력.
+
+    카탈로그는 수시로 바뀌므로 config.json 의 모델이 404 를 낼 때
+    실제 사용 가능한 ID 를 확인하는 용도.
+    """
+    from core.ai_analyzer import (
+        list_nvidia_models, resolve_nvidia_key, resolve_nvidia_model,
+        NVIDIA_BASE_URL, NVIDIA_API_KEY_ENV, is_chat_model,
+    )
+    from core.config_loader import get_ai_cfg
+
+    try:
+        _nv = (get_ai_cfg().get("nvidia") or {})
+    except Exception:
+        _nv = {}
+
+    base = (base_url or _nv.get("base_url", "") or NVIDIA_BASE_URL).rstrip("/")
+    key  = resolve_nvidia_key(api_key, _nv.get("api_key", ""))
+    if not key:
+        console.print(
+            f"[red]NVIDIA API 키가 없습니다.[/red]\n"
+            f"  환경변수 [bold]{NVIDIA_API_KEY_ENV}[/bold] 설정 또는 "
+            f"config.json 의 [bold]ai.nvidia.api_key[/bold] 를 채우세요."
+        )
+        return
+
+    console.print(f"[bold]NVIDIA NIM 카탈로그 조회[/bold] — {base}")
+    models = list_nvidia_models(base, key)
+    if not models:
+        console.print("[red]모델 목록을 가져오지 못했습니다 — 키 유효성/네트워크를 확인하세요.[/red]")
+        return
+
+    chat  = sorted(m for m in models if is_chat_model(m))
+    other = sorted(m for m in models if not is_chat_model(m))
+
+    console.print(f"\n[bold green]대화형 모델 ({len(chat)}개)[/bold green]")
+    for m in chat:
+        console.print(f"  {m}")
+    if other:
+        console.print(
+            f"\n[dim]비대화형(임베딩·리랭킹·비전 등) {len(other)}개는 생략 — "
+            f"AI 분석에 쓸 수 없습니다.[/dim]"
+        )
+
+    configured = _nv.get("model", "") or ""
+    picked, note = resolve_nvidia_model(base, key, configured)
+    console.print(
+        f"\n[bold]현재 설정[/bold]: {configured or '(없음)'}\n"
+        f"[bold]실제 사용[/bold]: {picked}"
+        + (f"\n[yellow]{note}[/yellow]" if note else "  [green](카탈로그에 존재)[/green]")
+    )
+    if note:
+        console.print(
+            "\n[dim]자동 대체는 매 실행마다 카탈로그를 조회합니다. "
+            "고정하려면 config.json 의 ai.nvidia.model 을 위 목록의 ID 로 바꾸세요.[/dim]"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="analyzer.py",
@@ -238,19 +297,39 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--vol-timeout", type=int, default=300, metavar="SEC",
                     help="Volatility3 플러그인당 타임아웃 (기본 300초)")
 
-    ag = p.add_argument_group("AI 분석 (Ollama 자동 감지)")
+    rg = p.add_argument_group("관련도 등급 · 베이스라인 차감")
+    rg.add_argument("--baseline-capture", action="store_true",
+                    help="베이스라인 수집 모드 — 샘플 없이 모니터링만 실행해 환경 배경 활동을 "
+                         "프로파일로 저장합니다. 이후 분석에서 자동 차감됩니다. "
+                         "예: python analyzer.py --baseline-capture --timeout 600")
+    rg.add_argument("--baseline", metavar="PATH", default="",
+                    help="사용할 베이스라인 파일 경로 (기본 baseline/<hostname>.json)")
+    rg.add_argument("--no-baseline", action="store_true",
+                    help="베이스라인 차감 비활성화 — 내장 OS 배경 프로파일만 사용")
+
+    ag = p.add_argument_group("AI 분석 (NVIDIA 우선 → Ollama 폴백)")
     ag.add_argument("--no-ai", action="store_true",
                     help="AI 분석 비활성화")
+    ag.add_argument("--ai-provider", choices=["auto", "nvidia", "ollama"], default="auto",
+                    help="AI 프로바이더 (기본 auto: NVIDIA 시도 후 실패 시 Ollama 폴백). "
+                         "외부 전송이 불가한 격리망에서는 ollama 로 고정하세요")
     ag.add_argument("--ai-model", metavar="MODEL", default="auto",
-                    help="Ollama 모델 이름 (기본 auto: 실행 중인 모델 자동 감지)")
+                    help="모델 이름 (기본 auto: NVIDIA는 config 기본값, Ollama는 실행 중인 모델 자동 감지)")
+    ag.add_argument("--ai-base-url", metavar="URL", default="",
+                    help="NVIDIA 엔드포인트 override (기본 https://integrate.api.nvidia.com/v1)")
+    ag.add_argument("--ai-api-key", metavar="KEY", default="",
+                    help="NVIDIA API 키. 미지정 시 환경변수 NVIDIA_API_KEY → config.json 순으로 조회")
     ag.add_argument("--ollama-url", metavar="URL", default="http://localhost:11434",
                     help="Ollama 서버 URL (기본 http://localhost:11434)")
-    ag.add_argument("--ai-timeout", type=int, default=600, metavar="SEC",
-                    help="AI 응답 타임아웃 초 (기본 600)")
+    ag.add_argument("--ai-timeout", type=int, default=0, metavar="SEC",
+                    help="AI 응답 타임아웃 초 (미지정 시 config.json ai.timeout, 기본 600)")
 
     # 유틸리티
     p.add_argument("--check-tools",      action="store_true", help="도구 설치 상태 확인 후 종료")
     p.add_argument("--list-interfaces",  action="store_true", help="tshark 인터페이스 목록 후 종료")
+    p.add_argument("--list-ai-models",   action="store_true",
+                   help="NVIDIA NIM 카탈로그의 사용 가능한 모델 목록 출력 후 종료 "
+                        "(모델 404 오류 시 실제 ID 확인용)")
 
     return p
 
@@ -266,6 +345,11 @@ def main() -> None:
 
     if args.list_interfaces:
         _list_interfaces()
+        sys.exit(0)
+
+    if getattr(args, "list_ai_models", False):
+        _list_ai_models(getattr(args, "ai_base_url", ""),
+                        getattr(args, "ai_api_key", ""))
         sys.exit(0)
 
     # ── scapy 가용성 확인 (PCAP 분석 필수) ──────────────────────
@@ -284,6 +368,24 @@ def main() -> None:
         if not sample_path.exists():
             console.print(f"[red][!] 파일 없음: {sample_path}[/red]")
             sys.exit(1)
+
+    # ── 베이스라인 수집 모드 ────────────────────────────────────
+    # 샘플 없이 모니터링만 돌려 환경 배경 활동을 프로파일로 저장한다.
+    # 샘플이 지정되면 악성 행위가 베이스라인에 섞여 이후 분석에서
+    # 진짜 악성 활동이 배경으로 강등되므로 거부한다.
+    if getattr(args, "baseline_capture", False):
+        if sample_path is not None:
+            console.print(
+                "[red][!] --baseline-capture 는 샘플과 함께 쓸 수 없습니다.[/red]\n"
+                "    샘플 행위가 베이스라인에 섞이면 이후 분석에서 악성 활동이\n"
+                "    환경 배경으로 강등됩니다. 샘플 인자 없이 실행하세요."
+            )
+            sys.exit(1)
+        args.no_ai = True   # 베이스라인 수집에 AI 해석은 불필요
+        console.print(
+            "[cyan][베이스라인] 수집 모드 — 샘플을 실행하지 않고 "
+            f"{args.timeout}초간 환경 배경 활동만 관측합니다.[/cyan]"
+        )
 
     # ── 외부 PCAP 검증 ──────────────────────────────────────────
     external_pcap = None
@@ -361,10 +463,16 @@ def main() -> None:
         dump_timeout      = getattr(args, "dump_timeout", 600),
         vol_plugin_timeout= getattr(args, "vol_timeout", 300),
         existing_dump     = getattr(args, "dump", None),
+        use_baseline      = not getattr(args, "no_baseline", False),
+        baseline_path     = getattr(args, "baseline", ""),
+        baseline_capture  = getattr(args, "baseline_capture", False),
         use_ai            = not getattr(args, "no_ai", False),
+        ai_provider       = getattr(args, "ai_provider", "auto"),
         ai_model          = getattr(args, "ai_model", "auto"),
+        ai_base_url       = getattr(args, "ai_base_url", ""),
+        ai_api_key        = getattr(args, "ai_api_key", ""),
         ollama_url        = getattr(args, "ollama_url", "http://localhost:11434"),
-        ai_timeout        = getattr(args, "ai_timeout", 600),
+        ai_timeout        = getattr(args, "ai_timeout", 0),
     )
 
     def on_status(msg: str) -> None:

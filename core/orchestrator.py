@@ -279,11 +279,18 @@ class AnalysisConfig:
     dump_timeout:     int  = 600          # 메모리 덤프 타임아웃 (초)
     vol_plugin_timeout: int = 300         # 플러그인당 타임아웃 (초)
     existing_dump:    Optional[str] = None  # 기존 덤프 재사용
+    # ── 관련도 등급 / 베이스라인 옵션 ────────────────────────────────
+    use_baseline:     bool = True          # 베이스라인 차감 사용
+    baseline_path:    str  = ""            # 미지정 시 baseline/<hostname>.json
+    baseline_capture: bool = False         # 베이스라인 수집 모드 (샘플 없이 실행)
     # ── AI 분석 옵션 ─────────────────────────────────────────────────
-    use_ai:       bool = True               # Ollama AI 분석 사용
-    ai_model:     str  = "auto"            # Ollama 모델 이름 (auto: 실행 중인 모델 자동 감지)
+    use_ai:       bool = True              # AI 분석 사용
+    ai_provider:  str  = "auto"            # auto(NVIDIA 우선→Ollama 폴백) | nvidia | ollama
+    ai_model:     str  = "auto"            # 모델 이름 (auto: 프로바이더 기본/자동감지)
+    ai_base_url:  str  = ""                # NVIDIA 엔드포인트 override (미지정 시 config.json)
+    ai_api_key:   str  = ""                # NVIDIA API 키 (미지정 시 env → config.json)
     ollama_url:   str  = "http://localhost:11434"
-    ai_timeout:   int  = 600               # AI 응답 타임아웃 (초)
+    ai_timeout:   int  = 0                 # AI 응답 타임아웃 (초). 0 이면 config.json ai.timeout
 
 
 @dataclass
@@ -306,7 +313,9 @@ class AnalysisResult:
     start_time:         float = 0.0
     end_time:           float = 0.0
     sample_pid:         Optional[int] = None
-    all_pids:           set   = field(default_factory=set)    # 샘플 + 자식 PID
+    all_pids:           set   = field(default_factory=set)    # 이벤트 수집 포커스 PID (주입 탐지·실시간 감지 포함)
+    lineage_pids:       set   = field(default_factory=set)    # 샘플 계보 — 샘플 + 실제 자손만 (Tier 1 기준)
+    injected_pids:      set   = field(default_factory=set)    # HH/pe-sieve 주입 탐지 PID (오탐 비중 높음 → Tier 2)
     errors:             list  = field(default_factory=list)
     process_network_map: list = field(default_factory=list)  # list[ProcNetConnection]
     pe_sieve_results:   list  = field(default_factory=list)    # list[PeSieveResult] — 신규 프로세스별 스캔
@@ -322,6 +331,13 @@ class AnalysisResult:
     dns_attributed:     list  = field(default_factory=list)   # list[AttributedDnsQuery]
     # ── AI 분석 결과 ─────────────────────────────────────────────────
     ai_analysis:        dict  = field(default_factory=dict)   # AiAnalysisResult dict
+    yara_result:        object = None                         # YaraScanResult
+    packer_findings:    list  = field(default_factory=list)   # 패커/인스톨러 식별
+    masquerade_findings: list = field(default_factory=list)   # 정상 구성요소 사칭 의심
+    sideload_findings:  list  = field(default_factory=list)   # DLL 사이드로딩 탐지 결과
+    injection_findings: list  = field(default_factory=list)   # 주입 탐지 + 신뢰도 (HIGH/MEDIUM/LOW)
+    relevance_counts:   dict  = field(default_factory=dict)   # {항목종류: {tier: 개수}}
+    baseline_info:      dict  = field(default_factory=dict)   # 적용된 베이스라인 메타
     # ── 프로세스 행위 역색인 ─────────────────────────────────────────
     process_behaviors:  dict  = field(default_factory=dict)   # dict[int, ProcessBehavior]
     # ── 샘플 활성 여부 판정 ──────────────────────────────────────────
@@ -459,7 +475,7 @@ def run_analysis(
     from core.tls_keylog              import TLSKeyLogger
     from core.fakenet_integrator      import FakeNetIntegrator, fakenet_result_to_dict
     from core.memory_forensics        import run_memory_forensics, memforensics_to_dict, find_winpmem, find_volatility3
-    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict, detect_model, merge_ai_mitre
+    from core.ai_analyzer             import select_analyzer, ai_analysis_to_dict, merge_ai_mitre
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     _early_cfg  = _load_cfg_early()
@@ -599,6 +615,7 @@ def run_analysis(
                 )
                 result.sample_pid = sample_proc.pid
                 result.all_pids.add(sample_proc.pid)
+                result.lineage_pids.add(sample_proc.pid)
                 _klog_note = f" + SSLKEYLOGFILE 주입" if tls_keylogger else ""
                 status(f"      PID: {sample_proc.pid}{_klog_note}")
         except Exception as e:
@@ -801,8 +818,14 @@ def run_analysis(
     # ProcMon 중지 + CSV 변환
     if result.tools_used["procmon"]:
         pm.stop()
-        status("      ProcMon 로그 변환 중...")
-        pm.export_csv()
+        status("      ProcMon 로그 변환 중... (대용량 캡처는 수 분 걸릴 수 있습니다)")
+        if not pm.export_csv():
+            _pmerr = getattr(pm, "export_error", "") or "알 수 없는 원인"
+            # 조용히 넘어가면 이벤트 0건으로 분석이 진행돼 샘플 행위가
+            # 통째로 빠진 리포트가 나온다. 반드시 오류로 남긴다.
+            result.errors.append(f"ProcMon CSV 변환 실패: {_pmerr}")
+            status(f"      [오류] ProcMon CSV 변환 실패 — {_pmerr}")
+            status("      [경고] 파일·레지스트리·프로세스 생성 이벤트가 리포트에서 누락됩니다")
 
     # tshark 중지 (duration으로 자동 종료됐을 수 있음)
     if result.tools_used["tshark"]:
@@ -877,20 +900,37 @@ def run_analysis(
     status("[분석] ProcMon CSV 파싱...")
     if pm.csv_path.exists():
         result.procmon_events = parse_csv(pm.csv_path)
-        # 자식 PID 추적
+        # 자식 PID 추적 — 샘플 계보(lineage)를 별도로 보존한다.
+        # all_pids 는 아래에서 주입 탐지·실시간 감지 PID 로 확장되며 오탐이
+        # 섞일 수 있지만, lineage_pids 는 "샘플에서 실제로 뻗어나온 프로세스"
+        # 만 담아 관련도 등급(Tier 1) 판정의 기준이 된다.
         if result.sample_pid:
+            result.lineage_pids.add(result.sample_pid)
             child_pids = pm_child_pids(result.procmon_events, result.sample_pid)
+            result.lineage_pids.update(child_pids)
             result.all_pids.update(child_pids)
         # HH / pe-sieve 가 탐지한 인젝션 대상 프로세스 PID 도 포커스에 포함
         # (악성코드가 기존 프로세스에 쉘코드를 주입하면 그 PID 의 파일·레지스트리
         #  이벤트가 focus_pids 에서 제외되어 탭에 아무것도 안 보이는 문제 방지)
+        #
+        # 단, 이 PID 들은 오탐 비중이 높다(정상 프로세스의 .NET JIT/ASLR 영역).
+        # all_pids 에는 넣어 이벤트를 수집하되 아래 BFS 시드로는 쓰지 않는다.
+        # 시드로 쓰면 dwm/explorer/svchost 오탐 하나가 그 자손 전체
+        # (Conhost·wevtutil 수십 개)를 신규 프로세스 목록에 끌어들인다.
+        _injected_pids: set[int] = set()
         if result.hh_result and not result.hh_result.error:
             for _hpr in result.hh_result.suspicious_processes:
                 if _hpr.implanted_shc > 0 or _hpr.implanted_pe > 0:
-                    result.all_pids.add(_hpr.pid)
+                    if (_hpr.name or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
+                        continue          # 분석 도구 자기 탐지 제외
+                    _injected_pids.add(_hpr.pid)
         for _psr in result.pe_sieve_results:
             if not _psr.error and (_psr.implanted_shc > 0 or _psr.implanted_pe > 0):
-                result.all_pids.add(_psr.pid)
+                if (getattr(_psr, "name", "") or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
+                    continue
+                _injected_pids.add(_psr.pid)
+        result.injected_pids.update(_injected_pids)
+        result.all_pids.update(_injected_pids)
         # ProcessWatcher 가 실시간 감지한 PID 를 all_pids 에 추가.
         # after-snapshot 이전에 종료된 단명 프로세스(PowerShell 로더, 인젝터 등)는
         # process_diff["new_processes"] 에 포함되지 않으므로 여기서 보완.
@@ -964,11 +1004,17 @@ def run_analysis(
             if _pid in _child_by_pid:
                 _add_proc(_child_by_pid[_pid])
 
-        # Step 2: 보완된 프로세스를 포함한 all_pids 에서 BFS로 추가 자손 발굴
+        # Step 2: 샘플 계보에서 BFS로 추가 자손 발굴
         # _visited 는 new_proc_pids 기준으로 초기화 (all_pids 를 넣으면 Step 1 이후
         # 보완된 PID 를 BFS 가 다시 건너뛰는 문제가 생기므로 분리)
+        #
+        # 시드는 lineage_pids(샘플 계보)로 한정한다. all_pids 를 시드로 쓰면
+        # HH/pe-sieve 가 오탐한 정상 프로세스(explorer, svchost, dwm 등)의
+        # 자손 전체가 신규 프로세스 목록에 딸려 들어온다.
+        # 계보를 특정할 수 없는 ShellExecute 모드에서만 all_pids 로 폴백.
         _visited: set[int] = set(_new_proc_pids)
-        _queue: list[int]  = list(result.all_pids)
+        _bfs_seed: set[int] = result.lineage_pids or result.all_pids
+        _queue: list[int]  = list(_bfs_seed)
 
         while _queue:
             _pid = _queue.pop()
@@ -977,6 +1023,10 @@ def run_analysis(
                     continue
                 _visited.add(_ci.child_pid)
                 _queue.append(_ci.child_pid)
+                # 시드가 샘플 계보이므로 BFS 로 발견한 자손도 계보에 속한다
+                if result.lineage_pids and _pid in result.lineage_pids:
+                    result.lineage_pids.add(_ci.child_pid)
+                    result.all_pids.add(_ci.child_pid)
                 if _ci.child_pid not in _new_proc_pids:
                     _add_proc(_ci)
 
@@ -1319,6 +1369,172 @@ def run_analysis(
     except Exception as _bpe:
         result.errors.append(f"프로세스 행위 맵 실패: {_bpe}")
 
+    # ── YARA 스캔 ────────────────────────────────────────────────────
+    # 지금까지 run_yara_scan() 이 호출되지 않아 리포트에 항상
+    # "실행되지 않음" 이 찍혔다. 샘플 + 드롭 파일을 대상으로 스캔한다.
+    try:
+        from analysis.yara_scanner import run_yara_scan
+        _drops_for_yara = list(getattr(result.ioc_report, "dropped_files", []) or [])
+        result.yara_result = run_yara_scan(
+            config.sample_path, _drops_for_yara[:300]
+        )
+        _yr = result.yara_result
+        if not _yr.available:
+            result.tools_used["yara"] = f"미실행 ({_yr.error})"
+            status(f"[YARA] 건너뜀 — {_yr.error}")
+        elif _yr.error:
+            result.tools_used["yara"] = f"오류: {_yr.error}"
+            status(f"[YARA] 오류 — {_yr.error}")
+        else:
+            result.tools_used["yara"] = (
+                f"{len(_yr.matches)}건 매치 (룰 {_yr.rules_loaded}개)"
+            )
+            status(f"[YARA] 룰 {_yr.rules_loaded}개 로드, "
+                   f"{len(_yr.files_scanned)}개 파일 스캔 → {len(_yr.matches)}건 매치")
+            for _m in _yr.matches[:5]:
+                status(f"      {_m.rule_name} ← {Path(_m.file_scanned).name}")
+    except Exception as _ye:
+        result.errors.append(f"YARA 스캔 실패: {_ye}")
+        result.tools_used["yara"] = f"오류: {_ye}"
+        status(f"      [오류] YARA 스캔 실패: {_ye}")
+
+    # ── 드로퍼 프로파일링 (패커·사칭 이름) ───────────────────────────
+    try:
+        from analysis.artifact_intel import (
+            detect_packers, detect_masquerading, add_masquerade_techniques,
+        )
+        result.packer_findings = detect_packers(
+            result.ioc_report, result.process_diff.get("new_processes", []),
+        )
+        result.masquerade_findings = detect_masquerading(
+            result.ioc_report, result.process_diff.get("new_processes", []),
+            lineage_pids=result.lineage_pids,
+        )
+        if result.packer_findings:
+            _pk = ", ".join(f"{p['name']}({p['confidence']})" for p in result.packer_findings[:3])
+            status(f"[아티팩트] 패커/인스톨러 식별: {_pk}")
+        if result.masquerade_findings:
+            _mq = add_masquerade_techniques(
+                result.behavior_report, result.masquerade_findings
+            )
+            status(f"[아티팩트] 사칭 의심 파일 {len(result.masquerade_findings)}건 "
+                   f"→ T1036 매핑 {_mq}건")
+            for _m in result.masquerade_findings[:3]:
+                status(f"      {_m['confidence']} {_m['path']} — {_m['reason']}")
+    except Exception as _ae:
+        result.errors.append(f"아티팩트 프로파일링 실패: {_ae}")
+        status(f"      [오류] 아티팩트 프로파일링 실패: {_ae}")
+
+    # ── DLL 사이드로딩 탐지 ──────────────────────────────────────────
+    # ProcMon 의 Load Image 이벤트에 "어느 프로세스가 어느 경로의 DLL 을
+    # 로드했는가" 가 남는다. 드롭된 DLL 을 실행 파일과 같은 비시스템
+    # 디렉터리에서 로드하면 사이드로딩으로 판정한다.
+    try:
+        from analysis.sideload_detector import (
+            detect_sideloading, sideload_to_dict, add_sideload_techniques,
+        )
+        _sl = detect_sideloading(
+            result.filtered_events or result.procmon_events,
+            lineage_pids  = result.lineage_pids,
+            new_processes = result.process_diff.get("new_processes", []),
+        )
+        result.sideload_findings = [sideload_to_dict(f) for f in _sl]
+        if _sl:
+            _added = add_sideload_techniques(result.behavior_report, _sl)
+            _hi = sum(1 for f in _sl if f.confidence == "HIGH")
+            status(f"[사이드로딩] {len(_sl)}건 탐지 (HIGH {_hi}건) → T1574.002 매핑 {_added}건")
+            for _f in _sl[:3]:
+                status(f"      {_f.confidence} {_f.summary()}")
+    except Exception as _sle:
+        result.errors.append(f"사이드로딩 탐지 실패: {_sle}")
+        status(f"      [오류] 사이드로딩 탐지 실패: {_sle}")
+
+    # ── 샘플 프로세스 항목 보장 ──────────────────────────────────────
+    # 샘플이 스냅샷 수집 전에 종료되면 process_diff 에 안 잡히고,
+    # ProcMon CSV 변환까지 실패하면 Process Create 보완도 동작하지 않아
+    # 정작 분석 대상인 샘플이 리포트에서 통째로 사라진다.
+    # 실행 시점에 PID·경로를 이미 알고 있으므로 여기서 반드시 채워 넣는다.
+    if result.sample_pid and config.sample_path:
+        _np_list = result.process_diff.setdefault("new_processes", [])
+        if not any(getattr(p, "pid", None) == result.sample_pid for p in _np_list):
+            from core.process_tracker import ProcessSnapshot as _PS
+            _np_list.insert(0, _PS(
+                pid         = result.sample_pid,
+                ppid        = 0,
+                name        = config.sample_path.name,
+                exe         = str(config.sample_path),
+                cmdline     = [config.sample_path.name],
+                create_time = 0.0,
+                note        = "분석 대상 샘플 (스냅샷 미포착 — 조기 종료 추정)",
+            ))
+            result.lineage_pids.add(result.sample_pid)
+            status(f"      [보완] 샘플 프로세스 {config.sample_path.name} "
+                   f"(PID {result.sample_pid}) 를 프로세스 목록에 추가 "
+                   f"— 스냅샷에 없어 조기 종료로 추정됩니다")
+
+    # ── 관련도 등급 부여 (Tier 1/2/3) ────────────────────────────────
+    # 항목을 제거하지 않고 등급만 매긴다. 리포트가 등급에 따라 접는다.
+    # 베이스라인이 있으면 환경 배경(Windows Update·Defender 등)을 정확히
+    # Tier 3 으로 강등할 수 있고, 없으면 내장 OS 배경 프로파일로 폴백한다.
+    if config.baseline_capture:
+        # 베이스라인 수집 모드 — 등급 판정 없이 프로파일만 저장
+        try:
+            from core.baseline import capture_baseline, save_baseline
+            _bl   = capture_baseline(result, note="baseline-capture 모드 수집")
+            _path = save_baseline(_bl, config.baseline_path or None)
+            result.baseline_info = {
+                "mode": "capture", "path": str(_path),
+                "items": _bl.item_count(), "summary": _bl.summary(),
+            }
+            status(f"[베이스라인] 저장 완료 → {_path}")
+            status(f"      {_bl.summary()}")
+        except Exception as _ble:
+            result.errors.append(f"베이스라인 저장 실패: {_ble}")
+            status(f"      [오류] 베이스라인 저장 실패: {_ble}")
+    else:
+        try:
+            from core.baseline    import load_baseline
+            from analysis.relevance import build_context, annotate, summarize_counts
+
+            _bl = None
+            if config.use_baseline:
+                _bl = load_baseline(config.baseline_path or None)
+            if _bl is None:
+                if config.use_baseline:
+                    status("[관련도] 베이스라인 없음 — 내장 OS 배경 프로파일로 판정 "
+                           "(--baseline-capture 로 수집하면 정확도가 올라갑니다)")
+                result.baseline_info = {"mode": "builtin"}
+            else:
+                _stale = _bl.is_stale()
+                result.baseline_info = {
+                    "mode": "baseline", "host": _bl.host,
+                    "age_days": round(_bl.age_days, 1), "stale": _stale,
+                    "items": _bl.item_count(), "summary": _bl.summary(),
+                }
+                status(f"[관련도] 베이스라인 적용 ({_bl.host}, {_bl.age_days:.1f}일 전, "
+                       f"{_bl.item_count()}개 항목)")
+                if _stale:
+                    status("      [주의] 베이스라인이 오래되었습니다 — 재수집 권장")
+
+            _ctx = build_context(result, _bl)
+            result.relevance_counts = annotate(result, _ctx)
+            _summary = summarize_counts(result.relevance_counts)
+            if _summary:
+                status(f"      등급 (계보/의심/배경): {_summary}")
+
+            # 주입 탐지 신뢰도 판정 — 오탐을 지우지 않고 등급만 매긴다
+            from analysis.relevance import classify_injections
+            result.injection_findings = classify_injections(result, _ctx)
+            if result.injection_findings:
+                _ic = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+                for _f in result.injection_findings:
+                    _ic[_f["confidence"]] = _ic.get(_f["confidence"], 0) + 1
+                status(f"      주입 탐지 신뢰도: HIGH {_ic['HIGH']} / "
+                       f"MEDIUM {_ic['MEDIUM']} / LOW(오탐추정) {_ic['LOW']}")
+        except Exception as _rle:
+            result.errors.append(f"관련도 등급 부여 실패: {_rle}")
+            status(f"      [오류] 관련도 등급 부여 실패: {_rle}")
+
     # ── 메모리 포렌식 (Volatility3) ──────────────────────────────────
     if config.use_memdump:
         status("[메모리 포렌식] 시작 (winpmem + Volatility3)...")
@@ -1355,35 +1571,53 @@ def run_analysis(
             status(f"      [오류] {_me}")
             result.mem_forensics = {"error": f"실행 예외: {_me}"}
 
-    # ── AI 분석 (Ollama 자동 감지) ──────────────────────────────────
-    if config.use_ai:
-        _ollama_url = config.ollama_url
-        # 모델 자동 감지: 사용자가 명시하지 않았거나 기본값이면 실행 중인 모델 우선
-        _ai_model = config.ai_model
-        if not _ai_model or _ai_model == "auto":
-            _ai_model = detect_model(_ollama_url) or ""
-        if not _ai_model:
-            status(f"[AI 분석] Ollama 모델 없음 — 건너뜀 (ollama list 로 모델 확인)")
+    # ── AI 분석 (NVIDIA 우선 → Ollama 폴백) ─────────────────────────
+    _ai_cfg = _early_cfg.get("ai") or {}
+    if config.use_ai and _ai_cfg.get("enabled", True):
+        _nv_cfg = _ai_cfg.get("nvidia") or {}
+        _ol_cfg = _ai_cfg.get("ollama") or {}
+
+        _az, _notes = select_analyzer(
+            provider         = config.ai_provider or _ai_cfg.get("provider", "auto"),
+            nvidia_base_url  = config.ai_base_url or _nv_cfg.get("base_url", ""),
+            nvidia_model     = _nv_cfg.get("model", ""),
+            # 우선순위: --ai-api-key > 환경변수 NVIDIA_API_KEY > config.json
+            nvidia_api_key   = config.ai_api_key,
+            nvidia_cfg_key   = _nv_cfg.get("api_key", ""),
+            nvidia_max_chars = int(_nv_cfg.get("max_prompt_chars", 0) or 0),
+            nvidia_max_tokens= int(_nv_cfg.get("max_tokens", 0) or 0),
+            ollama_url       = config.ollama_url  or _ol_cfg.get("base_url", ""),
+            ollama_model     = _ol_cfg.get("model", "auto"),
+            ollama_max_chars = int(_ol_cfg.get("max_prompt_chars", 0) or 0),
+            # --ai-model 이 auto 면 프로바이더 기본값/자동감지에 맡긴다
+            model_override   = "" if (config.ai_model or "auto") == "auto" else config.ai_model,
+        )
+        for _n in _notes:
+            status(f"[AI 분석] {_n}")
+
+        if _az is None:
+            status("[AI 분석] 사용 가능한 프로바이더 없음 — 건너뜀")
         else:
-            _az = OllamaAnalyzer(base_url=_ollama_url, model=_ai_model)
-            if _az.is_available():
-                status(f"[AI 분석] Ollama {_ai_model} 호출 중…")
-                try:
-                    _ai = _az.analyze(result, timeout=config.ai_timeout)
-                    result.ai_analysis = ai_analysis_to_dict(_ai)
-                    if _ai.error:
-                        status(f"      [오류] {_ai.error}")
-                        result.errors.append(f"AI 분석: {_ai.error}")
-                    else:
-                        status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
-                        if _ai.mitre_techniques and result.behavior_report:
-                            merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
-                            status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
-                except Exception as _ae:
-                    result.errors.append(f"AI 분석 예외: {_ae}")
-                    status(f"      [오류] {_ae}")
+            if _az.provider == "nvidia":
+                status(f"[AI 분석] NVIDIA {_az.model} 호출 중… (프롬프트가 외부로 전송됩니다)")
             else:
-                status(f"[AI 분석] Ollama 서버 미실행 — 건너뜀 ({_ollama_url})")
+                status(f"[AI 분석] Ollama {_az.model} 호출 중…")
+            _ai_timeout = config.ai_timeout or int(_ai_cfg.get("timeout", 600) or 600)
+            try:
+                _ai = _az.analyze(result, timeout=_ai_timeout)
+                result.ai_analysis = ai_analysis_to_dict(_ai)
+                if _ai.error:
+                    status(f"      [오류] {_ai.error}")
+                    result.errors.append(f"AI 분석: {_ai.error}")
+                else:
+                    status(f"      AI 분석 완료 ({_az.provider}/{_ai.model}, "
+                           f"{_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
+                    if _ai.mitre_techniques and result.behavior_report:
+                        merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
+                        status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
+            except Exception as _ae:
+                result.errors.append(f"AI 분석 예외: {_ae}")
+                status(f"      [오류] {_ae}")
 
     # ── 샘플 활성 여부 최종 판정 ────────────────────────────────────────
     result.sample_active, result.inactivity_signals = _compute_activity_verdict(result)

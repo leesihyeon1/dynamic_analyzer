@@ -144,6 +144,56 @@ def _is_analysis_service_domain(domain: str) -> bool:
             return True
     return False
 
+
+# DNS 터널링 판정에서 제외할 베이스 도메인.
+# 이들은 정상적으로 서브도메인이 수십 개씩 뻗어 나가므로 "베이스 도메인당
+# 쿼리 수" 임계치를 늘 넘긴다. microsoft.com 하나 때문에 하위 도메인 20여 개가
+# 통째로 "의심"으로 찍히는 오탐을 막는다.
+# 주의: C2 가 이 도메인을 사칭할 수는 없다(실제 DNS 응답 기준). 다만 서브도메인
+# 탈취 가능성은 남으므로, 엔트로피/라벨 길이 기반 개별 판정은 그대로 적용된다.
+_TUNNEL_EXEMPT_BASES: frozenset[str] = frozenset({
+    "microsoft.com", "windows.com", "windowsupdate.com", "windows.net",
+    "msftconnecttest.com", "msftncsi.com", "msedge.net", "office.com",
+    "office.net", "live.com", "msn.com", "bing.com", "skype.com",
+    "akamai.net", "akamaiedge.net", "akadns.net", "edgekey.net",
+    "cloudflare.com", "cloudfront.net", "fastly.net", "gstatic.com",
+    "google.com", "googleapis.com", "apple.com", "icloud.com",
+    "digicert.com", "verisign.com", "globalsign.com", "sectigo.com",
+    "letsencrypt.org", "entrust.net", "in-addr.arpa", "ip6.arpa",
+})
+
+
+def _is_tunnel_exempt_base(base: str) -> bool:
+    b = (base or "").lower().rstrip(".")
+    return b in _TUNNEL_EXEMPT_BASES
+
+
+def _is_dns_tunnel_base(base: str, count: int) -> bool:
+    """베이스 도메인이 DNS 터널링 의심 대상인지.
+
+    단순 쿼리 수만 보면 CDN·업데이트 서비스가 전부 걸린다.
+    알려진 정상 베이스는 제외하고 임계치를 적용한다.
+    """
+    if _is_tunnel_exempt_base(base):
+        return False
+    return count >= DNS_TUNNEL_QUERY_THRESHOLD
+
+
+def _is_excluded_dns_name(name: str) -> bool:
+    """DGA/터널링 판정에서 제외할 DNS 이름이면 True.
+
+    PTR 역방향 조회(.in-addr.arpa / .ip6.arpa)는 OS·도구가 상시 발생시키는
+    노이즈이고, base domain 이 전부 "in-addr.arpa" 로 동일해 터널링 임계치를
+    쉽게 넘긴다. scapy 경로와 tshark 폴백 경로 양쪽에서 같은 기준을 쓴다.
+    """
+    n = name.lower().rstrip(".")
+    return (
+        n.endswith(".in-addr.arpa")
+        or n.endswith(".ip6.arpa")
+        or _is_analysis_service_domain(n)
+    )
+
+
 _QTYPE_MAP: dict[int, str] = {
     1: "A", 2: "NS", 5: "CNAME", 6: "SOA",
     12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA",
@@ -871,7 +921,11 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
 
             # DNS 쿼리
             dns_name = _f(8).rstrip(".")
-            if dns_name:
+            # PTR 레코드(.in-addr.arpa / .ip6.arpa)와 분석 서비스 도메인은
+            # DGA/터널링 판정 대상에서 제외한다. scapy 경로와 동일한 가드로,
+            # dns_base_cnt 집계 전에 걸러야 base domain "in-addr.arpa" 가
+            # 터널링 임계치를 넘겨 PTR 전체를 오탐하는 것을 막을 수 있다.
+            if dns_name and not _is_excluded_dns_name(dns_name):
                 raw_domains.add(dns_name)
                 dns_base_cnt[_base_domain(dns_name)] += 1
                 if dns_name not in dns_seen:
@@ -964,13 +1018,14 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
     for name, q in dns_seen.items():
         if (q.entropy >= DGA_ENTROPY_THRESHOLD
                 or len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN
-                or dns_base_cnt.get(_base_domain(name), 0) >= DNS_TUNNEL_QUERY_THRESHOLD):
+                or _is_dns_tunnel_base(_base_domain(name),
+                                       dns_base_cnt.get(_base_domain(name), 0))):
             q.suspicious = True
             suspicious_domains.append(name)
 
     dns_tunnel_suspects = [
         d for d, cnt in dns_base_cnt.items()
-        if cnt >= DNS_TUNNEL_QUERY_THRESHOLD
+        if _is_dns_tunnel_base(d, cnt)
     ]
 
     summary = PcapSummary(
@@ -1118,8 +1173,6 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                                 if isinstance(raw_name, bytes) else str(raw_name))
                         name = name.rstrip(".")
                         qtype_str = _QTYPE_MAP.get(int(qr.qtype), str(qr.qtype))
-                        raw_domains.add(name)
-                        dns_base_cnt[_base_domain(name)] += 1
 
                         # 프로세스 귀속용 raw 쿼리 — PTR·분석서비스 포함 모든 쿼리 기록
                         raw_dns_list.append(DnsRawQuery(
@@ -1128,12 +1181,16 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                             tx_id=getattr(dns_pkt, "id", 0) or 0,
                         ))
 
+                        # PTR·분석서비스 도메인은 집계 전에 제외한다.
+                        # dns_base_cnt 를 먼저 올리면 base domain "in-addr.arpa" 가
+                        # 터널링 임계치를 넘어 dns_tunnel_suspects 를 오염시킨다.
+                        _excluded = _is_excluded_dns_name(name)
+                        if not _excluded:
+                            raw_domains.add(name)
+                            dns_base_cnt[_base_domain(name)] += 1
+
                         if name not in dns_seen:
-                            # PTR 레코드(.in-addr.arpa / .ip6.arpa)와
-                            # 분석 서비스 도메인은 DGA/C2 판정 대상에서 제외
-                            if (name.endswith(".in-addr.arpa")
-                                    or name.endswith(".ip6.arpa")
-                                    or _is_analysis_service_domain(name)):
+                            if _excluded:
                                 raw_domains.discard(name)
                             else:
                                 ent = _subdomain_entropy(name)
@@ -1255,7 +1312,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     for name, q in dns_seen.items():
         is_dga     = q.entropy >= DGA_ENTROPY_THRESHOLD
         is_long    = len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN
-        is_tunnel  = dns_base_cnt.get(_base_domain(name), 0) >= DNS_TUNNEL_QUERY_THRESHOLD
+        is_tunnel  = _is_dns_tunnel_base(_base_domain(name), dns_base_cnt.get(_base_domain(name), 0))
         if is_dga or is_long or is_tunnel:
             q.suspicious = True
             suspicious_domains.append(name)
@@ -1263,7 +1320,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     # --- DNS 터널링 의심 베이스 도메인 ---
     dns_tunnel_suspects = [
         domain for domain, cnt in dns_base_cnt.items()
-        if cnt >= DNS_TUNNEL_QUERY_THRESHOLD
+        if _is_dns_tunnel_base(domain, cnt)
     ]
 
     # --- 비콘 탐지 ---

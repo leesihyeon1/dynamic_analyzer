@@ -1,0 +1,86 @@
+{
+  "_comment": "dynamic_analyzer 설정 파일 — 수정 후 다음 실행부터 적용됩니다",
+
+  "tools": {
+    "_comment": "pe-sieve / hollows-hunter 경로. 비워두면 PATH + 알려진 디렉터리에서 자동 탐색.",
+    "pe_sieve":       "",
+    "hollows_hunter": ""
+  },
+
+  "capa": {
+    "_comment": "CAPA 정적 분석 (https://github.com/mandiant/capa). FLARE VM에 기본 포함됨.",
+    "enabled": true,
+    "path": "capa.exe",
+    "timeout": 120
+  },
+
+  "virustotal": {
+    "_comment": "VirusTotal API v3. 무료 키: 4 req/분, 500 req/일. api_key 가 비어있으면 비활성화됩니다.",
+    "enabled": true,
+    "api_key": "",
+    "timeout": 20
+  },
+
+  "ai": {
+    "_comment": "AI 위협 분석. provider=auto 이면 NVIDIA 를 먼저 시도하고 실패 시 Ollama 로 폴백합니다.",
+    "_comment_privacy": "주의: nvidia 사용 시 프롬프트(파일 경로·프로세스명·C2 IP·해시)가 외부 클라우드로 전송됩니다. 외부 전송 불가 환경은 provider 를 'ollama' 로 고정하세요.",
+    "enabled": true,
+    "provider": "auto",
+    "timeout": 600,
+
+    "nvidia": {
+      "_comment": "NVIDIA NIM (OpenAI 호환). 무료 키 발급: https://build.nvidia.com — 크레딧/레이트리밋 정책은 사이트에서 확인하세요.",
+      "_comment_key": "api_key 는 비워두고 환경변수 NVIDIA_API_KEY 사용을 권장합니다 (설정 파일 평문 저장 방지). 우선순위: --ai-api-key > NVIDIA_API_KEY > 이 값.",
+      "_comment_model": "권장 qwen/qwen2.5-72b-instruct — 한국어 서술 품질이 가장 좋고 MITRE 파이프 형식을 안정적으로 지킵니다. 대안: meta/llama-3.3-70b-instruct(한국어 다소 번역투). 코드 특화 모델(*-coder-*)은 한국어 위협 서술에 부적합합니다.",
+      "_comment_model_auto": "NVIDIA 카탈로그는 수시로 바뀝니다. 여기 적힌 모델이 카탈로그에 없으면 매 실행마다 선호 순위(Qwen > Llama > Nemotron)에 따라 자동 대체되므로 404 로 죽지 않습니다. 실제 사용된 모델은 콘솔과 리포트에 표시됩니다. 사용 가능한 ID 확인: python analyzer.py --list-ai-models",
+      "_comment_reasoning": "deepseek-ai/deepseek-r1 등 reasoning 모델은 <think> 블록이 자동 제거되고 max_tokens 도 자동 상향(16384)됩니다. 실행 흐름 추론은 강하지만 응답이 느리고 크레딧 소모가 큽니다.",
+      "_comment_max_tokens": "0 이면 모델 종류에 따라 자동 결정 (일반 4096 / reasoning 16384).",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "model": "qwen/qwen2.5-72b-instruct",
+      "api_key": "",
+      "max_prompt_chars": 40000,
+      "max_tokens": 0
+    },
+
+    "ollama": {
+      "_comment": "로컬 폴백. 외부 전송이 전혀 없습니다. model=auto 이면 실행 중인 모델을 자동 감지합니다.",
+      "base_url": "http://localhost:11434",
+      "model": "auto",
+      "max_prompt_chars": 10000
+    }
+  },
+
+  "hunt": {
+    "_comment_serve": "serve_port > 0 이면 리포트를 http://127.0.0.1:PORT 로 서빙합니다 (CORS 문제 해소). 0 이면 file:// 직접 열기.",
+    "serve_port": 18080,
+
+    "services": {
+      "_comment": "enabled: false 로 설정하면 해당 서비스를 Hunt 탭에서 숨깁니다. url 을 프록시/미러로 교체 가능.",
+      "mb": {
+        "enabled": true,
+        "label": "MalwareBazaar",
+        "url": "https://mb-api.abuse.ch/api/v1/"
+      },
+      "tf": {
+        "enabled": true,
+        "label": "ThreatFox",
+        "url": "https://threatfox-api.abuse.ch/api/v1/"
+      },
+      "uh_url": {
+        "enabled": true,
+        "label": "URLhaus (URL)",
+        "url": "https://urlhaus-api.abuse.ch/v1/url/"
+      },
+      "uh_host": {
+        "enabled": true,
+        "label": "URLhaus (Host)",
+        "url": "https://urlhaus-api.abuse.ch/v1/host/"
+      },
+      "feodo": {
+        "enabled": true,
+        "label": "Feodo Tracker",
+        "url": "https://feodotracker.abuse.ch/api/v1/host_info/"
+      }
+    }
+  }
+}
