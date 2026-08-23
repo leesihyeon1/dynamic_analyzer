@@ -637,7 +637,8 @@ def parse_mitre_from_ai(response: str) -> list:
     })
     for line in response.split("\n"):
         stripped = line.strip()
-        if stripped == "마이터 기법 목록":
+        head     = _strip_heading_mark(stripped)
+        if head == "마이터 기법 목록":
             in_section = True
             continue
         if not in_section:
@@ -646,7 +647,7 @@ def parse_mitre_from_ai(response: str) -> list:
             break  # 빈 줄 = 섹션 끝
         if stripped == "없음":
             break
-        if stripped in _NEXT_SECTIONS:
+        if head in _NEXT_SECTIONS:
             break
         parts = [p.strip() for p in stripped.split("|")]
         if len(parts) >= 4:
@@ -1053,6 +1054,29 @@ _SECTION_TITLES = [
     "확인된 IOC", "결론", "마이터 기법 목록",
 ]
 
+# 모델이 프롬프트 형식을 무시하고 '## 실행 흐름' / '**결론**' 처럼 제목에
+# 마크다운 표식을 붙이는 경우가 있다. 맨 제목만 매칭하면 섹션을 전부 놓쳐
+# 리포트에서 사라지므로 표식을 허용한다.
+_HEAD_MARK = r"(?:#{1,6}[ \t]*(?:\*\*)?|\*\*)"
+_HEADING_MARK_RE = _re.compile(
+    r"^[ \t]{0,3}(?:#{1,6}[ \t]*)?(?:\*\*)?(.*?)\**[ \t]*:?[ \t]*$"
+)
+
+
+def _strip_heading_mark(line: str) -> str:
+    """제목 줄에서 마크다운 표식(#, **)과 후행 콜론을 제거한다."""
+    m = _HEADING_MARK_RE.match(line.strip())
+    return m.group(1).strip() if m else line.strip()
+
+
+def _section_boundary_re(titles: list) -> "_re.Pattern":
+    """표식을 허용하는 섹션 제목 경계 정규식."""
+    _pat = "|".join(_re.escape(t) for t in titles)
+    return _re.compile(
+        r"^[ \t]{0,3}" + _HEAD_MARK + r"?(" + _pat + r")\**[ \t]*:?[ \t]*$",
+        _re.MULTILINE,
+    )
+
 _TID_RE = _re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
 
 
@@ -1076,8 +1100,7 @@ def _expand_technique_ids(response: str, result) -> str:
     if not id2name:
         return response
 
-    _pat    = "|".join(_re.escape(t) for t in _SECTION_TITLES)
-    _splits = list(_re.finditer(rf"^({_pat})\s*$", response, _re.MULTILINE))
+    _splits = list(_section_boundary_re(_SECTION_TITLES).finditer(response))
     if not _splits:
         return response
 
@@ -1104,9 +1127,7 @@ def _replace_section(
     해당 섹션이 있으면 통째로 바꾸고, 없으면 fallback_before 섹션 앞에 삽입한다.
     할루시네이션 억제용 — 데이터로 확정할 수 있는 항목은 AI 판단을 쓰지 않는다.
     """
-    import re as _re2
-    _pat    = "|".join(_re2.escape(t) for t in _SECTION_TITLES)
-    _splits = list(_re2.finditer(rf"^({_pat})\s*$", ai_response, _re2.MULTILINE))
+    _splits = list(_section_boundary_re(_SECTION_TITLES).finditer(ai_response))
 
     for i, m in enumerate(_splits):
         if m.group(1) == title:
@@ -1128,6 +1149,9 @@ def _build_prompt(result, max_chars: int = _MAX_PROMPT_CHARS) -> str:
         "당신은 악성코드 동적 분석 전문가입니다.",
         "아래 동적 분석 데이터를 바탕으로 **한국어**로 구조화된 위협 분석 보고서를 작성하세요.",
         "대응 권고는 절대 작성하지 않습니다. 확인된 사실만 기술하고 추측은 '추정' 표현을 사용하세요.",
+        "섹션 제목은 아래 템플릿의 문구를 그대로 한 줄에 쓰십시오. 제목 줄에 #, *, - 를"
+        " 붙이지 마십시오. 하위 필드(위협 수준 등)는 제목으로 분리하지 말고"
+        " '필드명: 값' 한 줄로 쓰십시오.",
         "",
     ]
 

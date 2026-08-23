@@ -4104,7 +4104,13 @@ def _md_to_html(text: str) -> str:
 
 
 def _parse_ai_sections(text: str) -> dict:
-    """any.run 포맷 텍스트 → 섹션별 dict 파싱."""
+    """any.run 포맷 텍스트 → 섹션별 dict 파싱.
+
+    프롬프트는 맨 제목("실행 흐름")을 요구하지만 모델이 마크다운 표식을
+    붙이거나(`## 실행 흐름`, `**결론**`) '분석 분류' 하위 필드를 최상위
+    제목으로 평탄화해 내놓는 경우가 있다(NVIDIA NIM 등). 제목을 못 찾으면
+    해당 섹션이 리포트에서 통째로 사라지므로 두 형태를 모두 흡수한다.
+    """
     import re as _re
 
     SECTION_TITLES = [
@@ -4121,17 +4127,66 @@ def _parse_ai_sections(text: str) -> dict:
         "Behavioral analysis": "행위 분석",
         "Conclusion": "결론",
     }
+    # '분석 분류' 하위 필드. 마크다운 표식이 붙은 형태만 제목으로 인정한다 —
+    # 맨 줄 "설명" 은 다른 섹션 본문에도 나타나므로 경계로 쓰면 오분할된다.
+    FIELD_TITLES = [
+        "위협 수준", "주요 분석 대상", "패커 / 빌드", "설명", "태그 및 해석",
+        "Threat level", "Main analyzed object", "Packer / build",
+        "Description", "Tags & interpretation",
+    ]
+    FIELD_KO_MAP = {
+        "Threat level": "위협 수준",
+        "Main analyzed object": "주요 분석 대상",
+        "Packer / build": "패커 / 빌드",
+        "Description": "설명",
+        "Tags & interpretation": "태그 및 해석",
+    }
+    # 재조립 순서 — '태그 및 해석' 은 _render_classification 의 태그 블록
+    # 정규식이 뒤를 끝까지 훑으므로 반드시 마지막이어야 한다.
+    FIELD_ORDER = ["위협 수준", "주요 분석 대상", "패커 / 빌드", "설명", "태그 및 해석"]
 
-    # 섹션 경계 탐지
-    pattern = "|".join(_re.escape(t) for t in SECTION_TITLES)
-    splits = list(_re.finditer(rf"^({pattern})\s*$", text, _re.MULTILINE))
+    _main  = "|".join(_re.escape(t) for t in SECTION_TITLES)
+    _field = "|".join(_re.escape(t) for t in FIELD_TITLES)
+    _MARK  = r"(?:#{1,6}[ \t]*(?:\*\*)?|\*\*)"   # 마크다운 제목 표식
+
+    # 섹션 경계 탐지 — 표식은 선택(맨 제목 허용), 하위 필드는 표식 필수
+    boundary = _re.compile(
+        r"^[ \t]{0,3}" + _MARK + r"?(?P<main>"  + _main  + r")\**[ \t]*:?[ \t]*$"
+        r"|"
+        r"^[ \t]{0,3}" + _MARK + r"(?P<field>" + _field + r")\**[ \t]*:?[ \t]*$",
+        _re.MULTILINE,
+    )
+    splits = list(boundary.finditer(text))
 
     sections: dict[str, str] = {}
+    fields:   dict[str, str] = {}
     for i, m in enumerate(splits):
-        title = KO_MAP.get(m.group(1), m.group(1))
-        end   = splits[i + 1].start() if i + 1 < len(splits) else len(text)
-        body  = text[m.end():end].strip()
-        sections[title] = body
+        end  = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+        body = text[m.end():end].strip()
+        if m.group("main"):
+            sections[KO_MAP.get(m.group("main"), m.group("main"))] = body
+        else:
+            fields[FIELD_KO_MAP.get(m.group("field"), m.group("field"))] = body
+
+    # 평탄화된 하위 필드를 '분석 분류' 본문으로 재조립해 기존 렌더러에 넘긴다
+    if fields and not sections.get("분석 분류"):
+        rebuilt: list[str] = []
+        for label in FIELD_ORDER:
+            fbody = fields.get(label, "")
+            if not fbody:
+                continue
+            if label == "태그 및 해석":
+                rebuilt.append(f"{label}:\n{fbody}")
+                continue
+            first = next(
+                (ln.strip().lstrip("-•*").strip()
+                 for ln in fbody.splitlines() if ln.strip()),
+                "",
+            )
+            if first:
+                rebuilt.append(f"{label}: {first}")
+        if rebuilt:
+            sections["분석 분류"] = "\n".join(rebuilt)
 
     return sections
 
@@ -4147,6 +4202,8 @@ def _render_classification(body: str) -> str:
     threat   = _field("위협 수준") or _field("Threat level")
     obj      = _field("주요 분석 대상") or _field("Main analyzed object")
     desc     = _field("설명") or _field("Description")
+    packer   = (_field("패커 / 빌드") or _field("패커/빌드")
+                or _field("Packer / build") or _field("Packer/build"))
 
     # 위협 수준 색상
     tl = threat.lower()
@@ -4173,14 +4230,15 @@ def _render_classification(body: str) -> str:
             tm = _re.match(r"^\[?([a-zA-Z가-힣/_\-]+)\]?:\s*(.+)", tl_line)
             if tm:
                 badge = _e(tm.group(1).strip())
-                desc  = _e(tm.group(2).strip())
+                # 바깥 desc('설명' 필드) 를 덮어쓰지 않도록 별도 이름을 쓴다
+                tag_desc = _e(tm.group(2).strip())
                 tag_rows.append(
                     f"<div style='display:flex;align-items:flex-start;gap:.55rem;"
                     f"padding:.28rem 0;border-bottom:1px solid #21262d'>"
                     f"<span style='flex-shrink:0;background:#1f2d3d;border:1px solid #264466;"
                     f"border-radius:10px;padding:1px 9px;font-size:.7rem;color:#79c0ff;"
                     f"white-space:nowrap;margin-top:2px'>{badge}</span>"
-                    f"<span style='font-size:.82rem;color:#8b949e;line-height:1.5'>{desc}</span>"
+                    f"<span style='font-size:.82rem;color:#8b949e;line-height:1.5'>{tag_desc}</span>"
                     f"</div>"
                 )
         if tag_rows:
@@ -4190,6 +4248,14 @@ def _render_classification(body: str) -> str:
                 f"text-transform:uppercase;letter-spacing:.05em'>태그 및 해석</p>"
                 + "".join(tag_rows) + "</div>"
             )
+
+    # 패커는 값이 있을 때만 노출한다 — "미식별" 행을 항상 띄우면 잡음이 된다
+    packer_row = ""
+    if packer and packer.strip() not in ("미식별", "없음", "N/A", "-"):
+        packer_row = (
+            f"<tr><td style='color:#8b949e'>패커 / 빌드</td>"
+            f"<td class='mono' style='font-size:.85rem'>{_e(packer)}</td></tr>"
+        )
 
     return (
         f"<div class='card' style='margin-bottom:1rem'>"
@@ -4201,6 +4267,7 @@ def _render_classification(body: str) -> str:
         f"<table class='kv' style='margin-bottom:.4rem'>"
         f"<tr><td style='width:130px;color:#8b949e'>주요 분석 대상</td>"
         f"<td class='mono' style='font-size:.85rem'>{_e(obj)}</td></tr>"
+        f"{packer_row}"
         f"<tr><td style='color:#8b949e'>설명</td>"
         f"<td style='font-size:.85rem;line-height:1.6'>{_e(desc)}</td></tr>"
         f"</table>"
