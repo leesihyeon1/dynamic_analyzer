@@ -58,4 +58,3 @@ class DeliveryTests(unittest.TestCase):
             row=json.loads(f.read_text(encoding='utf-8'))['mitre_techniques'][0]
             self.assertEqual(row['evidence'],t.evidence)
             self.assertEqual(row['sources'],['ProcMon'])
-

@@ -627,7 +627,7 @@ async function _huntFeodo(ip) {
 _PG_INIT = """<script>
 window.addEventListener('load', function() {
   var tbls = [
-    'tbl-mitre','tbl-process','tbl-process-all',
+    'tbl-mitre','tbl-masq','tbl-sideload','tbl-process','tbl-process-all',
     'tbl-file',
     'tbl-reg-diff','tbl-reg-procmon',
     'tbl-net-beacon','tbl-net-tls','tbl-net-conn',
@@ -870,6 +870,247 @@ def _ext_integration_status_html(result) -> str:
     )
 
 
+# ── 관련도 등급 (analysis.relevance) ─────────────────────────────────────────
+
+_TIER_META: dict[int, tuple[str, str, str]] = {
+    # tier: (라벨, 색, 툴팁)
+    1: ("계보", "#f97583", "샘플 프로세스와 그 자손이 직접 발생시킨 행위"),
+    2: ("의심", "#ffa657", "샘플 계보 밖이지만 환경 배경으로 설명되지 않는 행위"),
+    3: ("배경", "#6e7681", "베이스라인 또는 알려진 OS 배경 활동 (Windows Update·Defender 등)"),
+}
+
+
+def _tier_of(obj) -> int:
+    """항목의 관련도 등급. 미판정(0)은 '의심'으로 취급해 숨기지 않는다."""
+    t = getattr(obj, "relevance_tier", 0) or 0
+    return t if t in _TIER_META else 2
+
+
+def _tier_attr(obj_or_tier) -> str:
+    """행 요소에 붙일 data-tier 속성 — JS 필터가 이 값으로 표시를 제어한다."""
+    tier = obj_or_tier if isinstance(obj_or_tier, int) else _tier_of(obj_or_tier)
+    if tier not in _TIER_META:
+        tier = 2
+    return f" data-tier='{tier}'"
+
+
+def _tier_badge(obj_or_tier) -> str:
+    tier = obj_or_tier if isinstance(obj_or_tier, int) else _tier_of(obj_or_tier)
+    label, color, tip = _TIER_META.get(tier, _TIER_META[2])
+    return (
+        f"<span title='{_e(tip)}' style='display:inline-block;padding:0 5px;"
+        f"border:1px solid {color};border-radius:3px;color:{color};"
+        f"font-size:.62rem;line-height:1.35;vertical-align:middle'>{label}</span>"
+    )
+
+
+def _relevance_bar_html(result) -> str:
+    """리포트 상단 관련도 요약 + 등급 필터 토글."""
+    counts = getattr(result, "relevance_counts", None) or {}
+    if not counts:
+        return ""
+
+    bl = getattr(result, "baseline_info", None) or {}
+    mode = bl.get("mode", "")
+    if mode == "baseline":
+        stale = " · <span style='color:#ffa657'>오래됨(재수집 권장)</span>" if bl.get("stale") else ""
+        bl_txt = (f"베이스라인 적용 — {_e(str(bl.get('host','')))} "
+                  f"{bl.get('age_days','?')}일 전, {bl.get('items','?')}개 항목{stale}")
+    elif mode == "capture":
+        bl_txt = "베이스라인 수집 모드"
+    else:
+        bl_txt = ("베이스라인 없음 — 내장 OS 배경 프로파일로 판정 "
+                  "(<code>--baseline-capture</code> 로 수집하면 정확도 향상)")
+
+    labels = {
+        "processes": "프로세스", "dropped_files": "드롭 파일",
+        "connections": "커넥션", "dns_queries": "DNS",
+        "http_requests": "HTTP", "techniques": "MITRE",
+    }
+    cells = []
+    for kind, label in labels.items():
+        c = counts.get(kind)
+        if not c:
+            continue
+        t1, t2, t3 = c.get(1, 0), c.get(2, 0), c.get(3, 0)
+        cells.append(
+            f"<div style='min-width:96px'>"
+            f"<div style='font-size:.68rem;color:#8b949e;margin-bottom:2px'>{label}</div>"
+            f"<span style='color:#f97583;font-weight:600'>{t1}</span>"
+            f"<span style='color:#484f58'> / </span>"
+            f"<span style='color:#ffa657'>{t2}</span>"
+            f"<span style='color:#484f58'> / </span>"
+            f"<span style='color:#6e7681'>{t3}</span>"
+            f"</div>"
+        )
+
+    btns = (
+        "<button type='button' class='tier-btn' data-tierlevel='1' "
+        "onclick='setTierFilter(1)'>계보만</button>"
+        "<button type='button' class='tier-btn tier-btn-on' data-tierlevel='2' "
+        "onclick='setTierFilter(2)'>계보 + 의심</button>"
+        "<button type='button' class='tier-btn' data-tierlevel='3' "
+        "onclick='setTierFilter(3)'>전체 표시</button>"
+    )
+
+    return (
+        "<div class='card relevance-bar' style='margin-bottom:1rem'>"
+        "<div style='display:flex;flex-wrap:wrap;align-items:center;gap:1.2rem;"
+        "justify-content:space-between'>"
+        "<div style='display:flex;flex-wrap:wrap;gap:1.2rem;align-items:flex-start'>"
+        "<div style='min-width:120px'>"
+        "<div style='font-size:.72rem;color:#cdd9e5;font-weight:600'>관련도 등급</div>"
+        "<div style='font-size:.64rem;color:#6e7681'>계보 / 의심 / 배경</div>"
+        "</div>"
+        + "".join(cells) +
+        "</div>"
+        f"<div style='display:flex;gap:.3rem'>{btns}</div>"
+        "</div>"
+        f"<div style='margin-top:.6rem;font-size:.68rem;color:#6e7681'>{bl_txt}</div>"
+        "<div style='margin-top:.3rem;font-size:.68rem;color:#6e7681'>"
+        "등급은 표시만 제어합니다 — 수집된 데이터는 하나도 삭제되지 않으며 "
+        "JSON 리포트에는 항상 전부 들어 있습니다.</div>"
+        "</div>"
+    )
+
+
+_TIER_FILTER_CSS = """
+.tier-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;
+  border-radius:5px;padding:.25rem .6rem;font-size:.7rem;cursor:pointer}
+.tier-btn:hover{border-color:#58a6ff;color:#cdd9e5}
+.tier-btn-on{background:#1f6feb33;border-color:#58a6ff;color:#cdd9e5;font-weight:600}
+tr[data-tier].tier-hidden,div[data-tier].tier-hidden,li[data-tier].tier-hidden{display:none}
+"""
+
+_TIER_FILTER_JS = """
+// 관련도 등급 필터 — data-tier 가 붙은 요소만 대상으로 표시를 토글한다.
+// 데이터를 지우는 것이 아니라 DOM 표시만 제어하므로 '전체 표시'로 언제든 복구된다.
+var __tierLevel = 2;
+function setTierFilter(level){
+  __tierLevel = level;
+  document.querySelectorAll('[data-tier]').forEach(function(el){
+    var t = parseInt(el.getAttribute('data-tier') || '2', 10);
+    if (t > level) { el.classList.add('tier-hidden'); }
+    else           { el.classList.remove('tier-hidden'); }
+    // 프로세스 행위 상세 행은 부모 행과 함께 숨긴다
+    var br = el.getAttribute('data-behrow');
+    if (br) {
+      var d = document.getElementById(br);
+      if (d) { d.style.display = (t > level) ? 'none' : ''; }
+    }
+  });
+  document.querySelectorAll('.tier-btn').forEach(function(b){
+    var lv = parseInt(b.getAttribute('data-tierlevel') || '0', 10);
+    if (lv === level) b.classList.add('tier-btn-on');
+    else              b.classList.remove('tier-btn-on');
+  });
+}
+document.addEventListener('DOMContentLoaded', function(){ setTierFilter(2); });
+"""
+
+
+def _artifact_intel_html(result) -> str:
+    """패커/인스톨러 식별 + 정상 구성요소 사칭 탐지 카드."""
+    packers = getattr(result, "packer_findings", None) or []
+    masq    = getattr(result, "masquerade_findings", None) or []
+    if not packers and not masq:
+        return ""
+
+    out = []
+    if packers:
+        items = []
+        for p in packers:
+            color = "#f97583" if p.get("confidence") == "HIGH" else "#ffa657"
+            ev = "".join(
+                f"<div class='mono' style='color:#6e7681;font-size:.7rem'>{_e(e)}</div>"
+                for e in (p.get("evidence") or [])[:3]
+            )
+            items.append(
+                f"<li style='margin-bottom:.5rem'>"
+                f"<span style='color:{color};font-weight:600'>{_e(p.get('confidence',''))}</span> "
+                f"<strong>{_e(p.get('name',''))}</strong>"
+                f"<div style='color:#8b949e;font-size:.76rem'>{_e(p.get('description',''))}</div>"
+                f"{ev}</li>"
+            )
+        out.append(
+            "<h3 style='color:#79c0ff;margin-top:1.4rem'>📦 패커 / 인스톨러 식별</h3>"
+            "<ul style='margin:.3rem 0 0 1.1rem;padding:0;font-size:.82rem'>"
+            + "".join(items) + "</ul>"
+        )
+
+    if masq:
+        rows = []
+        for m in masq:
+            color = "#f97583" if m.get("confidence") == "HIGH" else "#ffa657"
+            rows.append(
+                f"<tr{_tier_attr(1 if m.get('in_lineage') else 2)}>"
+                f"<td><span style='color:{color};font-weight:600'>"
+                f"{_e(m.get('confidence',''))}</span></td>"
+                f"<td class='mono' style='font-size:.74rem'>{_e(m.get('path',''))}</td>"
+                f"<td class='mono' style='font-size:.72rem;color:#8b949e'>"
+                f"{_e(m.get('technique',''))}</td>"
+                f"<td style='font-size:.74rem;color:#8b949e'>{_e(m.get('reason',''))}</td>"
+                f"</tr>"
+            )
+        out.append(
+            "<h3 style='color:#f97583;margin-top:1.4rem'>🎭 정상 구성요소 사칭 탐지</h3>"
+            "<p style='font-size:.78rem;color:#8b949e;margin:.2rem 0 .6rem'>"
+            "실제 Windows 바이너리 이름을 비표준 경로에서 쓰거나, 실존하지 않지만 "
+            "정상 구성요소처럼 보이도록 이름을 구성한 드롭 파일입니다. "
+            "후자는 휴리스틱 판정이므로 경로와 근거를 함께 확인하세요.</p>"
+            "<table id='tbl-masq'>"
+            "<tr><th>신뢰도</th><th>경로</th><th>기법</th><th>근거</th></tr>"
+            + "".join(rows) + "</table>"
+        )
+
+    return "".join(out)
+
+
+def _sideload_html(result) -> str:
+    """DLL 사이드로딩 탐지 결과 카드."""
+    findings = getattr(result, "sideload_findings", None) or []
+    if not findings:
+        return ""
+
+    rows = []
+    for f in findings:
+        conf  = f.get("confidence", "MEDIUM")
+        color = "#f97583" if conf == "HIGH" else "#ffa657"
+        flags = []
+        if f.get("dll_dropped"): flags.append("DLL 드롭됨")
+        if f.get("same_dir"):    flags.append("동일 디렉터리")
+        if f.get("exe_dropped"): flags.append("EXE 드롭됨")
+        if f.get("in_lineage"):  flags.append("샘플 계보")
+        comp = f.get("companions") or []
+        comp_html = ""
+        if comp:
+            comp_html = (
+                "<div style='margin-top:4px;color:#8b949e;font-size:.72rem'>"
+                "동반 파일: " + ", ".join(_e(c) for c in comp[:5]) + "</div>"
+            )
+        rows.append(
+            f"<tr{_tier_attr(1 if f.get('in_lineage') else 2)}>"
+            f"<td><span style='color:{color};font-weight:600'>{_e(conf)}</span></td>"
+            f"<td class='mono'>{_e(f.get('loader_name',''))}"
+            f"<span style='color:#8b949e'>({f.get('loader_pid',0)})</span></td>"
+            f"<td class='mono' style='font-size:.74rem'>{_e(f.get('dll_path',''))}{comp_html}</td>"
+            f"<td style='font-size:.72rem;color:#8b949e'>{_e(' · '.join(flags))}</td>"
+            f"</tr>"
+        )
+
+    return (
+        "<h3 style='color:#f97583;margin-top:1.4rem'>🔗 DLL 사이드로딩 탐지</h3>"
+        "<p style='font-size:.78rem;color:#8b949e;margin:.2rem 0 .6rem'>"
+        "정상 실행 파일이 같은 디렉터리의 DLL 을 로드하는 기법입니다. "
+        "Windows DLL 검색 순서상 실행 파일 디렉터리가 System32 보다 먼저라, "
+        "서명된 정상 바이너리를 그대로 두고 옆에 악성 DLL 만 놓으면 실행됩니다. "
+        "동반 파일(.pmt/.dat/.bin 등)은 DLL 이 읽는 암호화 페이로드일 수 있습니다.</p>"
+        "<table id='tbl-sideload'>"
+        "<tr><th>신뢰도</th><th>로더</th><th>사이드로드된 DLL</th><th>근거</th></tr>"
+        + "".join(rows) + "</table>"
+    )
+
+
 def _section_html(result) -> str:
     """MITRE ATT&CK 기법 테이블"""
     techs = result.behavior_report.techniques if result.behavior_report else []
@@ -898,19 +1139,25 @@ def _section_html(result) -> str:
         # sources 필드는 구버전 JSON 호환을 위해 getattr 사용
         src_badges = _source_badges(getattr(t, "sources", []) or [])
         rows.append(
-            f"<tr>"
+            f"<tr{_tier_attr(t)}>"
             f"<td><a href='{_e(ref)}' target='_blank' style='color:#f97583;text-decoration:none'>"
             f"{_e(t.technique_id)}</a></td>"
             f"<td>{_e(tname)}</td>"
             f"<td>{_b(tactic, color)}</td>"
+            f"<td style='white-space:nowrap'>{_tier_badge(t)}</td>"
+
             f"<td style='white-space:nowrap'>{src_badges}</td>"
             f"<td>{evidence_html}</td>"
             f"</tr>"
         )
     return (
         status_html
+        + _relevance_bar_html(result)
+        + _artifact_intel_html(result)
+        + _sideload_html(result)
         + "<table id='tbl-mitre'>"
-        "<tr><th>ID</th><th>기법</th><th>전술</th><th>출처</th><th>근거</th></tr>"
+        "<tr><th>ID</th><th>기법</th><th>전술</th><th>관련도</th><th>출처</th><th>근거</th></tr>"
+
         + "".join(rows) + "</table>"
     )
 
@@ -1745,8 +1992,8 @@ def _network_html(result) -> str:
             _dns_chips_td = (f"<td style='white-space:nowrap'>{_dns_chips}</td>"
                              if _dns_chips else "<td></td>")
             rows.append(
-                f"<tr>"
-                f"<td class='mono {_q_cls}' style='{_q_clr}'>{_e(q.name)}</td>"
+                f"<tr{_tier_attr(q)}>"
+                f"<td class='mono {_q_cls}' style='{_q_clr}'>{_tier_badge(q)} {_e(q.name)}</td>"
                 f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
                 f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
                 f"<td class='mono' style='color:#56d364;font-size:0.72rem'>{_q_rips}</td>"
@@ -2432,17 +2679,20 @@ def _process_html(result) -> str:
         _chips = _attk_chips([p.name, p.exe or ""], _tag_map, _techs)
         _chips_td = f"<td style='white-space:nowrap'>{_chips}</td>" if _chips else "<td></td>"
         rows.append(
-            f"<tr{row_attr}>"
+            f"<tr{row_attr}{_tier_attr(p)}>"
+
             f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
             f"<td>{name_cell}</td>"
+            f"<td style='white-space:nowrap'>{_tier_badge(p)}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{cmd_html}</td>"
             f"{_chips_td}"
             f"</tr>{beh_detail_row}"
         )
     table_html = (
-        "<table id='tbl-process'><tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
+        "<table id='tbl-process'><tr><th></th><th>PID</th><th>프로세스</th><th>관련도</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
+
         + "".join(rows) + "</table>"
     )
 
@@ -2870,10 +3120,11 @@ def _all_procs_html(result, chain_pids: set) -> str:
         _chips2 = _attk_chips([p.name, p.exe or ""], _tag_map2, _techs2)
         _chips2_td = f"<td style='white-space:nowrap'>{_chips2}</td>" if _chips2 else "<td></td>"
         rows.append(
-            f"<tr{style}{tr_behrow}>"
+            f"<tr{style}{tr_behrow}{_tier_attr(p)}>"
             f"{exp_td}"
             f"<td class='mono'>{p.pid}</td>"
             f"<td>{name_cell}</td>"
+            f"<td style='white-space:nowrap'>{_tier_badge(p)}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(p.exe or '')}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{cmd_html}</td>"
             f"{_chips2_td}"
@@ -2883,7 +3134,8 @@ def _all_procs_html(result, chain_pids: set) -> str:
     return (
         note
         + "<table id='tbl-process-all'>"
-        + "<tr><th></th><th>PID</th><th>프로세스</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
+        + "<tr><th></th><th>PID</th><th>프로세스</th><th>관련도</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
+
         + "".join(rows)
         + "</table>"
     )
@@ -3413,11 +3665,19 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
 
     # ── 드롭된 파일 (프로세스 매핑 포함) ──────────────────────────
     if ioc.dropped_files:
+        # relevance.annotate() 가 채운 경로별 등급 (없으면 전부 '의심'으로 표시)
+        _file_tiers = getattr(ioc, "dropped_file_tiers", None) or {}
         rows = []
-        for fp in ioc.dropped_files[:_IOC_LIMIT]:
+        # 관련도 높은 파일이 위로 오도록 정렬 — 잘림(_IOC_LIMIT)에도 핵심이 살아남는다
+        _sorted_drops = sorted(
+            ioc.dropped_files, key=lambda p: (_file_tiers.get(p, 2), p.lower())
+        )
+        for fp in _sorted_drops[:_IOC_LIMIT]:
             procs = file_proc_map.get(fp.lower(), [])
+            _t = _file_tiers.get(fp, 2)
             rows.append(
-                f"<tr>"
+                f"<tr{_tier_attr(_t)}>"
+                f"<td style='white-space:nowrap'>{_tier_badge(_t)}</td>"
                 f"<td class='mono'>{_e(fp)}</td>"
                 + _proc_cell(procs) +
                 f"</tr>"
@@ -3426,7 +3686,7 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
             "<h3>드롭된 파일" + _ioc_copy_btn("file") + "</h3>"
             + _trunc_notice(len(ioc.dropped_files), _IOC_LIMIT)
             + "<table id='tbl-ioc-file'>"
-            + "<tr><th>파일 경로</th><th>프로세스</th></tr>"
+            + "<tr><th>관련도</th><th>파일 경로</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )
 
@@ -3725,8 +3985,10 @@ def generate_html_report(result, output_path: str) -> None:
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dynamic Analysis — {_e(sample_name)}</title>
 <style>{_CSS}</style>
+<style>{_TIER_FILTER_CSS}</style>
 <script>window.HUNT_CFG = {_hunt_cfg_js};</script>
 <script>{_JS}</script>
+<script>{_TIER_FILTER_JS}</script>
 </head>
 <body>
 <div class="container">
@@ -3812,6 +4074,8 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-process" class="tab-panel">
 
   <h2>프로세스와 실행 흐름</h2>
+  {_relevance_bar_html(result)}
+
   {_process_html(result)}
 
 </div>
@@ -4350,11 +4614,18 @@ def _md_to_html(text: str) -> str:
 
 
 def _parse_ai_sections(text: str) -> dict:
-    """any.run 포맷 텍스트 → 섹션별 dict 파싱."""
+    """any.run 포맷 텍스트 → 섹션별 dict 파싱.
+
+    프롬프트는 맨 제목("실행 흐름")을 요구하지만 모델이 마크다운 표식을
+    붙이거나(`## 실행 흐름`, `**결론**`) '분석 분류' 하위 필드를 최상위
+    제목으로 평탄화해 내놓는 경우가 있다(NVIDIA NIM 등). 제목을 못 찾으면
+    해당 섹션이 리포트에서 통째로 사라지므로 두 형태를 모두 흡수한다.
+    """
     import re as _re
 
     SECTION_TITLES = [
-        "분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "결론", "마이터 기법 목록",
+        "분석 분류", "핵심 요약", "실행 흐름", "행위 분석", "확인된 IOC",
+        "결론", "마이터 기법 목록",
         # 영문 fallback (모델이 영문으로 출력한 경우)
         "Analytical classification", "Executive summary",
         "Execution flow", "Behavioral analysis", "Conclusion",
@@ -4366,17 +4637,66 @@ def _parse_ai_sections(text: str) -> dict:
         "Behavioral analysis": "행위 분석",
         "Conclusion": "결론",
     }
+    # '분석 분류' 하위 필드. 마크다운 표식이 붙은 형태만 제목으로 인정한다 —
+    # 맨 줄 "설명" 은 다른 섹션 본문에도 나타나므로 경계로 쓰면 오분할된다.
+    FIELD_TITLES = [
+        "위협 수준", "주요 분석 대상", "패커 / 빌드", "설명", "태그 및 해석",
+        "Threat level", "Main analyzed object", "Packer / build",
+        "Description", "Tags & interpretation",
+    ]
+    FIELD_KO_MAP = {
+        "Threat level": "위협 수준",
+        "Main analyzed object": "주요 분석 대상",
+        "Packer / build": "패커 / 빌드",
+        "Description": "설명",
+        "Tags & interpretation": "태그 및 해석",
+    }
+    # 재조립 순서 — '태그 및 해석' 은 _render_classification 의 태그 블록
+    # 정규식이 뒤를 끝까지 훑으므로 반드시 마지막이어야 한다.
+    FIELD_ORDER = ["위협 수준", "주요 분석 대상", "패커 / 빌드", "설명", "태그 및 해석"]
 
-    # 섹션 경계 탐지
-    pattern = "|".join(_re.escape(t) for t in SECTION_TITLES)
-    splits = list(_re.finditer(rf"^({pattern})\s*$", text, _re.MULTILINE))
+    _main  = "|".join(_re.escape(t) for t in SECTION_TITLES)
+    _field = "|".join(_re.escape(t) for t in FIELD_TITLES)
+    _MARK  = r"(?:#{1,6}[ \t]*(?:\*\*)?|\*\*)"   # 마크다운 제목 표식
+
+    # 섹션 경계 탐지 — 표식은 선택(맨 제목 허용), 하위 필드는 표식 필수
+    boundary = _re.compile(
+        r"^[ \t]{0,3}" + _MARK + r"?(?P<main>"  + _main  + r")\**[ \t]*:?[ \t]*$"
+        r"|"
+        r"^[ \t]{0,3}" + _MARK + r"(?P<field>" + _field + r")\**[ \t]*:?[ \t]*$",
+        _re.MULTILINE,
+    )
+    splits = list(boundary.finditer(text))
 
     sections: dict[str, str] = {}
+    fields:   dict[str, str] = {}
     for i, m in enumerate(splits):
-        title = KO_MAP.get(m.group(1), m.group(1))
-        end   = splits[i + 1].start() if i + 1 < len(splits) else len(text)
-        body  = text[m.end():end].strip()
-        sections[title] = body
+        end  = splits[i + 1].start() if i + 1 < len(splits) else len(text)
+        body = text[m.end():end].strip()
+        if m.group("main"):
+            sections[KO_MAP.get(m.group("main"), m.group("main"))] = body
+        else:
+            fields[FIELD_KO_MAP.get(m.group("field"), m.group("field"))] = body
+
+    # 평탄화된 하위 필드를 '분석 분류' 본문으로 재조립해 기존 렌더러에 넘긴다
+    if fields and not sections.get("분석 분류"):
+        rebuilt: list[str] = []
+        for label in FIELD_ORDER:
+            fbody = fields.get(label, "")
+            if not fbody:
+                continue
+            if label == "태그 및 해석":
+                rebuilt.append(f"{label}:\n{fbody}")
+                continue
+            first = next(
+                (ln.strip().lstrip("-•*").strip()
+                 for ln in fbody.splitlines() if ln.strip()),
+                "",
+            )
+            if first:
+                rebuilt.append(f"{label}: {first}")
+        if rebuilt:
+            sections["분석 분류"] = "\n".join(rebuilt)
 
     return sections
 
@@ -4392,6 +4712,8 @@ def _render_classification(body: str) -> str:
     threat   = _field("위협 수준") or _field("Threat level")
     obj      = _field("주요 분석 대상") or _field("Main analyzed object")
     desc     = _field("설명") or _field("Description")
+    packer   = (_field("패커 / 빌드") or _field("패커/빌드")
+                or _field("Packer / build") or _field("Packer/build"))
 
     # 위협 수준 색상
     tl = threat.lower()
@@ -4418,14 +4740,15 @@ def _render_classification(body: str) -> str:
             tm = _re.match(r"^\[?([a-zA-Z가-힣/_\-]+)\]?:\s*(.+)", tl_line)
             if tm:
                 badge = _e(tm.group(1).strip())
-                desc  = _e(tm.group(2).strip())
+                # 바깥 desc('설명' 필드) 를 덮어쓰지 않도록 별도 이름을 쓴다
+                tag_desc = _e(tm.group(2).strip())
                 tag_rows.append(
                     f"<div style='display:flex;align-items:flex-start;gap:.55rem;"
                     f"padding:.28rem 0;border-bottom:1px solid #21262d'>"
                     f"<span style='flex-shrink:0;background:#1f2d3d;border:1px solid #264466;"
                     f"border-radius:10px;padding:1px 9px;font-size:.7rem;color:#79c0ff;"
                     f"white-space:nowrap;margin-top:2px'>{badge}</span>"
-                    f"<span style='font-size:.82rem;color:#8b949e;line-height:1.5'>{desc}</span>"
+                    f"<span style='font-size:.82rem;color:#8b949e;line-height:1.5'>{tag_desc}</span>"
                     f"</div>"
                 )
         if tag_rows:
@@ -4435,6 +4758,14 @@ def _render_classification(body: str) -> str:
                 f"text-transform:uppercase;letter-spacing:.05em'>태그 및 해석</p>"
                 + "".join(tag_rows) + "</div>"
             )
+
+    # 패커는 값이 있을 때만 노출한다 — "미식별" 행을 항상 띄우면 잡음이 된다
+    packer_row = ""
+    if packer and packer.strip() not in ("미식별", "없음", "N/A", "-"):
+        packer_row = (
+            f"<tr><td style='color:#8b949e'>패커 / 빌드</td>"
+            f"<td class='mono' style='font-size:.85rem'>{_e(packer)}</td></tr>"
+        )
 
     return (
         f"<div class='card' style='margin-bottom:1rem'>"
@@ -4446,6 +4777,7 @@ def _render_classification(body: str) -> str:
         f"<table class='kv' style='margin-bottom:.4rem'>"
         f"<tr><td style='width:130px;color:#8b949e'>주요 분석 대상</td>"
         f"<td class='mono' style='font-size:.85rem'>{_e(obj)}</td></tr>"
+        f"{packer_row}"
         f"<tr><td style='color:#8b949e'>설명</td>"
         f"<td style='font-size:.85rem;line-height:1.6'>{_e(desc)}</td></tr>"
         f"</table>"
@@ -4555,6 +4887,38 @@ def _render_behavioral(body: str) -> str:
     )
 
 
+def _render_ioc_section(body: str) -> str:
+    """'확인된 IOC' 섹션 렌더링.
+
+    이 섹션은 AI 가 아니라 _build_ioc_text() 가 데이터에서 직접 만든 값이다.
+    C2 후보·드롭 파일 경로가 들어오므로 등폭 글꼴로 그대로 보여준다.
+    """
+    lines = []
+    for raw in (body or "").split("\n"):
+        s = raw.rstrip()
+        if not s.strip():
+            continue
+        indented = s.startswith("  ") or s.lstrip().startswith("-")
+        txt = _e(s.strip().lstrip("- ").strip())
+        if indented:
+            lines.append(
+                f"<div class='mono' style='margin-left:1rem;font-size:.78rem;"
+                f"color:#cdd9e5'>· {txt}</div>"
+            )
+        else:
+            lines.append(
+                f"<div style='margin-top:.5rem;font-size:.82rem;color:#8b949e'>{txt}</div>"
+            )
+    return (
+        "<div class='card' style='margin-bottom:1rem;border-left:3px solid #f97583;"
+        "padding-left:1rem'>"
+        + "".join(lines)
+        + "<div style='margin-top:.6rem;font-size:.7rem;color:#6e7681'>"
+          "데이터에서 직접 산출된 값입니다 (AI 판단 아님) — 환경 배경·사설/멀티캐스트 제외</div>"
+        "</div>"
+    )
+
+
 def _render_conclusion(body: str) -> str:
     return (
         f"<div class='card' style='margin-bottom:1rem;border-left:3px solid #58a6ff;"
@@ -4568,11 +4932,15 @@ def _ai_html(result) -> str:
     """AI 분석 결과 탭 렌더링 (any.run 스타일)."""
     ai = getattr(result, "ai_analysis", None) or {}
     model     = ai.get("model", "")
+    provider  = ai.get("provider", "") or "ollama"
     response  = ai.get("response", "")
     elapsed   = ai.get("elapsed_sec", 0)
     prompt_ch = ai.get("prompt_chars", 0)
     error     = ai.get("error", "")
     provider  = ai.get("provider", "ollama" if ai else "nvidia")
+
+    PROVIDER_LABEL = {"nvidia": "NVIDIA NIM (클라우드)", "ollama": "Ollama (로컬)"}
+    prov_label = PROVIDER_LABEL.get(provider, provider)
 
     parts = ["<h2>🤖 AI 위협 분석</h2>"]
 
@@ -4585,6 +4953,7 @@ def _ai_html(result) -> str:
     parts.append(
         f"<p style='color:#8b949e;font-size:.8rem;margin-bottom:1.2rem'>"
         f"제공자: {_e(provider.upper())} &nbsp;|&nbsp; 모델: <code>{_e(model)}</code> &nbsp;|&nbsp; "
+
         f"응답 시간: {elapsed}s &nbsp;|&nbsp; 입력: {prompt_ch:,}자"
         f"</p>"
     )
@@ -4594,17 +4963,33 @@ def _ai_html(result) -> str:
             "<div class='alert alert-info'>"
             "AI 분석 결과가 없습니다. GUI의 AI 설정에서 NVIDIA API 키와 모델을 설정한 뒤 AI 분석을 켜세요.<br>"
             "환경변수 <code>NVIDIA_API_KEY</code>로도 키를 지정할 수 있습니다."
+
             "</div>"
         )
         return "\n".join(parts)
 
     if error:
+        if provider == "nvidia":
+            _hint = (
+                f"1. 환경변수 <code>NVIDIA_API_KEY</code> 유효성 확인<br>"
+                f"2. build.nvidia.com 에서 크레딧 잔량/레이트리밋 확인<br>"
+                f"3. <code>--ai-model</code> 모델 이름 확인 (<code>{_e(model)}</code>)<br>"
+                f"4. <code>--ai-provider ollama</code> 로 로컬 폴백, "
+                f"<code>--no-ai</code> 로 비활성화 가능"
+            )
+        else:
+            _hint = (
+                f"1. <code>ollama serve</code> 실행 확인<br>"
+                f"2. <code>ollama pull {_e(model)}</code> 로 모델 다운로드<br>"
+                f"3. <code>--no-ai</code> 옵션으로 비활성화 가능"
+            )
         parts.append(
             f"<div class='alert alert-warning'>"
             f"<strong>AI 분석 오류</strong><br>{_e(error)}<br><br>"
             + ("NVIDIA API 키·모델 접근 권한·호출 한도를 확인하세요.<br>" if provider == "nvidia"
                else "Ollama 서버와 설치된 모델을 확인하세요.<br>")
             + "<code>--no-ai</code> 옵션으로 비활성화 가능"
+
             f"</div>"
         )
         if not response.strip():
@@ -4622,6 +5007,7 @@ def _ai_html(result) -> str:
         ("핵심 요약",  _render_summary),
         ("실행 흐름",  _render_exec_flow),
         ("행위 분석",  _render_behavioral),
+        ("확인된 IOC", _render_ioc_section),
         ("결론",       _render_conclusion),
     ]
 
@@ -4650,6 +5036,7 @@ def _ai_html(result) -> str:
         f"<details style='margin-top:1rem'>"
         f"<summary style='cursor:pointer;color:#8b949e;font-size:.8rem'>"
         f"▶ AI 응답 원문</summary>"
+
         f"<pre style='background:#0d1117;border:1px solid #30363d;border-radius:6px;"
         f"padding:1rem;margin-top:.5rem;font-size:.76rem;overflow-x:auto;"
         f"white-space:pre-wrap;color:#c9d1d9'>{_e(response)}</pre>"

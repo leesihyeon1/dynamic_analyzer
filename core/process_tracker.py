@@ -181,6 +181,7 @@ class ProcessSnapshot:
     create_time: float = 0.0
     note: str     = ""  # 보완 사유 (예: "pe-sieve 탐지 / 스냅샷 수집 전 종료")
     category: str = ""  # "BROWSER_INFRA" = 브라우저 인프라 서브프로세스 (기본 접힘)
+    relevance_tier: int = 0  # 1=샘플 계보 2=상관 의심 3=환경 배경 (analysis.relevance)
 
 
 # ---------------------------------------------------------------------------
