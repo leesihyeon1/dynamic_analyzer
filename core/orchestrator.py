@@ -172,7 +172,7 @@ def _scan_procmon_once(
 
         # ── 네트워크 맵 (TCP/UDP outbound/inbound) ───────────────────
         elif cat == EventCategory.NETWORK:
-            if ev.process.lower() in _ANALYSIS_TOOL_PROCESSES:
+            if ev.process.lower() in _ANALYSIS_TOOL_PROCESSES and ev.pid not in sample_pids:
                 continue
             op = ev.operation
             if op in _OUTBOUND_OPS:
@@ -229,7 +229,7 @@ def _find_suspicious_activity_pids(events: list, known_pids: set) -> set:
     found: set[int] = set()
     for ev in events:
         pid = ev.pid
-        if pid == 0 or pid in known_pids or pid in found:
+        if pid == 0 or pid in known_pids or pid in found or ev.result != "SUCCESS":
             continue
         if (getattr(ev, "process", "") or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
             continue
@@ -240,7 +240,10 @@ def _find_suspicious_activity_pids(events: list, known_pids: set) -> set:
         hit = False
 
         if cat == EventCategory.FILE:
-            if op in _WRITE_OPS and is_suspicious_path(path):
+            # 단순 Temp 접근은 정상 앱에서도 흔함. 실행 가능한 파일 쓰기만 편입.
+            if (op == "WriteFile" and is_suspicious_path(path)
+                    and path.lower().endswith((".exe", ".dll", ".sys", ".scr", ".com",
+                                               ".ps1", ".bat", ".cmd", ".vbs", ".js", ".hta"))):
                 hit = True
             elif op == "ReadFile" and is_sensitive_read_path(path):
                 hit = True
@@ -328,8 +331,9 @@ class AnalysisConfig:
     vol_plugin_timeout: int = 300         # 플러그인당 타임아웃 (초)
     existing_dump:    Optional[str] = None  # 기존 덤프 재사용
     # ── AI 분석 옵션 ─────────────────────────────────────────────────
-    use_ai:       bool = True               # Ollama AI 분석 사용
-    ai_model:     str  = "auto"            # Ollama 모델 이름 (auto: 실행 중인 모델 자동 감지)
+    use_ai:       bool = True               # AI 분석 사용
+    ai_provider:  str  = "nvidia"
+    ai_model:     str  = "auto"            # NVIDIA 설정 모델 또는 Ollama 자동 감지
     ollama_url:   str  = "http://localhost:11434"
     ai_timeout:   int  = 600               # AI 응답 타임아웃 (초)
 
@@ -341,6 +345,7 @@ class AnalysisResult:
     # 원시 데이터
     procmon_events:     list  = field(default_factory=list)   # list[ProcMonEvent]
     filtered_events:    list  = field(default_factory=list)
+    analysis_pcap:      object = None  # 샘플 귀속 확인된 행위 분석 입력
     pcap_result:        object = None                          # PcapResult
     registry_diff:      dict  = field(default_factory=dict)
     process_diff:       dict  = field(default_factory=dict)
@@ -507,7 +512,7 @@ def run_analysis(
     from core.tls_keylog              import TLSKeyLogger
     from core.fakenet_integrator      import FakeNetIntegrator, fakenet_result_to_dict
     from core.memory_forensics        import run_memory_forensics, memforensics_to_dict, find_winpmem, find_volatility3
-    from core.ai_analyzer             import OllamaAnalyzer, ai_analysis_to_dict, detect_model, merge_ai_mitre
+    from core.ai_analyzer             import create_ai_analyzer, ai_analysis_to_dict, merge_ai_mitre
 
     # ── 도구 초기화 ──────────────────────────────────────────────────
     _early_cfg  = _load_cfg_early()
@@ -572,7 +577,9 @@ def run_analysis(
     if result.tools_used["procmon"]:
         ok = pm.start()
         if not ok:
-            result.errors.append("ProcMon 시작 실패")
+            reason = pm.last_error or "원인 확인 불가"
+            result.errors.append(f"ProcMon 시작 실패: {reason}")
+            status(f"      [ProcMon] 시작 실패: {reason}")
             result.tools_used["procmon"] = False
 
     if result.tools_used["tshark"] and not config.use_fakenet:
@@ -600,18 +607,7 @@ def run_analysis(
     # 확장자별 실행 방법 분기:
     #   Office 문서 / 스크립트 / PDF → os.startfile (ShellExecute, 연관 앱으로 열기)
     #   실행 파일 (.exe / .dll 등)   → subprocess.Popen (직접 실행, PID 추적 가능)
-    _SHELL_EXEC_SUFFIXES: frozenset[str] = frozenset({
-        # Office 문서
-        ".doc", ".docx", ".docm", ".dot", ".dotm",
-        ".xls", ".xlsx", ".xlsm", ".xlt", ".xltm",
-        ".ppt", ".pptx", ".pptm", ".pot", ".potm",
-        ".rtf", ".pdf", ".odt", ".ods", ".odp",
-        # 스크립트 / 웹 기반 실행 파일
-        ".js", ".jse", ".vbs", ".vbe", ".wsf", ".wsh",
-        ".hta", ".ps1", ".psm1", ".psd1",
-        # 링크 / URL
-        ".url", ".lnk",
-    })
+    from core.sample_types import SHELL_EXEC_SUFFIXES as _SHELL_EXEC_SUFFIXES
 
     sample_proc = None
     if config.sample_path:
@@ -859,9 +855,20 @@ def run_analysis(
 
     # ProcMon 중지 + CSV 변환
     if result.tools_used["procmon"]:
-        pm.stop()
-        status("      ProcMon 로그 변환 중...")
-        pm.export_csv()
+        if not pm.stop():
+            reason = pm.last_error or "원인 확인 불가"
+            result.errors.append(f"ProcMon 종료 실패: {reason}")
+            status(f"      [ProcMon] 종료 실패: {reason}")
+        if pm.pml_path.is_file() and pm.pml_path.stat().st_size > 0:
+            status("      ProcMon 로그 변환 중...")
+            if not pm.export_csv():
+                reason = pm.last_error or "원인 확인 불가"
+                result.errors.append(f"ProcMon CSV 변환 실패: {reason}")
+                status(f"      [ProcMon] CSV 변환 실패: {reason}")
+        else:
+            reason = f"캡처 파일이 없거나 비어 있습니다: {pm.pml_path}"
+            result.errors.append(f"ProcMon CSV 변환 생략: {reason}")
+            status(f"      [ProcMon] CSV 변환 생략: {reason}")
 
     # tshark 중지 (duration으로 자동 종료됐을 수 있음)
     if result.tools_used["tshark"]:
@@ -1225,7 +1232,7 @@ def run_analysis(
 
     # step 7.5 에서 새로 추가된 pe-sieve 결과(DLL 인젝션 대상 기존 프로세스)를
     # all_pids 에 반영. filter_events 이후에 발견된 PID 이므로 filtered_events 에는
-    # 포함되지 않지만, 프로세스↔네트워크 매핑에서는 포함되어야 한다.
+    # 최신 PID 목록으로 아래에서 이벤트 필터를 재적용한다.
     _injection_pids: set[int] = set()
     for _psr2 in result.pe_sieve_results:
         if not _psr2.error and (_psr2.implanted_shc > 0 or _psr2.implanted_pe > 0):
@@ -1241,11 +1248,20 @@ def run_analysis(
             if ev.pid in _injection_pids
         ]
 
+    from analysis.network_scope import sample_network_view, refresh_tracked_events
+    refresh_tracked_events(result)
+    result.analysis_pcap = result.pcap_result
+    if config.sample_path is not None:
+        result.analysis_pcap = sample_network_view(
+            result.pcap_result, result.procmon_events, result.all_pids,
+        )
+        status("      샘플 네트워크 분류: 프로세스 귀속이 확인된 연결만 사용 (전체 관찰은 네트워크 탭)")
+
     # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
     status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
     result.behavior_report = classify_behaviors(
         result.filtered_events,
-        result.pcap_result,
+        result.analysis_pcap,
         result.registry_diff,
         result.process_diff,
         hh_result=result.hh_result,
@@ -1258,7 +1274,7 @@ def run_analysis(
 
     result.ioc_report = extract_iocs(
         result.filtered_events,
-        result.pcap_result,
+        result.analysis_pcap,
         result.registry_diff,
         result.process_diff,
         injection_events=_injection_events or None,
@@ -1362,6 +1378,7 @@ def run_analysis(
             _ns_map = build_netstat_proc_map(
                 _netstat_snaps,
                 proc_snapshots=result.proc_after_snapshot,
+                focus_pids=result.all_pids if result.all_pids else None,
             )
             if _ns_map:
                 # 중복 제거: ProcMon에 이미 있는 (pid, remote_ip, remote_port) 제외
@@ -1379,6 +1396,12 @@ def run_analysis(
                            f"(ProcMon {len(_precomp_net_map)}개 + netstat {len(_added)}개)")
         except Exception as _ns_err:
             status(f"      netstat 보완 실패: {_ns_err}")
+
+    # 모든 수집 경로에 동일한 제외/추적 범위를 적용.
+    from analysis.process_network_map import filter_process_connections
+    result.process_network_map = filter_process_connections(
+        result.process_network_map, result.all_pids if result.all_pids else None,
+    )
 
     if result.process_network_map:
         status(f"      총 {len(result.process_network_map)}개 연결 집계")
@@ -1432,35 +1455,25 @@ def run_analysis(
             status(f"      [오류] {_me}")
             result.mem_forensics = {"error": f"실행 예외: {_me}"}
 
-    # ── AI 분석 (Ollama 자동 감지) ──────────────────────────────────
+    # ── AI 분석 (기본 NVIDIA NIM) ──────────────────────────────────
     if config.use_ai:
-        _ollama_url = config.ollama_url
-        # 모델 자동 감지: 사용자가 명시하지 않았거나 기본값이면 실행 중인 모델 우선
-        _ai_model = config.ai_model
-        if not _ai_model or _ai_model == "auto":
-            _ai_model = detect_model(_ollama_url) or ""
-        if not _ai_model:
-            status(f"[AI 분석] Ollama 모델 없음 — 건너뜀 (ollama list 로 모델 확인)")
-        else:
-            _az = OllamaAnalyzer(base_url=_ollama_url, model=_ai_model)
-            if _az.is_available():
-                status(f"[AI 분석] Ollama {_ai_model} 호출 중…")
-                try:
-                    _ai = _az.analyze(result, timeout=config.ai_timeout)
-                    result.ai_analysis = ai_analysis_to_dict(_ai)
-                    if _ai.error:
-                        status(f"      [오류] {_ai.error}")
-                        result.errors.append(f"AI 분석: {_ai.error}")
-                    else:
-                        status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
-                        if _ai.mitre_techniques and result.behavior_report:
-                            merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
-                            status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
-                except Exception as _ae:
-                    result.errors.append(f"AI 분석 예외: {_ae}")
-                    status(f"      [오류] {_ae}")
+        try:
+            _az = create_ai_analyzer(config.ai_provider, config.ai_model, config.ollama_url)
+            status(f"[AI 분석] {config.ai_provider.upper()} {_az.model} 분석 준비…")
+            _ai = _az.analyze(result, timeout=config.ai_timeout)
+            result.ai_analysis = ai_analysis_to_dict(_ai)
+            result.tools_used["ai"] = f"{config.ai_provider}: {'실패' if _ai.error else '완료'}"
+            if _ai.error:
+                status(f"      [오류] {_ai.error}")
+                result.errors.append(f"AI 분석: {_ai.error}")
             else:
-                status(f"[AI 분석] Ollama 서버 미실행 — 건너뜀 ({_ollama_url})")
+                status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
+                if _ai.mitre_techniques and result.behavior_report:
+                    merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
+                    status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
+        except Exception:
+            result.errors.append("AI 분석 처리 중 예외가 발생했습니다.")
+            status("      [오류] AI 분석 처리 중 예외가 발생했습니다.")
 
     # ── 샘플 활성 여부 최종 판정 ────────────────────────────────────────
     result.sample_active, result.inactivity_signals = _compute_activity_verdict(result)

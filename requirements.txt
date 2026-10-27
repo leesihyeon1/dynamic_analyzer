@@ -3,3 +3,5 @@ scapy>=2.5.0      # 없으면 tshark fallback 파서로 자동 대체
 rich>=13.7.0
 yara-python>=4.3.0  # 없으면 YARA 스캔 스킵 (optional)
 wmi>=1.5.1         # Windows 전용, 선택: ETW 기반 즉시 프로세스 감지 (없으면 psutil 폴링 폴백)
+
+tkinterdnd2>=0.4.2  # GUI 파일 드래그 앤 드롭

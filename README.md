@@ -1,7 +1,7 @@
 # dynamic_analyzer
 
 Windows 악성코드 동적 분석 자동화 도구.  
-ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 · Ollama 를 조합해 **Noriben.py** 스타일로 동작하며,  
+ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 · NVIDIA NIM을 조합해 **Noriben.py** 스타일로 동작하며,
 실행 한 줄로 샘플 모니터링 → MITRE ATT&CK 매핑 → HTML/JSON 리포트까지 자동 생성합니다.
 
 ---
@@ -24,7 +24,7 @@ ProcMon · tshark · pe-sieve · hollows-hunter · CAPA · YARA · Volatility3 �
 | **쉘코드 덤프 재분석** | pe-sieve/HH가 덤프한 `.shc`·`.bin` 파일에 YARA + CAPA `--shellcode` 적용, 오탐 필터링 포함 |
 | **물리 메모리 덤프** | winpmem / DumpIt으로 RAM 전체 덤프 (`--memdump`) |
 | **Volatility3 포렌식** | malfind · pstree · netscan · cmdline · handles · dlllist 병렬 실행, 오류 원인 리포트 포함 |
-| **AI 행위 분석** | Ollama (qwen2.5:7b 기본) 기반 — 악성코드 패밀리 추정 · 위협 수준 · 행위 분석 · C2 패턴 한국어 자동 생성 |
+| **AI 행위 분석** | NVIDIA NIM API 기반 — 악성코드 패밀리 추정 · 위협 수준 · 행위 분석 · C2 패턴 한국어 자동 생성 |
 | **CAPA 정적 분석** | 샘플 바이너리에 CAPA 적용 → ATT&CK 기법 자동 추출 |
 | **VirusTotal 연동** | SHA256 기반 샌드박스 ATT&CK 기법 조회 (API 키 선택 설정) |
 | **프로세스↔네트워크 매핑** | ProcMon TCP/UDP 이벤트 기반, 프로세스별 외부 연결 집계 |
@@ -70,11 +70,35 @@ yara-python    # 선택 — 쉘코드 YARA 스캔
 | **winpmem** / **DumpIt** | `C:\Tools\winpmem\` 또는 PATH | `--memdump` 사용 불가 |
 | **Volatility3** (`vol.py` / `vol3`) | `C:\Tools\volatility3\` 또는 PATH | 메모리 포렌식 스킵 |
 | **FakeNet-NG** (`FakeNet.exe`) | PATH 또는 `--fakenet-path` 명시 | FakeNet 기능 스킵 |
-| **Ollama** | `http://localhost:11434` | AI 분석 스킵 |
+| **NVIDIA NIM API** | GUI의 AI 설정 또는 `NVIDIA_API_KEY` | 오류 사유를 기록하고 AI 분석 생략 |
 
 ---
 
 ## 사용법
+
+### 로컬 GUI 실행
+
+격리된 Windows 분석 VM에서 `python gui.py`를 실행합니다. EXE, Office 문서·PDF·스크립트 또는 PCAP 파일을 선택하고 옵션을 확인한 뒤 **분석 시작**을 누르면 기존 CLI 분석이 실행됩니다. 진행 로그와 결과 폴더를 GUI에서 확인할 수 있습니다. PCAP을 제외한 파일은 시작 전에 실행 확인 창이 표시됩니다.
+
+GUI는 일반 권한으로 실행하며 분석 시작 시에만 UAC 승인을 받아 관리자 분석 프로세스를 실행합니다. `start_gui.bat`을 관리자 실행 없이 여세요. 드래그 앤 드롭은 `tkinterdnd2`가 필요하며 `requirements.txt`에 포함되어 있습니다. 탐색기 파일을 경로 입력란으로 끌어다 놓거나, 복사 후 입력란에서 Ctrl+V로 붙여넣을 수 있습니다. 분석 로그는 관리자 프로세스가 저장한 `run.log`를 통해 GUI에 표시됩니다.
+
+`start_gui.bat`를 더블 클릭해도 열 수 있습니다. **저장 결과 불러오기**로 기존 결과 폴더를 선택하면 샘플을 실행하지 않고 다음 내용을 확인합니다.
+
+GUI는 왼쪽 실행 패널과 오른쪽 결과 영역을 사용하는 네이비·청록색 테마입니다. 결과 표는 가로·세로 스크롤을 지원합니다. 새 HTML 보고서는 왼쪽 섹션 메뉴, 요약 카드, 접을 수 있는 도구 상태, 글자 확대와 현재 화면 인쇄를 제공합니다. 작은 화면에서는 탐색 메뉴가 가로 배치로 전환됩니다.
+
+기존 HTML 보고서와 같은 이름의 JSON 파일이 있으면 새 테마를 별도 파일에 적용할 수 있습니다.
+
+```powershell
+python tools/restyle_report.py results\sample_dynamic_report.html results\sample_readable.html
+```
+
+- **결과 요약**: ATT&CK 후보, ProcMon 이벤트, 네트워크 패킷, 관찰 IP 및 수집 경고
+- **수집 상태**: 도구 사용 기록과 실제 산출물 확인 상태. PML만 있고 CSV가 없으면 부분 수집으로 표시
+- **기법 근거**: 후보별 CAPA·외부 분석·AI 등 명시된 출처와 원문 근거
+- **프로세스 연결**: 원격 주소와 추적 대상 PID 일치 여부
+- **산출물 / 실행 로그**: 파일 크기·용도와 GUI 실행 시 저장되는 `run.log` (화면에는 마지막 1MB 표시)
+
+후보 수와 관찰 IP 수는 악성 판정이 아닙니다. 기존 JSON의 출처가 명시되지 않은 근거는 `미분류 근거`로 표시하며, `tools_used`의 참 값만으로 수집 성공을 판단하지 않습니다.
 
 ### 기본 실행
 
@@ -143,18 +167,34 @@ python analyzer.py malware.exe --fakenet
 python analyzer.py malware.exe --fakenet --fakenet-path C:\Tools\FakeNet\FakeNet.exe
 ```
 
-### AI 행위 분석 (Ollama)
+### AI 행위 분석 (기본 NVIDIA NIM)
 
-```powershell
-# Ollama가 실행 중이면 자동 활성화 — 분석 종료 후 AI 탭에 결과 표시
-python analyzer.py malware.exe --ai
+기존 `config.json`의 `ai.api_key`에 NVIDIA API 키를 입력하고 `ai.model`에 모델을 지정합니다. GUI의 **AI 설정**에서 저장해도 같은 항목이 갱신됩니다. 기본 모델은 `mistralai/mistral-large-2-instruct`입니다. `config.json` 값을 우선 사용하며, 빈 값만 환경변수 `NVIDIA_API_KEY`와 `NVIDIA_MODEL`로 보완합니다. 기존 `ai.local.json`은 더 이상 읽지 않습니다. 키를 입력한 config.json을 공유하거나 커밋하지 마세요.
 
-# 모델 지정 (기본: qwen2.5:7b)
-python analyzer.py malware.exe --ai --ai-model qwen2.5:14b
+```json
+"ai": {
+  "api_key": "여기에 NVIDIA API 키 입력",
+  "model": "mistralai/mistral-large-2-instruct"
+}
 ```
 
-> **Ollama 설치**: https://ollama.com  
-> 모델 다운로드: `ollama pull qwen2.5:7b`
+AI가 켜진 분석은 프로세스·파일 경로·레지스트리·IP·도메인·ATT&CK 근거를 포함한 요약 프롬프트를 `https://integrate.api.nvidia.com/v1/chat/completions`로 전송합니다. EXE·PCAP·메모리 덤프 원본은 전송하지 않습니다. 인증에 사용하는 NVIDIA 키는 프롬프트·로그·리포트에 포함하지 않습니다.
+
+```powershell
+# 기본 NVIDIA 분석 — config.json의 ai 설정 사용
+python analyzer.py malware.exe
+
+# NVIDIA 모델 지정
+python analyzer.py malware.exe --ai-model mistralai/mistral-large-2-instruct
+
+# AI 비활성화
+python analyzer.py malware.exe --no-ai
+
+# 기존 로컬 Ollama를 명시적으로 선택
+python analyzer.py malware.exe --ai-provider ollama --ai-model auto
+```
+
+키가 없거나 인증·권한·호출 한도 오류가 있으면 AI 오류가 로그와 리포트에 기록됩니다. NVIDIA 실패 시 다른 제공자로 자동 전환하지 않습니다. [NVIDIA API 공식 문서](https://docs.api.nvidia.com/nim/reference/meta-llama-3_3-70b-instruct-infer)
 
 ### PCAP 분석
 
@@ -240,7 +280,7 @@ python analyzer.py malware.exe --memdump --ai
                         IOC 추출 (SMTP/FTP C2 IP 포함)
                         물리 메모리 덤프 (winpmem) ← --memdump
                         Volatility3 병렬 실행 (malfind·pstree·netscan·cmdline·handles·dlllist)
-                        Ollama AI 행위 분석 (qwen2.5:7b) ← --ai
+                        NVIDIA NIM AI 행위 분석 (API 키 설정 시)
         │
         ▼
       리포트             results/<이름>_<timestamp>/
@@ -270,7 +310,7 @@ python analyzer.py malware.exe --memdump --ai
 | 🌐 **네트워크** | 외부 연결·DNS·TLS SNI·HTTP·SMTP/FTP·HTTPS 복호화·FakeNet-NG |
 | 🧠 **메모리** | pe-sieve/HH 인젝션 탐지 + Volatility3 포렌식 (malfind·pstree·netscan·handles) |
 | 🔎 **IOC** | 외부 IP·도메인·드롭 파일·레지스트리 키·URL (프로세스 매핑 포함) |
-| 🤖 **AI 분석** | Ollama 행위 분석 — 패밀리 추정·위협 수준·행위 요약·C2 패턴 (한국어) |
+| 🤖 **AI 분석** | NVIDIA 행위 분석 — 제공자·모델·위협 수준·행위 요약·C2 패턴 (한국어) |
 | 🕵️ **Hunt** | abuse.ch 실시간 IOC 조회 (MalwareBazaar·ThreatFox·URLhaus·Feodo) |
 
 ---
@@ -296,7 +336,7 @@ dynamic_analyzer/
 │   ├── tls_keylog.py         # SSLKEYLOGFILE 기반 TLS 세션 키 수집
 │   ├── fakenet_integrator.py # FakeNet-NG 실행 + 결과 파싱
 │   ├── memory_forensics.py   # winpmem 메모리 덤프 + Volatility3 포렌식
-│   ├── ai_analyzer.py        # Ollama 기반 AI 행위 분석 (qwen2.5:7b)
+│   ├── ai_analyzer.py        # NVIDIA NIM / 선택적 Ollama AI 행위 분석
 │   ├── config_loader.py      # config.json 로더
 │   └── vm_setup.py           # 캡처 최적화 레지스트리 정책 자동 적용
 │
@@ -365,11 +405,11 @@ dynamic_analyzer/
 ### v1.8 — AI 분석 · 메모리 포렌식 · TLS 복호화 · FakeNet-NG
 
 - **🤖 AI 행위 분석** (`core/ai_analyzer.py` 신규)
-  - Ollama 로컬 LLM(기본: `qwen2.5:7b`) 기반 한국어 자동 위협 분석
+  - NVIDIA NIM API 기반 한국어 자동 위협 분석 (기본 `mistralai/mistral-large-2-instruct`)
   - 분석 항목 4개: 악성코드 패밀리 추정 · 위협 수준 평가 · 행위 분석 · C2 통신 패턴
   - 프롬프트 구성: MITRE ATT&CK 전술별 그룹 + 프로세스·파일·레지스트리·네트워크 행위 데이터
   - 10,000자 프롬프트 한도, `temperature=0.2` (사실 기반 일관성), `num_ctx=8192`
-  - Ollama 미실행 또는 모델 미설치 시 자동 스킵, `--ai` 옵션으로 활성화
+  - GUI AI 설정 또는 `NVIDIA_API_KEY`로 인증. `--no-ai`로 비활성화, 로컬 모델은 `--ai-provider ollama`로 선택
 
 - **🧠 물리 메모리 덤프 + Volatility3** (`core/memory_forensics.py` 신규)
   - winpmem / DumpIt으로 RAM 전체 덤프 후 Volatility3 플러그인 병렬 실행

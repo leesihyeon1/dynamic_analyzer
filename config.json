@@ -1,6 +1,12 @@
 {
   "_comment": "dynamic_analyzer 설정 파일 — 수정 후 다음 실행부터 적용됩니다",
 
+  "ai": {
+    "_comment": "NVIDIA NIM AI 분석 설정. api_key에 NVIDIA 키 입력. 모델·키는 이 설정을 우선 사용하며, 빈 값만 환경변수로 보완합니다.",
+    "api_key": "",
+    "model": "mistralai/mistral-large-2-instruct"
+  },
+
   "tools": {
     "_comment": "pe-sieve / hollows-hunter 경로. 비워두면 PATH + 알려진 디렉터리에서 자동 탐색.",
     "pe_sieve":       "",
@@ -17,7 +23,7 @@
   "virustotal": {
     "_comment": "VirusTotal API v3. 무료 키: 4 req/분, 500 req/일. api_key 가 비어있으면 비활성화됩니다.",
     "enabled": true,
-    "api_key": "aa7a0d74857917b94afe99180fc6676d86cdbba27a6cbd4df9af872963e5a199",
+    "api_key": "",
     "timeout": 20
   },
 

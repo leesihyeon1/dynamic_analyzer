@@ -50,6 +50,7 @@ _SINGLE_RE = re.compile(r'([\w\.\-\:\[\]]+):(\d+)')
 
 # 분석 환경 도구 — process_network_map에서 제외하여 노이즈 방지
 _ANALYSIS_TOOL_PROCESSES: frozenset[str] = frozenset({
+    "ollama.exe", "ollama app.exe",
     "procmon.exe", "procmon64.exe", "procmon64a.exe",
     "systeminformer.exe", "processhacker.exe", "procexp.exe", "procexp64.exe",
     "hollows_hunter.exe", "pe-sieve64.exe", "pe-sieve32.exe",
@@ -259,6 +260,7 @@ def capture_netstat_snapshot() -> list[tuple[str, int, int, str]]:
 def build_netstat_proc_map(
     snapshots:      list[list[tuple]],
     proc_snapshots: "dict | None" = None,
+    focus_pids: set[int] | None = None,
 ) -> list[ProcNetConnection]:
     """netstat 스냅샷 목록 → ProcNetConnection 목록.
 
@@ -314,4 +316,14 @@ def build_netstat_proc_map(
             event_count=count,
         ))
 
-    return sorted(connections, key=lambda c: (-c.event_count, c.process.lower(), c.remote_ip))
+    return filter_process_connections(sorted(connections, key=lambda c: (-c.event_count, c.process.lower(), c.remote_ip)), focus_pids)
+
+
+def filter_process_connections(connections, focus_pids: set[int] | None = None):
+    """수집 방식에 관계없이 추적 범위와 분석 도구 제외 규칙 적용.
+
+    명시적으로 추적하는 PID는 이름이 분석 도구와 같아도 보존한다.
+    """
+    return [c for c in connections
+            if (c.pid in focus_pids if focus_pids is not None
+                else c.process.lower() not in _ANALYSIS_TOOL_PROCESSES)]

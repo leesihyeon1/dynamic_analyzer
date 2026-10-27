@@ -11,6 +11,7 @@ from __future__ import annotations
 
 # (경로 조각(소문자), 관심 사유 라벨) — 더 구체적인 조각을 앞에 두어 우선 매칭.
 _INTEREST_RULES: tuple[tuple[str, str], ...] = (
+    ("\\session manager\\bootexecute", "BootExecute 자동실행"),
     # ── 자동 실행 / 지속성 ────────────────────────────────────────────
     ("\\currentversion\\runonce",      "RunOnce 자동실행"),
     ("\\currentversion\\runservices",  "RunServices 자동실행"),

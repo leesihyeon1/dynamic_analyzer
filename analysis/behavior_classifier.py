@@ -888,13 +888,7 @@ def _classify_network(
     }
     large_transfers = [c for c in pcap.connections
                        if not _is_private_ip(c.dst_ip) and c.bytes_out > 100_000]
-    if external_ips:
-        _add_evidence(technique_map, "T1041",
-                      "Exfiltration Over C2 Channel", "Exfiltration",
-                      evidence=", ".join(sorted(external_ips)),
-                      reference="https://attack.mitre.org/techniques/T1041/")
-        for _ip in external_ips:
-            _tag_entity(report.tag_map, _ip, "T1041")
+    # 외부 연결만으로 정보 유출(T1041)을 판정하지 않는다.
     for c in large_transfers:
         report.suspicious_network.append(
             f"대용량 전송: {c.dst_ip}:{c.dst_port} {c.bytes_out:,} bytes")

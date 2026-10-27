@@ -135,17 +135,17 @@ def _print_tool_status() -> None:
     pm = find_procmon()
     tbl.add_row("ProcMon",
                 "[green]✔ 발견[/green]" if pm else "[red]✘ 없음[/red]",
-                pm or "PATH 또는 C:\\Tools\\SysinternalsSuite\\")
+                str(pm) if pm else "PATH 또는 C:\\Tools\\SysinternalsSuite\\")
 
     ts = find_tshark()
     tbl.add_row("tshark (Wireshark)",
                 "[green]✔ 발견[/green]" if ts else "[red]✘ 없음[/red]",
-                ts or "PATH 또는 C:\\Program Files\\Wireshark\\")
+                str(ts) if ts else "PATH 또는 C:\\Program Files\\Wireshark\\")
 
     ph = find_process_hacker()
     tbl.add_row("Process Hacker / System Informer",
                 "[green]✔ 발견[/green]" if ph else "[yellow]△ 선택[/yellow]",
-                ph or "C:\\Tools\\processhacker\\ (없어도 psutil로 대체)")
+                str(ph) if ph else "C:\\Tools\\processhacker\\ (없어도 psutil로 대체)")
 
     tbl.add_row("Registry Snapshot (winreg)",
                 "[green]✔ 내장[/green]" if REG_AVAIL else "[red]✘ Windows 전용[/red]",
@@ -238,11 +238,15 @@ def build_parser() -> argparse.ArgumentParser:
     mg.add_argument("--vol-timeout", type=int, default=300, metavar="SEC",
                     help="Volatility3 플러그인당 타임아웃 (기본 300초)")
 
-    ag = p.add_argument_group("AI 분석 (Ollama 자동 감지)")
+    ag = p.add_argument_group("AI 분석 (기본 NVIDIA NIM)")
+    ag.add_argument("--ai-provider", choices=("nvidia", "ollama"), default="nvidia",
+                    help="AI 제공자 (기본 nvidia)")
     ag.add_argument("--no-ai", action="store_true",
                     help="AI 분석 비활성화")
+    ag.add_argument("--ai", dest="no_ai", action="store_false", default=argparse.SUPPRESS,
+                    help="AI 분석 활성화 (기본)")
     ag.add_argument("--ai-model", metavar="MODEL", default="auto",
-                    help="Ollama 모델 이름 (기본 auto: 실행 중인 모델 자동 감지)")
+                    help="모델 이름 (기본 auto: NVIDIA 설정 모델 또는 Ollama 자동 감지)")
     ag.add_argument("--ollama-url", metavar="URL", default="http://localhost:11434",
                     help="Ollama 서버 URL (기본 http://localhost:11434)")
     ag.add_argument("--ai-timeout", type=int, default=600, metavar="SEC",
@@ -362,6 +366,7 @@ def main() -> None:
         vol_plugin_timeout= getattr(args, "vol_timeout", 300),
         existing_dump     = getattr(args, "dump", None),
         use_ai            = not getattr(args, "no_ai", False),
+        ai_provider       = args.ai_provider,
         ai_model          = getattr(args, "ai_model", "auto"),
         ollama_url        = getattr(args, "ollama_url", "http://localhost:11434"),
         ai_timeout        = getattr(args, "ai_timeout", 600),

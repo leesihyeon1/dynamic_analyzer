@@ -69,7 +69,8 @@ def save_json_report(result, output_path: str) -> None:
                 "name":      t.technique_name,
                 "tactic":    t.tactic,
                 "reference": t.reference,
-                "evidence":  t.evidence[:10],
+                "evidence":  t.evidence,
+                "sources":   t.sources,
             }
             for t in (result.behavior_report.techniques if result.behavior_report else [])
         ],
@@ -93,6 +94,8 @@ def save_json_report(result, output_path: str) -> None:
             ],
         },
 
+        "network_scope": "전체 관찰 기록 — 샘플 귀속과 별개",
+        "analysis_network": _to_serializable(getattr(result, "analysis_pcap", None)),
         "network": _to_serializable(result.pcap_result) if result.pcap_result else {},
 
         "process_network_map": [
@@ -114,6 +117,7 @@ def save_json_report(result, output_path: str) -> None:
         },
 
         "yara_scan": _build_yara_json(getattr(result, "yara_result", None)),
+        "ai_analysis": _to_serializable(getattr(result, "ai_analysis", None)),
     }
 
     Path(output_path).write_text(

@@ -10,10 +10,14 @@ config_loader.py — config.json 로드 및 기본값 병합
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 # ── 기본값 ──────────────────────────────────────────────────────────
 _DEFAULTS: dict = {
+    "ai": {"model": "mistralai/mistral-large-2-instruct", "api_key": ""},
     "tools": {
         "pe_sieve":       "",   # 비워두면 PATH + 알려진 디렉터리 자동 탐색
         "hollows_hunter": "",
@@ -82,14 +86,14 @@ def load_config(path: str | Path | None = None) -> dict:
     config.json 을 탐색합니다.  파일이 없거나 파싱 실패 시 기본값만 반환합니다.
     """
     if path is None:
-        path = Path(__file__).parent.parent / "config.json"
+        path = CONFIG_PATH
     else:
         path = Path(path)
 
     cfg = _deep_merge({}, _DEFAULTS)   # 기본값 복사
     if path.exists():
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 user = json.load(f)
             cfg = _deep_merge(cfg, user)
         except Exception:
@@ -100,3 +104,26 @@ def load_config(path: str | Path | None = None) -> dict:
 def get_hunt_cfg(path: str | Path | None = None) -> dict:
     """Hunt 탭 설정(hunt 섹션)만 반환합니다."""
     return load_config(path)["hunt"]
+
+
+def get_ai_cfg() -> dict:
+    """config.json의 AI 설정을 우선 사용하고 빈 값만 환경변수로 보완한다."""
+    cfg = dict(load_config()["ai"])
+    for key, variable in (("api_key", "NVIDIA_API_KEY"), ("model", "NVIDIA_MODEL")):
+        if not str(cfg.get(key, "")).strip() and os.environ.get(variable, "").strip():
+            cfg[key] = os.environ[variable].strip()
+    if not cfg.get("model"):
+        cfg["model"] = _DEFAULTS["ai"]["model"]
+    return cfg
+
+
+def save_ai_settings(model: str, api_key: str | None = None) -> None:
+    """기존 설정 섹션을 보존하면서 config.json의 ai 항목만 갱신한다."""
+    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
+    if not isinstance(data, dict) or not isinstance(data.get("ai", {}), dict):
+        raise ValueError("config.json 형식이 올바르지 않습니다.")
+    cfg = data.setdefault("ai", {})
+    cfg["model"] = model.strip()
+    if api_key is not None:
+        cfg["api_key"] = api_key.strip()
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

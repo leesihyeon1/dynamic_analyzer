@@ -10,6 +10,7 @@ import json as _json
 import re as _re
 from datetime import datetime
 from pathlib import Path
+from exporters.report_theme import REPORT_CSS, report_header
 
 # HH/pe-sieve JIT·UWP 오탐 화이트리스트 — analysis/fp_allowlist.py 단일 소스
 from analysis.fp_allowlist import HH_SYSTEM_FP_NAMES as _HH_FP_ALLOWLIST
@@ -181,6 +182,8 @@ code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
 .beh-empty{color:#484f58;font-size:.72rem;font-style:italic}
 """
 
+_CSS += REPORT_CSS
+
 _JS = """
 function togglePT(id) {
   var el  = document.getElementById(id);
@@ -319,11 +322,15 @@ document.addEventListener('DOMContentLoaded', function () {
     var btns   = document.querySelectorAll('.tab-btn');
     var panels = document.querySelectorAll('.tab-panel');
     btns.forEach(function (btn) {
+        btn.setAttribute('aria-pressed', String(btn.classList.contains('active')));
         btn.addEventListener('click', function () {
-            btns.forEach(function(b){ b.classList.remove('active'); });
+            btns.forEach(function(b){ b.classList.remove('active'); b.setAttribute('aria-pressed','false'); });
             panels.forEach(function(p){ p.classList.remove('active'); });
             btn.classList.add('active');
-            document.getElementById(btn.dataset.tab).classList.add('active');
+            btn.setAttribute('aria-pressed', 'true');
+            var panel = document.getElementById(btn.dataset.tab);
+            panel.classList.add('active');
+            if (window.scrollY > panel.offsetTop) window.scrollTo({top:Math.max(0,panel.offsetTop-85),behavior:'auto'});
         });
     });
 });
@@ -962,7 +969,7 @@ def _file_events_html(result) -> tuple[str, int]:
             f"padding:1px 5px;border-radius:9px'>×{count}</span>"
             if count > 1 else ""
         )
-        detail_str = (e.detail or "").strip()[:160]
+        detail_str = (e.detail or "").strip()
         detail_html = (
             f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
             if detail_str else ""
@@ -974,7 +981,7 @@ def _file_events_html(result) -> tuple[str, int]:
             f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
             f"<td class='mono'>{_e(e.process)} <span style='color:#8b949e'>({e.pid})</span></td>"
             f"<td>{_b(e.operation, op_color.get(e.operation,'gray'))}{count_html}</td>"
-            f"<td class='mono ev-file'>{_e(e.path[:120])}{detail_html}</td>"
+            f"<td class='mono ev-file'>{_e(e.path)}{detail_html}</td>"
             f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
             f"{_chips_td}"
             f"</tr>"
@@ -1112,8 +1119,9 @@ def _registry_events_html(result) -> str:
                 f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
                 f"<td class='mono'>{_e(e.process)}</td>"
                 f"<td>{_b(e.operation,'purple')}</td>"
-                f"<td class='mono ev-registry'>{_e(e.path[:100])}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.detail[:60])}</td>"
+                f"<td class='mono ev-registry'>{_e(e.path)}</td>"
+                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.detail)}</td>"
+                f"<td>{_e(e.result)}</td>"
                 f"{extra_td}"
                 f"</tr>"
             )
@@ -1126,11 +1134,11 @@ def _registry_events_html(result) -> str:
                 extra  = f"<td style='white-space:nowrap'>{reason}{(' ' + chips) if chips else ''}</td>"
                 hi_rows.append(_reg_row(e, extra))
             parts.append(
-                "<h3>지속성 · 보안 관련 레지스트리 변경 "
+                "<h3>지속성 · 보안 관련 레지스트리 변경 및 시도 "
                 "<span style='font-size:.75rem;color:#6e7681'>(자동실행·서비스·인젝션·보안 무력화)</span></h3>"
                 + _trunc_notice(len(hi), _REG_EV_LIMIT)
                 + "<table id='tbl-reg-key'><tr><th>시각</th><th>프로세스</th><th>작업</th>"
-                "<th>키 경로</th><th>상세</th><th>관심 사유</th></tr>"
+                "<th>키 경로</th><th>상세</th><th>결과</th><th>관심 사유</th></tr>"
                 + "".join(hi_rows) + "</table>"
             )
 
@@ -1143,7 +1151,7 @@ def _registry_events_html(result) -> str:
             lo_table = (
                 _trunc_notice(len(lo), _REG_EV_LIMIT)
                 + "<table id='tbl-reg-procmon'><tr><th>시각</th><th>프로세스</th><th>작업</th>"
-                "<th>키 경로</th><th>상세</th><th>기법</th></tr>"
+                "<th>키 경로</th><th>상세</th><th>결과</th><th>기법</th></tr>"
                 + "".join(lo_rows) + "</table>"
             )
             parts.append(
@@ -1418,7 +1426,7 @@ def _network_html(result) -> str:
             if _lbl not in _lst:
                 _lst.append(_lbl)
 
-    parts = []
+    parts = ["<p class='alert'>전체 환경의 네트워크 관찰 기록입니다. 샘플 귀속이 확인된 연결만 샘플 행위 분석에 사용하며, HTTP·TLS 등 귀속 미확인 요약은 참고 자료입니다.</p>"]
 
     # ── 실행 진단 배너 ──────────────────────────────────────────────────
     parts.append(_execution_verdict_banner(_br))
@@ -2045,7 +2053,7 @@ def _compute_display_procs(result):
     [폴백-1] 위 두 방법으로 씨드를 못 구한 경우:
       filtered_events에 이벤트가 있는 비WL 신규 프로세스를 씨드로 사용.
       (noise_filter를 통과한 WriteFile·TCP 등 실질 활동 프로세스)
-    [폴백-2] ProcMon 미사용 등: 비WL 전체.
+    수집 증거가 없으면 신규 프로세스 전체를 체인으로 승격하지 않음.
 
     ※ pe-sieve/HH 탐지 PID는 전략과 무관하게 항상 씨드에 포함.
 
@@ -2121,11 +2129,7 @@ def _compute_display_procs(result):
             if p.pid in pids_with_events and p.name.lower() not in _WL:
                 malware_chain.add(p.pid)
 
-    # 폴백-2: ProcMon 미사용 등 완전 실패 → 비WL 전체
-    if not malware_chain:
-        for p in all_procs:
-            if p.name.lower() not in _WL:
-                malware_chain.add(p.pid)
+    # 수집 증거가 없으면 전체 신규 프로세스를 의심 실행 체인으로 승격하지 않음.
 
     # 루트 씨드 자손 반복 확장 (WL 이름이더라도 체인 내 자식은 포함)
     changed = True
@@ -3707,6 +3711,13 @@ def generate_html_report(result, output_path: str) -> None:
         _inactivity_banner = ""
 
     _hunt_cfg_js = _build_hunt_cfg_js()
+    _report_header = report_header(
+        sample_name=sample_name, sample_path=result.config.sample_path or "전체 시스템 모니터링",
+        generated=generated, timeout=result.config.timeout, duration=result.end_time-result.start_time,
+        techniques=tech_count, events=len(result.procmon_events), connections=conn_count, ips=ip_count,
+        tools_html=tools_html, indicator=threat_label,
+        needs_review=bool(result.errors) or bool(result.tools_used.get("procmon") and not result.procmon_events),
+    )
     body = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -3720,65 +3731,50 @@ def generate_html_report(result, output_path: str) -> None:
 <body>
 <div class="container">
 
-<h1>🧪 Dynamic Malware Analysis Report</h1>
-<p class="subtitle">
-  샘플: <code>{_e(str(result.config.sample_path) if result.config.sample_path else "전체 시스템 모니터링")}</code> &nbsp;|&nbsp;
-  생성: {generated} &nbsp;|&nbsp;
-  모니터링: {result.config.timeout}초 &nbsp;|&nbsp;
-  총 소요: {result.end_time - result.start_time:.1f}초
-</p>
-<p style="margin-bottom:1rem">
-  {_b('위협 수준: ' + threat_label, threat_color)}
-  &nbsp;
-  {_b(f'MITRE {tech_count}건', 'red' if tech_count else 'gray')}
-  {_b(f'인젝션·쉘코드 {shc_total}건' + (f' (오탐 {shc_fp_excluded}개 제외)' if shc_fp_excluded else ''), 'red' if shc_total else 'gray')}
-  {_b(f'외부 IP {ip_count}건', 'orange' if ip_count else 'gray')}
-  {_b(f'드롭 파일 {file_count}건', 'orange' if file_count else 'gray')}
-</p>
-<p style="margin-bottom:1.5rem">{tools_html}</p>
+{_report_header}
 
 {"".join(f'<p class="alert alert-warning">⚠ {_e(e)}</p>' for e in result.errors) if result.errors else ""}
 
 {_inactivity_banner}
 
 <!-- ── 탭 네비게이션 ── -->
-<div class="tabs">
+<nav class="tabs" aria-label="보고서 섹션">
   <button class="tab-btn active" data-tab="tab-basic">
-    📋 기본 분석{tab1_b}
+    분석 개요{tab1_b}
   </button>
   <button class="tab-btn" data-tab="tab-attack">
-    🎯 ATT&amp;CK{tab_att_b}
+    ATT&amp;CK 근거{tab_att_b}
   </button>
   <button class="tab-btn" data-tab="tab-process">
-    ⚙️ 프로세스{tab_proc_b}
+    프로세스{tab_proc_b}
   </button>
   <button class="tab-btn" data-tab="tab-filesystem">
-    📂 파일시스템{tab2_b}
+    파일 활동{tab2_b}
   </button>
   <button class="tab-btn" data-tab="tab-registry">
-    🔑 레지스트리{tab3_b}
+    레지스트리{tab3_b}
   </button>
   <button class="tab-btn" data-tab="tab-network">
-    🌐 네트워크{tab4_b}
+    네트워크{tab4_b}
   </button>
   <button class="tab-btn" data-tab="tab-memory">
-    🧠 메모리{tab_mem_b}
+    메모리{tab_mem_b}
   </button>
   <button class="tab-btn" data-tab="tab-ioc">
-    🔍 IOC{tab5_b}
+    관찰 지표 · IOC{tab5_b}
   </button>
   <button class="tab-btn" data-tab="tab-hunt">
-    🕵️ Hunt
+    위협 조회 · Hunt
   </button>
   <button class="tab-btn" data-tab="tab-ai">
-    🤖 AI 분석
+    AI 분석
   </button>
-</div>
+</nav>
 
 <!-- ══════════ 탭 1: 기본 분석 ══════════ -->
 <div id="tab-basic" class="tab-panel active">
 
-  <h2>📋 분석 개요</h2>
+  <h2>분석 개요</h2>
   <div class="grid2">
     <div class="card">
       <table class="kv">
@@ -3807,7 +3803,7 @@ def generate_html_report(result, output_path: str) -> None:
 <!-- ══════════ 탭 2: ATT&CK ══════════ -->
 <div id="tab-attack" class="tab-panel">
 
-  <h2>🎯 MITRE ATT&amp;CK 매핑</h2>
+  <h2>MITRE ATT&amp;CK 근거</h2>
   {_section_html(result)}
 
 </div>
@@ -3815,7 +3811,7 @@ def generate_html_report(result, output_path: str) -> None:
 <!-- ══════════ 탭 3: 프로세스 ══════════ -->
 <div id="tab-process" class="tab-panel">
 
-  <h2>⚙️ 프로세스 트리</h2>
+  <h2>프로세스와 실행 흐름</h2>
   {_process_html(result)}
 
 </div>
@@ -4576,6 +4572,7 @@ def _ai_html(result) -> str:
     elapsed   = ai.get("elapsed_sec", 0)
     prompt_ch = ai.get("prompt_chars", 0)
     error     = ai.get("error", "")
+    provider  = ai.get("provider", "ollama" if ai else "nvidia")
 
     parts = ["<h2>🤖 AI 위협 분석</h2>"]
 
@@ -4587,7 +4584,7 @@ def _ai_html(result) -> str:
     # 메타
     parts.append(
         f"<p style='color:#8b949e;font-size:.8rem;margin-bottom:1.2rem'>"
-        f"모델: <code>{_e(model)}</code> &nbsp;|&nbsp; "
+        f"제공자: {_e(provider.upper())} &nbsp;|&nbsp; 모델: <code>{_e(model)}</code> &nbsp;|&nbsp; "
         f"응답 시간: {elapsed}s &nbsp;|&nbsp; 입력: {prompt_ch:,}자"
         f"</p>"
     )
@@ -4595,9 +4592,8 @@ def _ai_html(result) -> str:
     if not ai:
         parts.append(
             "<div class='alert alert-info'>"
-            "AI 분석 결과가 없습니다. Ollama가 실행 중이면 자동으로 분석됩니다.<br>"
-            "<code>ollama serve</code> 실행 후 재분석하거나 "
-            "<code>ollama pull qwen2.5:7b</code>로 모델을 먼저 설치하세요."
+            "AI 분석 결과가 없습니다. GUI의 AI 설정에서 NVIDIA API 키와 모델을 설정한 뒤 AI 분석을 켜세요.<br>"
+            "환경변수 <code>NVIDIA_API_KEY</code>로도 키를 지정할 수 있습니다."
             "</div>"
         )
         return "\n".join(parts)
@@ -4606,9 +4602,9 @@ def _ai_html(result) -> str:
         parts.append(
             f"<div class='alert alert-warning'>"
             f"<strong>AI 분석 오류</strong><br>{_e(error)}<br><br>"
-            f"1. <code>ollama serve</code> 실행 확인<br>"
-            f"2. <code>ollama pull {_e(model)}</code> 로 모델 다운로드<br>"
-            f"3. <code>--no-ai</code> 옵션으로 비활성화 가능"
+            + ("NVIDIA API 키·모델 접근 권한·호출 한도를 확인하세요.<br>" if provider == "nvidia"
+               else "Ollama 서버와 설치된 모델을 확인하세요.<br>")
+            + "<code>--no-ai</code> 옵션으로 비활성화 가능"
             f"</div>"
         )
         if not response.strip():
@@ -4653,7 +4649,7 @@ def _ai_html(result) -> str:
     parts.append(
         f"<details style='margin-top:1rem'>"
         f"<summary style='cursor:pointer;color:#8b949e;font-size:.8rem'>"
-        f"▶ 원문 (Ollama raw 응답)</summary>"
+        f"▶ AI 응답 원문</summary>"
         f"<pre style='background:#0d1117;border:1px solid #30363d;border-radius:6px;"
         f"padding:1rem;margin-top:.5rem;font-size:.76rem;overflow-x:auto;"
         f"white-space:pre-wrap;color:#c9d1d9'>{_e(response)}</pre>"

@@ -13,6 +13,7 @@ from typing import Optional
 
 from parsers.procmon_csv import ProcMonEvent, EventCategory
 from analysis.sensitive_paths import is_sensitive_read_path
+from analysis.registry_relevance import is_persistence_key
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +203,12 @@ def filter_events(
                 proc_lower == "wmiprvse.exe"
                 and ev.operation == "Process Create"
             )
-            if is_noisy_proc and not write_to_suspicious and not sensitive_read and not wmi_spawn:
+            tracked = focus_pids is not None and ev.pid in focus_pids
+            persistence_write = (
+                ev.operation in {"RegSetValue", "RegCreateKey", "RegDeleteValue", "RegDeleteKey"}
+                and is_persistence_key(ev.path)
+            )
+            if is_noisy_proc and not (tracked or persistence_write or write_to_suspicious or sensitive_read or wmi_spawn):
                 continue
 
             # --- 3. Noisy operations ----------------------------------------
@@ -218,7 +224,12 @@ def filter_events(
 
             # --- 4. Noisy paths ---------------------------------------------
             path_lower = ev.path.lower()
-            if path_lower.startswith(noisy_path_tuple):
+            noisy_path = any(path_lower == prefix or path_lower.startswith(prefix + "\\")
+                             for prefix in noisy_path_tuple)
+            # 추적 대상의 변경 및 지속성 증거는 시스템 경로에서도 보존.
+            mutation = ev.operation in {"WriteFile", "CreateFile", "DeleteFile", "RenameFile",
+                                        "RegSetValue", "RegCreateKey", "RegDeleteValue", "RegDeleteKey"}
+            if noisy_path and not (persistence_write or (tracked and mutation)):
                 continue
 
             # --- 5. Failed basic query operations ---------------------------

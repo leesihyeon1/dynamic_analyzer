@@ -1,12 +1,12 @@
 """
-ai_analyzer.py — Ollama 기반 행위 중심 AI 위협 분석
+ai_analyzer.py — NVIDIA NIM / Ollama 기반 행위 중심 AI 위협 분석
 
 동적 분석 결과(프로세스·파일·레지스트리·네트워크·MITRE ATT&CK)를
-행위 중심 프롬프트로 변환해 Ollama에 전송하고, 위협 분석 텍스트를 반환합니다.
+행위 중심 프롬프트로 변환해 선택한 API에 전송하고, 위협 분석 텍스트를 반환합니다.
 
 사용:
-    from core.ai_analyzer import OllamaAnalyzer
-    az = OllamaAnalyzer()
+    from core.ai_analyzer import create_ai_analyzer
+    az = create_ai_analyzer()  # config.json의 ai 설정 사용
     if az.is_available():
         ai_result = az.analyze(result)
 """
@@ -38,6 +38,7 @@ class AiAnalysisResult:
     prompt_chars:      int   = 0
     error:             str   = ""
     mitre_techniques:  list  = field(default_factory=list)  # 파싱된 MITRE 기법 [{id,name,tactic,evidence}]
+    provider:          str   = "ollama"
 
 
 # ── Ollama 가용성 확인 ────────────────────────────────────────────────────────
@@ -202,7 +203,7 @@ def _compute_tags(result) -> list[tuple[str, str]]:
         tags.append(("dotnet", ".NET 컴파일러/빌더 실행 확인"))
 
     # 네트워크 기반
-    pcap = result.pcap_result
+    pcap = getattr(result, "analysis_pcap", None) or result.pcap_result
     if pcap:
         dns_names = {getattr(q, "name", "").lower() for q in getattr(pcap, "dns_queries", [])}
         if dns_names & _IP_CHECK_DOMAINS:
@@ -365,7 +366,7 @@ def _build_behavioral_text(result) -> str:
     sample_name = "샘플"
     if getattr(result.config, "sample_path", None):
         sample_name = Path(result.config.sample_path).name
-    pcap = getattr(result, "pcap_result", None)
+    pcap = getattr(result, "analysis_pcap", None) or getattr(result, "pcap_result", None)
 
     # 로더 / 스테이징 — ioc_extractor가 이미 분석 도구·시스템 경로를 걸러낸 결과를 사용
     _ioc = getattr(result, "ioc_report", None)
@@ -641,7 +642,7 @@ def _build_prompt(result) -> str:
                     _pid_hh2[getattr(_hr, "pid", 0)] = _hr
 
         # 도메인 역조회 맵
-        _pcap_pp = getattr(result, "pcap_result", None)
+        _pcap_pp = getattr(result, "analysis_pcap", None) or getattr(result, "pcap_result", None)
         _ip2dom_pp = getattr(_pcap_pp, "ip_to_domain", {}) or {} if _pcap_pp else {}
 
         # 의심 경로/확장자 필터
@@ -906,7 +907,7 @@ def _build_prompt(result) -> str:
 
     # ── 네트워크 통신 ───────────────────────────────────────────────────
     net_lines: list[str] = []
-    pcap = result.pcap_result
+    pcap = getattr(result, "analysis_pcap", None) or result.pcap_result
 
     # 프로세스 ↔ IP 매핑 (pnmap)
     pnmap = getattr(result, "process_network_map", []) or []
@@ -1332,9 +1333,88 @@ class OllamaAnalyzer:
         return ai
 
 
+NVIDIA_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+
+
+class _NoApiRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # 승인된 NVIDIA 목적지 외에는 인증정보와 분석 프롬프트를 전달하지 않는다.
+        return None
+
+
+class NvidiaAnalyzer:
+    """NVIDIA NIM으로 기존 행위 요약 프롬프트를 분석한다."""
+
+    def __init__(self, api_key: str = "", model: str = "mistralai/mistral-large-2-instruct") -> None:
+        self.api_key = api_key.strip()
+        self.model = model.strip()
+
+    def is_available(self) -> bool:
+        return bool(self.api_key and self.model)
+
+    def analyze(self, result, timeout: int = 600) -> AiAnalysisResult:
+        ai = AiAnalysisResult(model=self.model, provider="nvidia")
+        if not self.is_available():
+            ai.error = "NVIDIA API 키 또는 모델이 없습니다. GUI의 AI 설정 또는 NVIDIA_API_KEY를 확인하세요."
+            return ai
+        start = time.monotonic()
+        try:
+            prompt = _build_prompt(result).replace(self.api_key, "[API KEY REDACTED]")
+            ai.prompt_chars = len(prompt)
+            payload = json.dumps({"model": self.model, "messages": [{"role": "user", "content": prompt}],
+                                  "temperature": 0.2, "max_tokens": 4096, "stream": False}).encode("utf-8")
+            request = urllib.request.Request(NVIDIA_ENDPOINT, data=payload,
+                                             headers={"Authorization": "Bearer " + self.api_key,
+                                                      "Content-Type": "application/json", "Accept": "application/json"}, method="POST")
+            opener = urllib.request.build_opener(_NoApiRedirect())
+            with opener.open(request, timeout=timeout) as response:
+                data = json.loads(response.read())
+            choice = data["choices"][0]
+            content = choice["message"].get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("empty response")
+            ai.response = content.replace(self.api_key, "[API KEY REDACTED]")
+            if choice.get("finish_reason") == "length":
+                ai.response += "\n\n*(응답 토큰 한도에 도달해 분석이 중단되었습니다)*"
+            try:
+                ai.response = _inject_behavioral_section(ai.response, _build_behavioral_text(result))
+            except Exception:
+                pass
+            ai.response = ai.response.replace(self.api_key, "[API KEY REDACTED]")
+            ai.mitre_techniques = parse_mitre_from_ai(ai.response)
+        except urllib.error.HTTPError as exc:
+            reasons = {401: "API 키 인증 실패", 403: "모델 접근 권한 없음", 404: "모델 또는 API를 찾을 수 없음",
+                       410: "설정한 모델의 API 제공이 종료되었습니다. AI 설정에서 모델을 변경해 주세요.",
+                       429: "호출 한도 초과 — 잠시 후 재시도", 402: "API 크레딧 확인 필요"}
+            ai.error = f"NVIDIA API 오류 ({exc.code}): {reasons.get(exc.code, '서버 응답 오류')}"
+            exc.close()
+        except (TimeoutError, urllib.error.URLError):
+            ai.error = f"NVIDIA API 연결 실패 또는 타임아웃 ({timeout}초)"
+        except (ValueError, KeyError, IndexError, TypeError):
+            ai.error = "NVIDIA API 응답이 비어 있거나 예상한 Chat Completions 형식이 아닙니다."
+        except Exception:
+            ai.error = "NVIDIA AI 분석 처리 중 오류가 발생했습니다."
+        ai.elapsed_sec = round(time.monotonic() - start, 1)
+        return ai
+
+
+def create_ai_analyzer(provider: str = "nvidia", model: str = "auto",
+                       ollama_url: str = OLLAMA_BASE_URL):
+    if provider == "nvidia":
+        from core.config_loader import get_ai_cfg
+        cfg = get_ai_cfg()
+        return NvidiaAnalyzer(api_key=cfg.get("api_key", ""),
+                              model=cfg["model"] if not model or model == "auto" else model)
+    if provider == "ollama":
+        return OllamaAnalyzer(base_url=ollama_url,
+                              model=(detect_model(ollama_url) or DEFAULT_MODEL) if not model or model == "auto" else model)
+    raise ValueError("지원하지 않는 AI 제공자입니다.")
+
+
 def ai_analysis_to_dict(r: AiAnalysisResult) -> dict:
     return {
         "model":            r.model,
+        "provider":         r.provider,
         "response":         r.response,
         "elapsed_sec":      r.elapsed_sec,
         "prompt_chars":     r.prompt_chars,
