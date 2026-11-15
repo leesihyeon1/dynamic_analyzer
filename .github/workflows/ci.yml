@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "codex/ci-actions"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install ruff==0.14.7
+      - run: ruff check --output-format=github --select E9,F821,F822,F823 .
+
+  test:
+    name: Unittest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install "psutil>=5.9.0"
+      - run: python -m unittest discover -s tests -v
+      - run: python -m compileall -q analyzer.py analysis_worker.py gui.py analysis core exporters parsers
