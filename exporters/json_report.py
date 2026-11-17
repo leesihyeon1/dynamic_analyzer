@@ -93,6 +93,7 @@ def save_json_report(result, output_path: str) -> None:
         },
         "lineage_pids":  sorted(getattr(result, "lineage_pids", None) or []),
         "injected_pids": sorted(getattr(result, "injected_pids", None) or []),
+        "evidence":           getattr(result, "evidence", None) or {},
         "sideload_findings":  getattr(result, "sideload_findings", None) or [],
         "injection_findings": getattr(result, "injection_findings", None) or [],
         "packer_findings":    getattr(result, "packer_findings", None) or [],
@@ -134,6 +135,7 @@ def save_json_report(result, output_path: str) -> None:
         },
 
         "network_scope": "전체 관찰 기록 — 샘플 귀속과 별개",
+        "dns_attributed": _to_serializable(getattr(result, "dns_attributed", [])),
         "analysis_network": _to_serializable(getattr(result, "analysis_pcap", None)),
         "network": _to_serializable(result.pcap_result) if result.pcap_result else {},
 

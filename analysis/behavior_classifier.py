@@ -12,6 +12,7 @@ from analysis.sensitive_paths import (
     BROWSER_CRED_PATH_FRAGMENTS as _BROWSER_CRED_PATH_FRAGMENTS,
     BROWSER_CRED_FILENAMES as _BROWSER_CRED_FILENAMES,
     ANTI_VM_FILE_FRAGMENTS as _ANTI_VM_FILE_FRAGMENTS,
+    is_vm_self_access as _is_vm_self_access,
 )
 
 
@@ -201,7 +202,8 @@ def _classify_file_events(
                 _tag_entity(report.tag_map, lower, "T1070.004")
 
         # T1497.001 – Virtualization/Sandbox Evasion: VM 아티팩트 파일 접근
-        if op in _FILE_READ_OPS and any(frag in lower for frag in _ANTI_VM_FILE_FRAGMENTS):
+        if (op in _FILE_READ_OPS and not _is_vm_self_access(ev.process)
+                and any(frag in lower for frag in _ANTI_VM_FILE_FRAGMENTS)):
             _add_evidence(
                 technique_map, "T1497.001",
                 "Virtualization/Sandbox Evasion: System Checks", "Defense Evasion",
@@ -214,8 +216,9 @@ def _classify_file_events(
 
         # T1555.003 – Credentials from Web Browsers
         # Exclude browser processes reading their own files
-        if ev.process.lower() not in _BROWSER_PROC_NAMES:
-            _is_cred_path = any(frag in lower for frag in _BROWSER_CRED_PATH_FRAGMENTS)
+        if op == "ReadFile" and ev.result == "SUCCESS" and ev.process.lower() not in _BROWSER_PROC_NAMES:
+            # Windows DPAPI 저장소만 읽은 이벤트는 브라우저 자격증명 근거에서 제외한다.
+            _is_cred_path = any(frag in lower for frag in _BROWSER_CRED_PATH_FRAGMENTS if "user data" in frag)
             _is_ff_cred   = ("\\mozilla\\firefox\\" in lower and fname in _BROWSER_CRED_FILENAMES)
             if _is_cred_path or _is_ff_cred:
                 _add_evidence(
@@ -372,7 +375,7 @@ def _classify_registry_events(
         if ev.operation == "RegSetValue":
             _check_reg_path(ev.path, ev.detail, process=ev.process)
         # T1497.001 – VM 아티팩트 레지스트리 쿼리 (Anti-VM 체크)
-        if ev.operation in _REG_READ_OPS:
+        if ev.operation in _REG_READ_OPS and not _is_vm_self_access(ev.process):
             _lower = ev.path.lower()
             if any(frag in _lower for frag in _ANTI_VM_REG_FRAGMENTS):
                 _add_evidence(
@@ -1017,6 +1020,7 @@ def classify_behaviors(
     proc_diff: dict,
     hh_result=None,         # HollowsHunterResult | None
     pe_sieve_results=None,  # list[PeSieveResult] | None
+    lineage_pids=None,
 ) -> BehaviorReport:
     """Classify malware behaviors and map them to MITRE ATT&CK techniques."""
     report        = BehaviorReport()
@@ -1034,6 +1038,19 @@ def classify_behaviors(
             report.classify_errors.append(
                 f"{label} 분류 실패: {type(exc).__name__}: {exc}"
             )
+
+    # 브라우저를 실행한 계보 프로세스 또는 그 브라우저의 쿠키 내보내기.
+    lineage = set(lineage_pids or ())
+    browsers = [p for p in (proc_diff or {}).get("new_processes", []) if p.pid in lineage
+                and p.name.lower() in {"chrome.exe", "msedge.exe"} and p.ppid in lineage]
+    writers = {pid for p in browsers for pid in (p.pid, p.ppid)}
+    for ev in events:
+        if (ev.pid in writers and ev.operation == "WriteFile" and ev.result == "SUCCESS"
+                and ev.path.replace("/", chr(92)).lower().endswith(chr(92) + "cookies.json")):
+            evidence = f"브라우저 쿠키 내보내기 의심: {ev.path} (쓰기 PID {ev.pid})"
+            _add_evidence(technique_map, "T1539", "Steal Web Session Cookie", "Credential Access",
+                          evidence, process=ev.process)
+            _tag_entity(report.tag_map, ev.path, "T1539")
 
     _run("파일",       _classify_file_events,     events, technique_map, report)
     _run("레지스트리",  _classify_registry_events, events, reg_diff, technique_map, report)
@@ -1105,7 +1122,17 @@ def _assess_execution(
         details.append(f"비콘 패턴 {len(pcap.beacon_candidates)}건")
 
     # ── 판정 ──────────────────────────────────────────────────────────────
-    if has_anti_vm and not has_network:
+    # 지속성 등록·페이로드 드롭/실행까지 진행됐다면 "탐지 후 조기 종료"가 아니다.
+    _post_exec = [t for t in ("T1547.001", "T1543.003", "T1053.005", "T1574.002",
+                              "T1555.003", "T1218.011", "T1055")
+                  if t in technique_map]
+    if has_anti_vm and not has_network and len(_post_exec) >= 2:
+        verdict = "PARTIAL"
+        details.append("→ 판정: 부분 실행 — VM 아티팩트 조회가 있었지만 실행 후 행위"
+                       f"({', '.join(_post_exec)})가 관찰되어 조기 종료로 보지 않습니다")
+        details.append("  확인: 샘플 귀속 네트워크가 없음 — C2 도메인 미응답/DNS 실패 여부를 네트워크 탭에서 확인")
+
+    elif has_anti_vm and not has_network:
         # Anti-VM 체크 후 네트워크 코드 진입 전 종료 — 이벤트 수와 무관하게 우선 판정
         verdict = "EVADED"
         details.append("→ 판정: VM/Sandbox 탐지 후 조기 종료 의심 (T1497.001)")

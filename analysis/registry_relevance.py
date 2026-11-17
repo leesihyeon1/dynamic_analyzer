@@ -37,12 +37,30 @@ _INTEREST_RULES: tuple[tuple[str, str], ...] = (
     ("\\shell\\open\\command",         "파일 연결 하이재킹"),
 )
 
+# "\services\" 규칙에 걸리지만 OS 가 상시 갱신하는 상태 값 — 지속성과 무관.
+#   bam/dam  : 프로세스 실행 시각 기록(Background Activity Moderator) — 실행할 때마다 갱신
+#   w32time  : 시간 동기화 상태,  tcpip/dhcp/dnscache : 네트워크 상태 갱신
+_SERVICE_STATE_NOISE: tuple[str, ...] = (
+    "\\services\\bam\\", "\\services\\dam\\",
+    "\\services\\w32time\\securetimelimits", "\\services\\w32time\\config",
+    "\\services\\tcpip\\parameters\\interfaces", "\\services\\tcpip6\\parameters",
+    "\\services\\dhcp\\", "\\services\\dnscache\\", "\\services\\netbt\\",
+    "\\services\\eventlog\\", "\\services\\sharedaccess\\epoch",
+    "\\services\\wdnissvc\\", "\\services\\windefend\\",
+    "\\services\\bits\\performance", "\\services\\vss\\diag",
+    "\\services\\lanmanserver\\", "\\services\\lanmanworkstation\\",
+    "\\services\\rdyboost\\", "\\services\\wuauserv\\", "\\services\\usosvc\\",
+    "\\services\\pcw\\",
+)
+
 
 def registry_key_interest(path: str) -> str:
     """레지스트리 키 경로의 관심 사유 라벨을 반환. 해당 없으면 빈 문자열."""
     if not path:
         return ""
     lower = path.lower()
+    if "\\services\\" in lower and any(n in lower for n in _SERVICE_STATE_NOISE):
+        return ""
     for frag, label in _INTEREST_RULES:
         if frag in lower:
             return label

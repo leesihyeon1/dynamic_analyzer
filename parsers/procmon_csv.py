@@ -182,6 +182,70 @@ _CMD_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_WIN_TOKEN_RE = re.compile(r'"([^"]*)"|(\S+)')
+
+
+def split_windows_cmdline(raw: str) -> list[str]:
+    r"""Windows 명령줄을 토큰으로 나눈다 — 백슬래시를 이스케이프로 보지 않는다.
+
+    shlex(POSIX 모드)는 ``C:\Windows\System32`` 의 백슬래시를 먹어
+    ``C:WindowsSystem32`` 로 만든다. 경로가 깨지면 리포트·AI 프롬프트·IOC 가
+    전부 오염되므로 따옴표만 해석하는 단순 분리기를 쓴다.
+    """
+    raw = (raw or "").strip()
+    out: list[str] = []
+    for m in _WIN_TOKEN_RE.finditer(raw):
+        out.append(m.group(1) if m.group(1) is not None else m.group(2))
+    return [t for t in out if t != ""]
+
+
+# 샘플 경로가 명령줄에 있어도 호스트로 보지 않는 프로세스 (분석기 자신)
+_NOT_SAMPLE_HOST: frozenset[str] = frozenset({
+    "python.exe", "pythonw.exe", "py.exe", "capa.exe", "yara.exe", "yara64.exe",
+    "procmon.exe", "procmon64.exe", "tshark.exe", "dumpcap.exe",
+    "hollows_hunter.exe", "pe-sieve64.exe", "pe-sieve32.exe", "pe-sieve.exe",
+    "systeminformer.exe", "processhacker.exe", "conhost.exe",
+})
+
+
+def find_sample_host(events: "list[ProcMonEvent]", sample_path: str) -> "ChildProcInfo | None":
+    """ShellExecute 로 연 샘플(.js/.docx/.hta 등)의 호스트 프로세스를 찾는다.
+
+    문서·스크립트는 연관 앱(wscript.exe, WINWORD.EXE, mshta.exe …)이 대신 실행하므로
+    실행 시점에는 PID 를 알 수 없다. ProcMon Process Create 이벤트 중
+    **명령줄에 샘플 경로가 들어 있는 가장 이른 프로세스**가 호스트다.
+    이것을 못 찾으면 샘플 계보(lineage)가 비어 관련도 등급이 전부 "의심"으로 뭉개진다.
+    """
+    if not sample_path:
+        return None
+    full = sample_path.lower()
+    base = _os.path.basename(sample_path).lower()
+    fallback = None
+    for ev in events:
+        if ev.operation != "Process Create":
+            continue
+        detail = ev.detail or ""
+        m_pid = _CHILD_PID_RE.search(detail)
+        m_cmd = _CMD_LINE_RE.search(detail)
+        if not m_pid or not m_cmd:
+            continue
+        exe  = ev.path or ""
+        name = _os.path.basename(exe).lower()
+        if name in _NOT_SAMPLE_HOST:
+            continue
+        cmd_l = m_cmd.group(1).lower()
+        if full not in cmd_l and base not in cmd_l:
+            continue
+        info = ChildProcInfo(
+            child_pid=int(m_pid.group(1)), parent_pid=ev.pid,
+            name=_os.path.basename(exe) or f"pid{m_pid.group(1)}",
+            exe=exe, cmdline=split_windows_cmdline(m_cmd.group(1)),
+        )
+        if full in cmd_l:
+            return info            # 전체 경로 일치 — 확정
+        fallback = fallback or info  # 파일명만 일치 — 더 나은 후보가 없을 때만
+    return fallback
+
 
 @dataclass
 class ChildProcInfo:
@@ -238,11 +302,7 @@ def get_child_proc_infos(
         cmdline: list[str] = []
         m_cmd = _CMD_LINE_RE.search(ev.detail or "")
         if m_cmd:
-            raw = m_cmd.group(1).strip().strip('"')
-            try:
-                cmdline = _shlex.split(raw)
-            except ValueError:
-                cmdline = [raw] if raw else []
+            cmdline = split_windows_cmdline(m_cmd.group(1))
 
         results.append(ChildProcInfo(
             child_pid  = child_pid,

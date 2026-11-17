@@ -58,16 +58,52 @@ pre{line-height:1.8!important;font-size:.86rem!important;tab-size:4}details>summ
 """
 
 
+COMPACT_CSS = """
+.report-menu-toggle{position:fixed;top:8px;left:12px;z-index:50;border:1px solid var(--line);background:#182b3b;color:var(--text);padding:5px 13px;cursor:pointer}
+.tabs{padding-top:54px}.tabs:before,.tabs:after{display:none}.tabs .tab-btn{padding:8px 15px}
+body.menu-hidden .tabs{display:none}body.menu-hidden .container{margin-left:auto;margin-right:auto}
+.container{padding-top:48px}.metric-grid{gap:0}
+.report-header .metric-grid{overflow:hidden;background:transparent;border:0;border-top:1px solid #304454;border-bottom:1px solid #304454;gap:0}
+.report-header .metric{min-width:0;padding:14px clamp(12px,2vw,26px);border:0;border-radius:0;background:none;box-shadow:none}
+.report-header .metric+.metric{border-left:1px solid #304454}
+.report-header .metric-label{font-size:.82rem;color:#b3c7d1}
+.report-header .metric-value{font-size:clamp(1.3rem,2vw,1.85rem);margin:3px 0 0;line-height:1.25}
+@media(max-width:700px){.report-header .metric:nth-child(3){border-left:0}.report-header .metric:nth-child(n+3){border-top:1px solid #304454}}.card{border-color:transparent}
+.report-table-scroll{max-width:100%;overflow:auto;max-height:32rem;scrollbar-color:#547086 #142136}
+.report-table-scroll>table{margin:0}.report-table-scroll td,.report-table-scroll th{padding:6px 10px}
+.report-table-scroll td.mono,.report-table-scroll td code{white-space:nowrap;word-break:normal!important;overflow-wrap:normal!important}
+.tab-panel pre{max-height:22rem;overflow:auto;white-space:pre!important}
+@media(max-width:1100px){.tabs{padding-top:8px;top:38px}.report-menu-toggle{top:4px}}
+@media print{.report-menu-toggle{display:none}.report-table-scroll,.tab-panel pre{overflow:visible;max-height:none}}
+"""
+COMPACT_JS = """
+document.addEventListener('DOMContentLoaded', function(){
+ const nav=document.querySelector('nav.tabs'); if(!nav)return;
+ nav.id='report-navigation';
+ const toggle=document.createElement('button');
+ toggle.className='report-menu-toggle';toggle.setAttribute('aria-controls',nav.id);
+ function show(open){document.body.classList.toggle('menu-hidden',!open);
+ toggle.textContent='=';toggle.title=open?'메뉴 접기':'메뉴 열기';toggle.setAttribute('aria-label',toggle.title);toggle.setAttribute('aria-expanded',String(open));}
+ toggle.onclick=()=>show(document.body.classList.contains('menu-hidden'));
+ document.body.prepend(toggle);show(false);
+ window.addEventListener('load',function(){
+ document.querySelectorAll('.tab-panel table[id]').forEach(table=>{
+ const box=document.createElement('div');box.className='report-table-scroll';
+ box.tabIndex=0;table.before(box);box.append(table);});});
+});
+"""
+REPORT_CSS += COMPACT_CSS
+
+
 def report_header(*, sample_name, sample_path, generated, timeout, duration, techniques,
                   events, connections, ips, tools_html, needs_review=False, indicator=""):
     """사용자 데이터는 이스케이프하고 생성기가 만든 도구 배지만 HTML로 삽입한다."""
     e = lambda value: escape(str(value), quote=True)
-    metrics = [("ATT&CK 후보", techniques, "근거별 검토 필요"), ("ProcMon 이벤트", events, "수집·파싱된 이벤트"),
-               ("네트워크 연결", connections, "캡처에서 관찰"), ("관찰 IP", ips, "샘플 귀속 확인 필요")]
-    cards = "".join(f'<div class="metric"><div class="metric-label">{e(label)}</div><div class="metric-value">{int(count):,}</div><div class="metric-note">{e(note)}</div></div>' for label, count, note in metrics)
+    metrics = [("ATT&CK 후보", techniques), ("ProcMon 이벤트", events),
+               ("네트워크 연결", connections), ("IOC IP 주소", ips)]
+    cards = "".join(f'<div class="metric"><div class="metric-label">{e(label)}</div><div class="metric-value">{int(count):,}</div></div>' for label, count in metrics)
     minutes, seconds = divmod(int(max(0, duration)), 60)
-    health_title = "수집 확인 필요" if needs_review else "결과 검토"
-    health_text = "수집 오류 또는 ProcMon 이벤트 누락이 있습니다. 아래 경고와 원본 로그를 먼저 확인하세요." if needs_review else "후보 수와 관찰 IP는 수집 범위·프로세스 관계·원문 근거와 함께 해석하세요."
+    health = '<div class="health-strip warning">수집 상태 확인 필요</div>' if needs_review else ""
     return f'''<header class="report-header">
 <div class="report-topline"><span class="eyebrow">DYNAMIC / ANALYSIS REPORT</span><div class="report-actions">
 <button type="button" aria-pressed="false" onclick="const large=document.documentElement.classList.toggle('large-text');this.setAttribute('aria-pressed',String(large));this.textContent=large?'기본 글자':'글자 크게'">글자 크게</button>
@@ -75,6 +111,6 @@ def report_header(*, sample_name, sample_path, generated, timeout, duration, tec
 <h1>{e(sample_name)}</h1><p class="report-path">{e(sample_path)}</p>
 <div class="report-meta"><span>생성<strong>{e(generated)}</strong></span><span>모니터링<strong>{e(timeout)}초</strong></span><span>전체 소요<strong>{minutes}분 {seconds}초</strong></span><span>규칙 기반 지표<strong>{e(indicator)}</strong></span></div>
 <div class="metric-grid">{cards}</div>
-<div class="health-strip{' warning' if needs_review else ''}"><strong>{health_title}</strong><span>{health_text}</span></div>
+{health}
 <details class="tools-disclosure"><summary>수집 도구 상태 보기</summary><div class="tool-list">{tools_html}</div></details>
 </header>'''

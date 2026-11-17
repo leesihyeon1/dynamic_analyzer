@@ -35,7 +35,7 @@ _DEFAULTS: dict = {
         # provider: auto(NVIDIA 우선 → Ollama 폴백) | nvidia | ollama
         "enabled":  True,
         "provider": "nvidia",
-        "model": "mistralai/mistral-large-2-instruct",
+        "model": "mistralai/mistral-large-4-1t-a52b",
         "api_key": "",
         "timeout":  600,
         "nvidia": {

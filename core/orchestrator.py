@@ -218,7 +218,7 @@ def _find_suspicious_activity_pids(events: list, known_pids: set) -> set:
     """
     from parsers.procmon_csv import EventCategory
     from analysis.noise_filter import is_suspicious_path
-    from analysis.sensitive_paths import is_sensitive_read_path
+    from analysis.sensitive_paths import is_sensitive_read_path, is_vm_self_access
     from analysis.injection_paths import is_suspicious_module_path
     from analysis.registry_relevance import is_persistence_key
     from core.process_tracker import _ANALYSIS_TOOL_PROC_NAMES
@@ -245,7 +245,8 @@ def _find_suspicious_activity_pids(events: list, known_pids: set) -> set:
                     and path.lower().endswith((".exe", ".dll", ".sys", ".scr", ".com",
                                                ".ps1", ".bat", ".cmd", ".vbs", ".js", ".hta"))):
                 hit = True
-            elif op == "ReadFile" and is_sensitive_read_path(path):
+            elif (op == "ReadFile" and is_sensitive_read_path(path)
+                    and not is_vm_self_access(getattr(ev, "process", ""))):
                 hit = True
         elif cat == EventCategory.PROCESS and op == "Load Image":
             if is_suspicious_module_path(path):
@@ -626,6 +627,13 @@ def run_analysis(
     #   실행 파일 (.exe / .dll 등)   → subprocess.Popen (직접 실행, PID 추적 가능)
     from core.sample_types import SHELL_EXEC_SUFFIXES as _SHELL_EXEC_SUFFIXES
 
+    from core.dns_trace import DnsTrace
+    dns_trace = DnsTrace(config.output_dir)
+    if config.sample_path and not config.external_pcap:
+        try:
+            result.tools_used["dns_etw"] = dns_trace.start()
+        except (OSError, subprocess.SubprocessError):
+            result.tools_used["dns_etw"] = False
     sample_proc = None
     if config.sample_path:
         status(f"[3/6] 샘플 실행: {config.sample_path.name}")
@@ -872,6 +880,12 @@ def run_analysis(
                 pass
 
     # ProcMon 중지 + CSV 변환
+    if dns_trace.active:
+        try:
+            dns_trace.stop()
+        except (OSError, subprocess.SubprocessError) as exc:
+            result.errors.append(f"DNS-Client ETW 종료 실패: {exc}")
+
     if result.tools_used["procmon"]:
         if not pm.stop():
             reason = pm.export_error or pm.last_error or "원인 확인 불가"
@@ -966,6 +980,24 @@ def run_analysis(
         # all_pids 는 아래에서 주입 탐지·실시간 감지 PID 로 확장되며 오탐이
         # 섞일 수 있지만, lineage_pids 는 "샘플에서 실제로 뻗어나온 프로세스"
         # 만 담아 관련도 등급(Tier 1) 판정의 기준이 된다.
+        # ShellExecute 모드(.js/.docx/.hta …)는 실행 시점에 PID 를 모른다.
+        # 명령줄에 샘플 경로가 있는 호스트(wscript/WINWORD/mshta …)를 찾아
+        # 샘플 PID 로 확정한다 — 못 찾으면 계보가 비어 등급이 전부 "의심"이 된다.
+        _shell_mode = result.sample_pid is None and bool(config.sample_path)
+        if _shell_mode:
+            try:
+                from parsers.procmon_csv import find_sample_host
+                _host = find_sample_host(result.procmon_events, str(config.sample_path))
+            except Exception:
+                _host = None
+            if _host:
+                result.sample_pid = _host.child_pid
+                result.all_pids.add(_host.child_pid)
+                status(f"      [ShellExecute] 샘플 호스트 확정: {_host.name} "
+                       f"(PID {_host.child_pid}) — 계보 추적 기준으로 사용")
+            else:
+                status("      [ShellExecute] 샘플 호스트 프로세스를 특정하지 못함 "
+                       "— 계보 등급 없이 신규 프로세스 전체를 추적합니다")
         if result.sample_pid:
             result.lineage_pids.add(result.sample_pid)
             child_pids = pm_child_pids(result.procmon_events, result.sample_pid)
@@ -1002,7 +1034,9 @@ def run_analysis(
         # ShellExecute (doc/xls/js 등) 모드: sample_pid = None 이므로
         # 분석 중 새로 생성된 모든 프로세스 PID 를 추적 대상에 포함합니다.
         # → 호스트 앱(WINWORD.EXE, wscript.exe 등)의 네트워크·파일 이벤트 누락 방지
-        if result.sample_pid is None:
+        # (호스트를 확정했더라도 WMI·서비스·예약작업 경유로 계보 밖에서 뜨는
+        #  프로세스가 있으므로 추적 대상에는 계속 포함한다. 등급은 계보로 가린다.)
+        if result.sample_pid is None or _shell_mode:
             _new_proc_pids = {
                 p.pid for p in result.process_diff.get("new_processes", [])
             }
@@ -1303,6 +1337,13 @@ def run_analysis(
         )
         status("      샘플 네트워크 분류: 프로세스 귀속이 확인된 연결만 사용 (전체 관찰은 네트워크 탭)")
 
+    if result.tools_used.get("dns_etw") and not dns_trace.active:
+        try:
+            names = {p.pid: p.name for p in result.process_diff.get("new_processes", [])}
+            result.dns_attributed.extend(dns_trace.queries(names))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            result.errors.append(f"DNS-Client ETW 읽기 실패: {exc}")
+
     # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
     status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
     result.behavior_report = classify_behaviors(
@@ -1312,6 +1353,7 @@ def run_analysis(
         result.process_diff,
         hh_result=result.hh_result,
         pe_sieve_results=result.pe_sieve_results,
+        lineage_pids=result.lineage_pids,
     )
     # 분류기 예외(카테고리 통째 누락)를 조용히 넘기지 않고 표면화
     for _cerr in getattr(result.behavior_report, "classify_errors", []):
@@ -1631,6 +1673,16 @@ def run_analysis(
             result.errors.append(f"관련도 등급 부여 실패: {_rle}")
             status(f"      [오류] 관련도 등급 부여 실패: {_rle}")
 
+    # ── 증거 보존 ───────────────────────────────────────────────────
+    # 샘플 계보가 드롭한 파일을 결과 폴더로 복사하고 해시를 남긴다.
+    # 리포트 "증거" 탭이 이 결과를 원본 수집물과 함께 보여준다.
+    try:
+        from core.evidence_collector import collect_evidence
+        result.evidence = collect_evidence(result, config.output_dir, status=status)
+    except Exception as _eve:
+        result.evidence = {}
+        result.errors.append(f"증거 보존 실패: {_eve}")
+
     # ── 메모리 포렌식 (Volatility3) ──────────────────────────────────
     if config.use_memdump:
         status("[메모리 포렌식] 시작 (winpmem + Volatility3)...")
@@ -1674,6 +1726,8 @@ def run_analysis(
             status(f"[AI 분석] {config.ai_provider.upper()} {_az.model} 분석 준비…")
             _ai = _az.analyze(result, timeout=config.ai_timeout or 600)
             result.ai_analysis = ai_analysis_to_dict(_ai)
+            if getattr(_az, "model_note", ""):
+                status(f"      [모델 대체] {_az.model_note}")
             result.tools_used["ai"] = f"{config.ai_provider}: {'실패' if _ai.error else '완료'}"
             if _ai.error:
                 status(f"      [오류] {_ai.error}")

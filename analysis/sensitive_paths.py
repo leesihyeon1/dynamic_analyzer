@@ -37,6 +37,29 @@ ANTI_VM_FILE_FRAGMENTS: tuple[str, ...] = (
     "prl_tools.exe", "prl_cc.exe", "vmsrvc.exe", "vmusrvc.exe",
 )
 
+# VM 게스트 도구 자신 — 자기 설치 디렉터리·레지스트리를 읽는 것은 정상 동작이며
+# anti-VM 체크가 아니다. 이들을 근거로 잡으면 "EVADED" 오판정이 난다.
+VM_GUEST_TOOL_PROCS: frozenset[str] = frozenset({
+    "vmtoolsd.exe", "vm3dservice.exe", "vgauthservice.exe", "vmwaretray.exe",
+    "vmwareuser.exe", "vmacthlp.exe", "vmwareresolutionset.exe",
+    "vboxservice.exe", "vboxtray.exe", "vboxcontrol.exe",
+    "prl_tools.exe", "prl_cc.exe", "prl_tools_service.exe",
+    "qemu-ga.exe", "vdagent.exe", "vdservice.exe",
+})
+
+# OS 자체 프로세스 — 드라이버 열거·서비스 시작 과정에서 VM 관련 키/파일을 건드린다.
+_OS_SELF_PROCS: frozenset[str] = frozenset({
+    "system", "services.exe", "svchost.exe", "wmiprvse.exe", "msmpeng.exe",
+    "searchindexer.exe", "searchprotocolhost.exe", "trustedinstaller.exe",
+    "explorer.exe", "compattelrunner.exe", "mousocoreworker.exe",
+})
+
+
+def is_vm_self_access(process: str) -> bool:
+    """VM 게스트 도구·OS 프로세스가 VM 아티팩트를 건드린 경우 — anti-VM 근거에서 제외."""
+    p = (process or "").lower()
+    return p in VM_GUEST_TOOL_PROCS or p in _OS_SELF_PROCS
+
 
 def _basename_lower(lower_path: str) -> str:
     """소문자 경로에서 파일명 컴포넌트 추출."""

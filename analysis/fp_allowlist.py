@@ -31,6 +31,7 @@ HH_SYSTEM_FP_NAMES: frozenset[str] = frozenset({
     "sihost.exe",                   # Shell Infrastructure Host
     "taskhostw.exe",                # Task Host Window
     "ctfmon.exe",                   # CTF monitor (IME)
+    "msedgewebview2.exe",           # WebView2 런타임 (V8 JIT 영역이 쉘코드로 잡힘)
     # 분석 도구 — FP가 아니라 원래부터 의심 대상이 아님
     # (실제 실행 파일명은 하이픈 표기 — 언더스코어 표기는 과거 호환용)
     "picpick.exe",

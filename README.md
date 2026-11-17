@@ -172,12 +172,12 @@ python analyzer.py malware.exe --fakenet --fakenet-path C:\Tools\FakeNet\FakeNet
 
 ### AI 행위 분석 (기본 NVIDIA NIM)
 
-기존 `config.json`의 `ai.api_key`에 NVIDIA API 키를 입력하고 `ai.model`에 모델을 지정합니다. GUI의 **AI 설정**에서 저장해도 같은 항목이 갱신됩니다. 기본 모델은 `mistralai/mistral-large-2-instruct`입니다. `config.json` 값을 우선 사용하며, 빈 값만 환경변수 `NVIDIA_API_KEY`와 `NVIDIA_MODEL`로 보완합니다. 기존 `ai.local.json`은 더 이상 읽지 않습니다. 키를 입력한 config.json을 공유하거나 커밋하지 마세요.
+기존 `config.json`의 `ai.api_key`에 NVIDIA API 키를 입력하고 `ai.model`에 모델을 지정합니다. GUI의 **AI 설정**에서 저장해도 같은 항목이 갱신됩니다. 기본 모델은 `mistralai/mistral-large-4-1t-a52b`입니다. `config.json` 값을 우선 사용하며, 빈 값만 환경변수 `NVIDIA_API_KEY`와 `NVIDIA_MODEL`로 보완합니다. 기존 `ai.local.json`은 더 이상 읽지 않습니다. 키를 입력한 config.json을 공유하거나 커밋하지 마세요.
 
 ```json
 "ai": {
   "api_key": "여기에 NVIDIA API 키 입력",
-  "model": "mistralai/mistral-large-2-instruct"
+  "model": "mistralai/mistral-large-4-1t-a52b"
 }
 ```
 
@@ -188,7 +188,7 @@ AI가 켜진 분석은 프로세스·파일 경로·레지스트리·IP·도메�
 python analyzer.py malware.exe
 
 # NVIDIA 모델 지정
-python analyzer.py malware.exe --ai-model mistralai/mistral-large-2-instruct
+python analyzer.py malware.exe --ai-model mistralai/mistral-large-4-1t-a52b
 
 # AI 비활성화
 python analyzer.py malware.exe --no-ai
@@ -483,7 +483,7 @@ dynamic_analyzer/
 ### v1.8 — AI 분석 · 메모리 포렌식 · TLS 복호화 · FakeNet-NG
 
 - **🤖 AI 행위 분석** (`core/ai_analyzer.py` 신규)
-  - NVIDIA NIM API 기반 한국어 자동 위협 분석 (기본 `mistralai/mistral-large-2-instruct`)
+  - NVIDIA NIM API 기반 한국어 자동 위협 분석 (기본 `mistralai/mistral-large-4-1t-a52b`)
   - 분석 항목 4개: 악성코드 패밀리 추정 · 위협 수준 평가 · 행위 분석 · C2 통신 패턴
   - 프롬프트 구성: MITRE ATT&CK 전술별 그룹 + 프로세스·파일·레지스트리·네트워크 행위 데이터
   - 10,000자 프롬프트 한도, `temperature=0.2` (사실 기반 일관성), `num_ctx=8192`

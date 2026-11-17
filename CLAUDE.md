@@ -8,7 +8,7 @@ Windows malware dynamic-analysis automation tool (Noriben.py style). One command
 
 ## Commands
 
-There is no build step, linter, or test suite. Development is run-and-inspect:
+Run the regression suite with `python -m unittest discover -s tests -q`. For manual checks:
 
 ```powershell
 pip install -r requirements.txt

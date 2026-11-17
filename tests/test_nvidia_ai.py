@@ -58,9 +58,62 @@ class NvidiaTests(unittest.TestCase):
                 self.assertIn(str(status), result.error)
                 self.assertNotIn("test-key", result.error)
 
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["first", "second"])
+    def test_empty_reasoning_response_retries_and_reads_text_parts(self, _candidates):
+        def reply(content, reason):
+            return json.dumps({"choices": [{"message": {"content": content}, "finish_reason": reason}]}).encode()
+        self.opener.open.return_value.__enter__.return_value.read.side_effect = [
+            reply(None, "length"), reply([{"type": "text", "text": "분석 완료"}], "stop")]
+        result = NvidiaAnalyzer("test-key", "first").analyze(object())
+        self.assertFalse(result.error)
+        self.assertEqual(result.model, "second")
+        self.assertIn("분석 완료", result.response)
+
+    @patch("core.ai_analyzer.time.sleep")
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["primary", "backup"])
+    def test_disconnect_retries_then_uses_backup(self, _models, _sleep):
+        from http.client import RemoteDisconnected
+        self.respond()
+        self.opener.open.side_effect = [RemoteDisconnected(), urllib.error.URLError(RemoteDisconnected()),
+                                       self.opener.open.return_value]
+        result = NvidiaAnalyzer("test-key", "primary").analyze(object())
+        self.assertFalse(result.error)
+        self.assertEqual([json.loads(call.args[0].data)["model"] for call in self.opener.open.call_args_list],
+                         ["primary", "primary", "backup"])
+        self.assertEqual(result.model, "backup")
+
+    @patch("core.ai_analyzer.time.sleep")
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["primary"])
+    def test_persistent_disconnect_is_bounded(self, _models, _sleep):
+        from http.client import RemoteDisconnected
+        self.opener.open.side_effect = RemoteDisconnected()
+        result = NvidiaAnalyzer("test-key", "primary").analyze(object())
+        self.assertIn("세 차례", result.error)
+        self.assertEqual(self.opener.open.call_count, 3)
+
     def test_empty_content_is_reported_as_error(self):
         self.respond(content=None)
         self.assertTrue(NvidiaAnalyzer("test-key").analyze(object()).error)
+
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["test-model"])
+    def test_prompt_failure_recovers_with_observed_evidence(self, _models):
+        from types import SimpleNamespace as NS
+        result = NS(behavior_report=NS(techniques=[
+            NS(technique_id="T1055", sources=["로컬룰"], evidence=["fixture evidence"])]))
+        self.respond()
+        with patch("core.ai_analyzer._build_prompt", side_effect=AttributeError("test-key")):
+            ai = NvidiaAnalyzer("test-key").analyze(result)
+        self.assertFalse(ai.error)
+        self.assertIn("fixture evidence", json.loads(self.opener.open.call_args.args[0].data)["messages"][0]["content"])
+        self.assertIn("근거 요약", ai.response)
+
+    def test_internal_error_identifies_stage_without_secret(self):
+        with patch("core.ai_analyzer._build_prompt", side_effect=AttributeError("test-key")):
+            ai = NvidiaAnalyzer("test-key").analyze(object())
+        self.assertIn("분석 자료 구성 실패", ai.error)
+        self.assertIn("AttributeError", ai.error)
+        self.assertNotIn("test-key", ai.error)
+        self.opener.open.assert_not_called()
 
     def test_length_limit_is_visible(self):
         self.respond(finish_reason="length")

@@ -167,6 +167,8 @@ _ANALYSIS_TOOL_PATH_FRAGMENTS: tuple[str, ...] = (
     "hollows_hunter",
     "hollows-hunter",
     "pe-sieve",
+    "\\dumps\\process_",        # 분석기가 저장한 pe-sieve / hollows-hunter 덤프
+    "\\windows\\servicestate\\", # EventLog lastalive 등 OS 상태 파일
 )
 
 # 레지스트리 지속성/보안 키 판정은 analysis/registry_relevance.py 단일 소스 사용.

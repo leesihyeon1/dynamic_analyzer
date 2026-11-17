@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+from http.client import IncompleteRead, RemoteDisconnected
 import re as _re
 import time
 import urllib.request
@@ -170,7 +171,9 @@ def list_nvidia_models(base_url: str, api_key: str, timeout: int = 8) -> list:
         req = urllib.request.Request(
             f"{base_url}/models", method="GET", headers=_nvidia_headers(api_key)
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        # 리다이렉트를 따라가지 않는다 — 인증 헤더가 다른 호스트로 넘어가지 않게 한다
+        opener = urllib.request.build_opener(_NoApiRedirect())
+        with opener.open(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
         return [m.get("id", "") for m in data.get("data", []) if m.get("id")]
     except Exception:
@@ -193,6 +196,7 @@ def _is_nvidia_model_available(
 # 정확히 일치하지 않으면 부분 일치로도 찾으므로 버전이 올라가도 잡힌다.
 NVIDIA_MODEL_PREFERENCES: tuple[str, ...] = (
     # Qwen 계열 — CJK 비중이 높아 한국어 서술이 가장 자연스럽다
+    "mistralai/mistral-large-4-1t-a52b",   # 2026-11 실호출 확인
     "qwen/qwen2.5-72b-instruct",
     "qwen/qwen3-235b-a22b",
     "qwen/qwen2.5-32b-instruct",
@@ -283,6 +287,55 @@ def resolve_nvidia_model(
     if pool:
         return pool[0], f"모델 '{wanted}' 없음 → '{pool[0]}' 자동 선택 (카탈로그 임의)"
     return (wanted or NVIDIA_DEFAULT_MODEL), ""
+
+
+def nvidia_model_candidates(
+    base_url: str,
+    api_key: str,
+    wanted: str = "",
+    limit: int = 5,
+    timeout: int = 8,
+) -> list:
+    """호출을 시도할 모델 후보를 우선순위대로 돌려준다.
+
+    /v1/models 카탈로그에 올라 있어도 실제 호출은 404/410 으로 거절되는
+    모델이 있다(제공 종료 후에도 목록에 남는 경우). 그래서 하나만 고르지 않고
+    후보 목록을 만들어 404/410 이면 다음 후보로 넘어갈 수 있게 한다.
+
+    순서: 설정 모델(카탈로그에 있을 때) → 선호 목록 정확 일치 →
+          설정 모델과 같은 벤더 → 선호 목록 부분 일치
+    카탈로그를 못 읽으면 판단 근거가 없으므로 설정 모델만 돌려준다.
+    """
+    wanted = (wanted or "").strip()
+    catalog = list_nvidia_models(base_url, api_key, timeout)
+    if not catalog:
+        return [wanted or NVIDIA_DEFAULT_MODEL]
+
+    out: list = []
+
+    def _add(m: str) -> None:
+        if m and m not in out:
+            out.append(m)
+
+    if wanted in catalog:
+        _add(wanted)
+    pool = [m for m in catalog if is_chat_model(m)] or catalog
+    for pref in NVIDIA_MODEL_PREFERENCES:
+        if pref in pool:
+            _add(pref)
+    if wanted and "/" in wanted:
+        vendor = wanted.split("/", 1)[0] + "/"
+        for m in pool:
+            if m.startswith(vendor) and "instruct" in m.lower():
+                _add(m)
+    for pref in NVIDIA_MODEL_PREFERENCES:
+        key = pref.rstrip("/")
+        for m in pool:
+            if key in m:
+                _add(m)
+    if not out:
+        _add(next((m for m in pool if "instruct" in m.lower()), pool[0]))
+    return out[:max(1, limit)]
 
 
 # ── 내부 유틸 ────────────────────────────────────────────────────────────────
@@ -1056,11 +1109,11 @@ def _inject_behavioral_section(ai_response: str, behavioral_text: str) -> str:
     AI가 쓴 '행위 분석'이 있으면 그 범위를 교체하고, 없으면 '결론' 앞에 삽입한다.
     """
     return _replace_section(ai_response, "행위 분석", behavioral_text,
-                            fallback_before=("결론", "마이터 기법 목록"))
+                            fallback_before=("분석 한계", "결론", "마이터 기법 목록"))
 
 
 _SECTION_TITLES = [
-    "분석 분류", "핵심 요약", "실행 흐름", "행위 분석",
+    "분석 분류", "핵심 요약", "실행 흐름", "분석 한계", "행위 분석",
     "확인된 IOC", "결론", "마이터 기법 목록",
 ]
 
@@ -1191,11 +1244,30 @@ def _build_prompt(result, max_chars: int = _MAX_PROMPT_CHARS) -> str:
                 f"- 샘플 계보: {', '.join(_lin_names)}"
                 f"  ← 이 프로세스들의 행위만 샘플 소행으로 단정할 수 있음"
             )
+    # 스크립트·문서 샘플은 연관 앱(wscript/WINWORD/mshta …)이 대신 실행한다.
+    # 호스트를 알려주지 않으면 모델이 "PO.JS 프로세스가 …" 같은 없는 주체를 만든다.
+    _host_name = ""
+    if result.sample_pid:
+        for p in (result.process_diff or {}).get("new_processes", []):
+            if getattr(p, "pid", None) == result.sample_pid:
+                _host_name = getattr(p, "name", "") or ""
+                break
+    if _host_name and _host_name.lower() != sample_name.lower():
+        lines.append(
+            f"- 호스트 프로세스: {_host_name} (PID {result.sample_pid})"
+            f"  ← 샘플은 스크립트/문서이므로 이 프로세스가 샘플 내용을 실행한 주체임"
+        )
     lines.append(
         "- 실행 방법: 분석 도구가 샘플을 직접 실행했습니다. "
         "분석 도구(python.exe, procmon, pe-sieve, tshark 등)의 동작을 "
         "공격자 행위나 사용자 행위로 서술하지 마십시오."
     )
+    # 실행 진단 — 판정과 근거를 그대로 넘겨 "네트워크 없음 = 무해" 식 오독을 막는다
+    _br0 = result.behavior_report
+    if _br0 is not None and getattr(_br0, "execution_verdict", ""):
+        lines.append(f"- 실행 진단: {_br0.execution_verdict}"
+                     "  (CONFIRMED=실행·통신 확인 / PARTIAL=실행됐으나 C2 미응답 / "
+                     "EVADED=분석환경 탐지 후 중단 의심 / FAILED=실행 실패 의심)")
     if all_pids:
         lines.append(f"- 추적 PID: {', '.join(str(p) for p in all_pids[:20])}")
     lines.append("")
@@ -2012,6 +2084,18 @@ LOW    데이터에 없음 → 기술 금지
   샌드박스 탐지 코드가 있는데 행위가 없으면 "분석 환경을 탐지해 실행을
   중단했을 가능성" 을 언급하는 편이 억지 서술보다 낫습니다.
 - "자격증명 수집", "키로깅", "스크린샷" 은 직접 증거가 있을 때만 쓰십시오.
+  직접 증거의 예: 샘플 계보 프로세스가 브라우저 프로필(Login Data, Cookies, Web Data)을
+  읽었거나, 브라우저를 자식으로 띄워 쿠키·비밀번호를 파일로 내보낸 경우.
+
+[귀속 규칙 — 누가 했는지 틀리면 분석 전체가 틀립니다]
+- "샘플 계보" 에 적힌 프로세스의 행위만 샘플 소행으로 단정하십시오.
+- 계보 밖 프로세스(svchost.exe, msedgewebview2.exe, System 등)의 통신·파일 쓰기는
+  Windows 업데이트·브라우저 갱신 같은 배경 활동일 가능성이 높습니다.
+  샘플과 연결할 직접 근거(주입 탐지 HIGH, 계보가 만든 파일 실행)가 없으면 언급하지 마십시오.
+- 네트워크 항목에 프로세스가 "미확인" 이면 샘플 통신이라고 단정하지 말고 "귀속 미확인" 이라고 쓰십시오.
+- 응답 없는 DNS 질의(C2 오프라인·격리망)는 "접속 시도" 로 쓰되 통신 성공으로 쓰지 마십시오.
+- 메일 서버(mail./smtp. 접두, 25·465·587 포트)나 FTP·Telegram·Discord API 로의 통신은
+  "유출 채널 추정" 으로, 그 외는 "C2 추정" 으로 구분하십시오.
 - "다수의 IP", "시스템 도구", "악성 서버" 같은 추상 표현 금지. 실제 값을 쓰십시오.
 
 {tag_section}
@@ -2035,9 +2119,15 @@ LOW    데이터에 없음 → 기술 금지
 [프로세스 실행 체인을 부모→자식 순서로 재구성. 각 단계에 실제 파일 경로와
  프로세스명을 넣으십시오. 단계가 3개보다 적으면 있는 만큼만 쓰고 억지로 채우지 마십시오.
  분석 도구(python.exe, procmon 등)의 동작은 공격 단계가 아닙니다.]
-[1단계] [진입점 — 샘플 실행과 최초 전개(임시 디렉터리 추출 등)]
+[1단계] [진입점 — 샘플 실행과 최초 전개(임시 디렉터리 추출 등). 스크립트/문서면 호스트 프로세스 명시]
 [2단계] [준비 — 드롭 경로, 파일명, 자식 프로세스 생성]
-[3단계] [실행 — 사이드로딩·주입·네트워크 통신. 관측되지 않았으면 "관측되지 않음"]
+[3단계] [실행 — 사이드로딩·주입·페이로드 실행. 관측되지 않았으면 "관측되지 않음"]
+[4단계] [지속성 — 등록된 레지스트리 키·값·대상 경로 또는 예약 작업. 없으면 "관측되지 않음"]
+[5단계] [수집·유출·통신 — 무엇을 어디서 읽어 어디로 보냈는지. 없으면 "관측되지 않음"]
+
+분석 한계
+[이번 실행에서 확인하지 못한 것을 1~3줄로. 예: C2 미응답으로 2차 페이로드 미확인,
+ DNS 응답 없음, 프로세스 귀속 미확인 통신, 분석 시간 내 미발현 가능성. 없으면 "특이사항 없음"]
 
 결론
 [1~2문장. 최종 위협 판단과 공격자 의도. 관측 근거에 한정. 기법 ID 금지.]
@@ -2069,7 +2159,9 @@ LOW    데이터에 없음 → 기술 금지
         if divider in prompt:
             data_part, instr_part = prompt.split(divider, 1)
             cutoff = max_chars - len(instr_part) - len(divider) - 60
-            data_part = data_part[:max(cutoff, 500)]
+            sections = _re.split(r"\n(?=## )", data_part)
+            quota = max(0, (cutoff - len(sections)) // len(sections))
+            data_part = "\n".join(section[:quota] for section in sections)
             prompt = data_part + "\n\n(데이터 초과로 일부 생략됨)" + divider + instr_part
         else:
             prompt = prompt[:max_chars]
@@ -2392,9 +2484,10 @@ class _NoApiRedirect(urllib.request.HTTPRedirectHandler):
 class NvidiaAnalyzer:
     """NVIDIA NIM으로 기존 행위 요약 프롬프트를 분석한다."""
 
-    def __init__(self, api_key: str = "", model: str = "mistralai/mistral-large-2-instruct") -> None:
+    def __init__(self, api_key: str = "", model: str = "mistralai/mistral-large-4-1t-a52b") -> None:
         self.api_key = api_key.strip()
         self.model = model.strip()
+        self.model_note = ""   # 자동 대체가 일어났을 때의 안내 문구
 
     def is_available(self) -> bool:
         return bool(self.api_key and self.model)
@@ -2405,42 +2498,142 @@ class NvidiaAnalyzer:
             ai.error = "NVIDIA API 키 또는 모델이 없습니다. GUI의 AI 설정 또는 NVIDIA_API_KEY를 확인하세요."
             return ai
         start = time.monotonic()
+        tried: list = []
+        stage = "분석 자료 구성"
+        reduced = False
         try:
-            prompt = _build_prompt(result).replace(self.api_key, "[API KEY REDACTED]")
+            # NVIDIA 는 128k 컨텍스트 — Ollama 용 10,000자 상한으로 증거를 잘라내지 않는다
+            try:
+                prompt = _build_prompt(result, max_chars=_MAX_PROMPT_CHARS_CLOUD)
+            except Exception:
+                # 선택 수집기의 상세 자료 처리에 실패해도 이미 분류된 근거를 사용한다.
+                rows = []
+                for technique in getattr(getattr(result, "behavior_report", None), "techniques", []) or []:
+                    for evidence in (technique.evidence or [])[:3]:
+                        rows.append(f"{technique.technique_id} ({', '.join(technique.sources or [])}): {str(evidence)[:350]}")
+                if not rows:
+                    raise
+                prompt = ("다음 ATT&CK 후보와 출처를 바탕으로 한국어로 분석하세요. "
+                          "외부 출처와 로컬 관측을 구분하고 증거의 한계를 명시하세요.\n"
+                          + "\n".join(rows))[:_MAX_PROMPT_CHARS_CLOUD]
+                reduced = True
+            prompt = prompt.replace(self.api_key, "[API KEY REDACTED]")
+            stage = "모델 선택"
             ai.prompt_chars = len(prompt)
-            payload = json.dumps({"model": self.model, "messages": [{"role": "user", "content": prompt}],
-                                  "temperature": 0.2, "max_tokens": 4096, "stream": False}).encode("utf-8")
-            request = urllib.request.Request(NVIDIA_ENDPOINT, data=payload,
-                                             headers={"Authorization": "Bearer " + self.api_key,
-                                                      "Content-Type": "application/json", "Accept": "application/json"}, method="POST")
             opener = urllib.request.build_opener(_NoApiRedirect())
-            with opener.open(request, timeout=timeout) as response:
-                data = json.loads(response.read())
-            choice = data["choices"][0]
-            content = choice["message"].get("content")
-            if not isinstance(content, str) or not content.strip():
+            # 설정 모델이 카탈로그에서 빠졌거나 제공 종료(404/410)된 경우
+            # 다음 후보로 자동 대체한다 — 모델 ID 하나 때문에 AI 분석이 통째로 죽지 않게.
+            candidates = nvidia_model_candidates(NVIDIA_BASE_URL, self.api_key, self.model)
+            stage = "NVIDIA 요청"
+            disconnects = 0
+            data = None
+            for idx, cand in enumerate(candidates):
+                stage = "NVIDIA 요청"
+                tried.append(cand)
+                payload = json.dumps({"model": cand, "messages": [{"role": "user", "content": prompt}],
+                                      "temperature": 0.2, "max_tokens": default_max_tokens(cand),
+                                      "stream": False}).encode("utf-8")
+                request = urllib.request.Request(NVIDIA_ENDPOINT, data=payload,
+                                                 headers={"Authorization": "Bearer " + self.api_key,
+                                                          "Content-Type": "application/json", "Accept": "application/json"}, method="POST")
+                try:
+                    raw = None
+                    while raw is None:
+                        try:
+                            with opener.open(request, timeout=timeout) as response:
+                                raw = response.read()
+                        except (ConnectionError, IncompleteRead, urllib.error.URLError) as exc:
+                            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                            if not isinstance(cause, (RemoteDisconnected, ConnectionResetError,
+                                                      ConnectionAbortedError, BrokenPipeError, IncompleteRead)):
+                                raise
+                            disconnects += 1
+                            if disconnects >= 3:
+                                ai.error = f"NVIDIA 응답 연결이 세 차례 끊겨 AI 분석을 완료하지 못했습니다 (모델 {cand})."
+                                return ai
+                            time.sleep(disconnects)
+                            if disconnects == 2 and idx + 1 < len(candidates):
+                                break
+                    if raw is None:
+                        continue
+                    try:
+                        stage = "응답 해석"
+                        data = json.loads(raw)
+                        choice = data["choices"][0]
+                        message = choice["message"]
+                        content = message.get("content")
+                        if isinstance(content, list):
+                            content = "\n".join(part["text"] for part in content
+                                if isinstance(part, dict) and isinstance(part.get("text"), str)
+                                and part.get("type") in ("text", "output_text"))
+                        if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
+                            ai.error = "NVIDIA 모델이 분석 응답을 제한했습니다."
+                            return ai
+                        if not isinstance(content, str) or not _strip_think(content).strip():
+                            reason = ("응답 토큰 한도 내 최종 본문 없음" if choice.get("finish_reason") == "length"
+                                      else "최종 분석 본문 없음")
+                            raise ValueError(reason)
+                    except (ValueError, KeyError, TypeError, IndexError, AttributeError) as parse_error:
+                        if idx + 1 < len(candidates) and idx < 2:
+                            continue
+                        reason = str(parse_error) if str(parse_error) in (
+                            "응답 토큰 한도 내 최종 본문 없음", "최종 분석 본문 없음") else "응답 형식 오류"
+                        ai.error = f"NVIDIA {reason} (모델 {cand}, 시도 {len(tried)}회)"
+                        return ai
+                    break
+                except urllib.error.HTTPError as exc:
+                    if exc.code in (404, 410) and idx + 1 < len(candidates):
+                        exc.close()
+                        continue
+                    raise
+            if cand != self.model:
+                self.model_note = f"설정 모델 '{self.model}' 사용 불가 → '{cand}' 자동 대체"
+                self.model = ai.model = cand
+            # reasoning 모델의 <think> 블록 제거 — 사고 과정 속 기법 ID 오탐 방지
+            ai.response = _strip_think(content).replace(self.api_key, "[API KEY REDACTED]")
+            if not ai.response.strip():
                 raise ValueError("empty response")
-            ai.response = content.replace(self.api_key, "[API KEY REDACTED]")
             if choice.get("finish_reason") == "length":
                 ai.response += "\n\n*(응답 토큰 한도에 도달해 분석이 중단되었습니다)*"
+            # 데이터로 확정 가능한 섹션은 계산값으로 교체 (할루시네이션 방지)
             try:
                 ai.response = _inject_behavioral_section(ai.response, _build_behavioral_text(result))
             except Exception:
                 pass
+            try:
+                # IOC 는 모델이 고르게 두지 않는다 — 배경 도메인을 C2 로 오지목하는 것 차단
+                _ioc_txt = _build_ioc_text(result)
+                if _ioc_txt:
+                    ai.response = _replace_section(ai.response, "확인된 IOC", _ioc_txt)
+            except Exception:
+                pass
+            try:
+                # 서술 섹션의 기법 ID → 기법 이름
+                ai.response = _expand_technique_ids(ai.response, result)
+            except Exception:
+                pass
             ai.response = ai.response.replace(self.api_key, "[API KEY REDACTED]")
+            stage = "ATT&CK 응답 정리"
             ai.mitre_techniques = parse_mitre_from_ai(ai.response)
+            if reduced:
+                ai.response = "상세 자료 구성에 실패해 ATT&CK 근거 요약으로 분석했습니다.\n\n" + ai.response
         except urllib.error.HTTPError as exc:
             reasons = {401: "API 키 인증 실패", 403: "모델 접근 권한 없음", 404: "모델 또는 API를 찾을 수 없음",
                        410: "설정한 모델의 API 제공이 종료되었습니다. AI 설정에서 모델을 변경해 주세요.",
                        429: "호출 한도 초과 — 잠시 후 재시도", 402: "API 크레딧 확인 필요"}
             ai.error = f"NVIDIA API 오류 ({exc.code}): {reasons.get(exc.code, '서버 응답 오류')}"
+            if exc.code in (404, 410) and tried:
+                ai.error += (f" — 시도한 모델: {', '.join(tried)}. "
+                             "`python analyzer.py --list-ai-models` 로 사용 가능한 모델을 확인하세요.")
             exc.close()
         except (TimeoutError, urllib.error.URLError):
             ai.error = f"NVIDIA API 연결 실패 또는 타임아웃 ({timeout}초)"
-        except (ValueError, KeyError, IndexError, TypeError):
-            ai.error = "NVIDIA API 응답이 비어 있거나 예상한 Chat Completions 형식이 아닙니다."
-        except Exception:
-            ai.error = "NVIDIA AI 분석 처리 중 오류가 발생했습니다."
+        except Exception as exc:
+            import traceback
+            frame = traceback.extract_tb(exc.__traceback__)[-1]
+            ai.error = (f"{stage} 실패 ({type(exc).__name__}, "
+                        f"{Path(frame.filename).name}:{frame.lineno}, 모델 {ai.model})").replace(
+                            self.api_key, "[API KEY REDACTED]")
         ai.elapsed_sec = round(time.monotonic() - start, 1)
         return ai
 

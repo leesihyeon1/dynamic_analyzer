@@ -279,6 +279,9 @@ class HTTPRequest:
     extra_headers:  str  = ""    # 기타 주목할 헤더 (콤마 구분)
     body_preview:   str  = ""    # 요청 바디 앞 512자
 
+    src_ip: str = ""
+    src_port: int = 0
+
 
 @dataclass
 class TLSInfo:
@@ -289,6 +292,9 @@ class TLSInfo:
     ja3:         str  = ""    # JA3 MD5 핑거프린트
     ja3_label:   str  = ""    # 알려진 도구명 (Cobalt Strike 등)
     tls_version: str  = ""    # TLS 버전 문자열 (TLS 1.2 / TLS 1.3)
+
+    src_ip: str = ""
+    src_port: int = 0
 
 
 @dataclass
@@ -304,6 +310,8 @@ class SmtpSession:
     has_auth:    bool      = False
     has_data:    bool      = False  # DATA 명령 확인 여부
 
+    src_port: int = 0
+
 
 @dataclass
 class FtpSession:
@@ -315,6 +323,8 @@ class FtpSession:
     has_auth:   bool      = False
     uploaded:   list[str] = field(default_factory=list)   # STOR 파일명
     downloaded: list[str] = field(default_factory=list)   # RETR 파일명
+
+    src_port: int = 0
 
 
 @dataclass
@@ -621,7 +631,7 @@ _SMTP_RCPT_RE  = re.compile(rb"RCPT TO:\s*<([^>]+)>",  re.IGNORECASE)
 _SMTP_EHLO_RE  = re.compile(rb"(?:EHLO|HELO)\s+(\S+)",  re.IGNORECASE)
 _SMTP_AUTH_RE  = re.compile(rb"AUTH\s+LOGIN",            re.IGNORECASE)
 
-_FTP_CMD_RE    = re.compile(rb"^(USER|PASS|STOR|RETR|MKD|CWD|PWD|QUIT)\s*(\S*)", re.IGNORECASE | re.MULTILINE)
+_FTP_CMD_RE    = re.compile(rb"^(USER|PASS|STOR|RETR|MKD|CWD|PWD|QUIT)(?:[ \t]+([^\r\n]*))?\r?$", re.IGNORECASE | re.MULTILINE)
 
 
 def _parse_smtp_raw(
@@ -671,7 +681,7 @@ def _parse_smtp_raw(
                         pass
                 break
 
-    if b"DATA" in raw.upper():
+    if re.search(rb"^DATA[ \t]*\r?$", raw, re.IGNORECASE | re.MULTILINE):
         sess.has_data = True
 
     return sess
@@ -726,6 +736,8 @@ def _parse_http_raw(
     raw_bytes: bytes,
     dst_ip: str = "",
     dst_port: int = 80,
+    src_ip: str = "",
+    src_port: int = 0,
 ) -> Optional[HTTPRequest]:
     m = _HTTP_REQ_RE.search(raw_bytes)
     if not m:
@@ -765,7 +777,7 @@ def _parse_http_raw(
         method=method, host=host, path=path,
         user_agent=ua, content_length=cl,
         referer=referer, has_cookie=cookie,
-        dst_ip=dst_ip, dst_port=dst_port,
+        dst_ip=dst_ip, dst_port=dst_port, src_ip=src_ip, src_port=src_port,
         content_type=ct, authorization=auth,
         extra_headers=", ".join(extra_parts),
         body_preview=body_preview,
@@ -835,6 +847,36 @@ def _run_tshark_fields(
         return [ln.split("\t") for ln in r.stdout.splitlines() if ln.strip()]
     except Exception:
         return []
+
+
+def _tshark_transfer_sessions(pcap_path, tshark_path):
+    fields = ["tcp.stream", "ip.src", "ipv6.src", "tcp.srcport", "ip.dst", "ipv6.dst",
+              "tcp.dstport", "smtp.req.command", "smtp.req.parameter",
+              "ftp.request.command", "ftp.request.arg"]
+    sessions = defaultdict(list)
+    for row in _run_tshark_fields(tshark_path, pcap_path, fields,
+                                  display_filter="smtp.req.command || ftp.request.command"):
+        if len(row) != len(fields):
+            continue
+        stream, v4, v6, sport, dst4, dst6, dport, smtp, param, ftp, arg = row
+        if not (sport.isdigit() and dport.isdigit()):
+            continue
+        proto = "SMTP" if smtp else "FTP"
+        command, value = (smtp.upper(), param) if smtp else (ftp.upper(), arg)
+        if command not in ("HELO", "EHLO", "MAIL", "RCPT", "DATA", "STOR", "RETR"):
+            continue
+        key = (proto, stream, v4 or v6, int(sport), dst4 or dst6, int(dport))
+        sessions[key].append(f"{command} {value}".rstrip())
+
+    smtp_sessions, ftp_sessions = [], []
+    for (proto, stream, src, sport, dst, dport), lines in sessions.items():
+        payload = "\r\n".join(lines).encode()
+        parser = _parse_smtp_raw if proto == "SMTP" else _parse_ftp_raw
+        session = parser(payload, src, dst, dport)
+        if session:
+            session.src_port = sport
+            (smtp_sessions if proto == "SMTP" else ftp_sessions).append(session)
+    return smtp_sessions, ftp_sessions
 
 
 def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
@@ -956,6 +998,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
                 if not (sni and _is_analysis_service_domain(sni)):
                     tls_list.append(TLSInfo(
                         sni=sni, dst_ip=dst_ip, dst_port=dst_port,
+                        src_ip=src_ip, src_port=src_port if proto == "TCP" else 0,
                         ja3=ja3, ja3_label=_KNOWN_JA3.get(ja3, ""),
                     ))
 
@@ -990,6 +1033,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         "http.request.uri", "http.user_agent",
         "http.content_length", "http.referer",
         "http.cookie", "http.content_type", "http.authorization",
+        "ip.src", "tcp.srcport", "ipv6.src", "ipv6.dst",
     ]
     for row in _run_tshark_fields(
         tshark_path, pcap_path, P3, display_filter="http.request",
@@ -1003,7 +1047,9 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
             cl_str = _h(6)
             port_str = _h(1)
             http_list.append(HTTPRequest(
-                dst_ip=_h(0),
+                dst_ip=_h(0) or _h(14),
+                src_ip=_h(11) or _h(13),
+                src_port=int(_h(12)) if _h(12).isdigit() else 0,
                 dst_port=int(port_str) if port_str.isdigit() else 80,
                 host=_h(2),
                 method=method,
@@ -1084,9 +1130,12 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         unique_domains=len(raw_domains),
     )
 
+    smtp_sessions, ftp_sessions = _tshark_transfer_sessions(pcap_path, tshark_path)
     return PcapResult(
         connections=list(conn_map.values()),
         dns_queries=list(dns_seen.values()),
+        smtp_sessions=smtp_sessions,
+        ftp_sessions=ftp_sessions,
         http_requests=http_list,
         tls_info=tls_list,
         beacon_candidates=_detect_beacons(beacon_ts),
@@ -1296,7 +1345,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                             sni=sni or "",
                             dst_ip=dst_ip, dst_port=dst_port,
                             ja3=ja3_hash, ja3_label=ja3_label,
-                            tls_version=ver_str,
+                            tls_version=ver_str, src_ip=src_ip, src_port=src_port,
                         ))
                 else:
                     # ClientHello가 아닌 경우 SNI 전용 폴백
@@ -1304,7 +1353,8 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                     if sni:
                         raw_domains.add(sni)
                         if not _is_analysis_service_domain(sni):
-                            tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port))
+                            tls_list.append(TLSInfo(sni=sni, dst_ip=dst_ip, dst_port=dst_port,
+                                                    src_ip=src_ip, src_port=src_port))
 
             # --- HTTP 파싱 ---
             # scapy.layers.http 임포트 시 포트 80 패킷은 HTTPRequest 레이어로 자동
@@ -1329,23 +1379,23 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                             method=method, host=host, path=path,
                             user_agent=ua, content_length=cl,
                             has_cookie=cookie, content_type=ct, authorization=auth,
-                            body_preview=body_preview,
+                            body_preview=body_preview, src_ip=src_ip, src_port=src_port,
                             dst_ip=dst_ip, dst_port=dst_port,
                         ))
                     except Exception:
                         if raw_bytes:
-                            req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
+                            req = _parse_http_raw(raw_bytes, dst_ip, dst_port, src_ip, src_port)
                             if req:
                                 http_list.append(req)
                 elif raw_bytes:
-                    req = _parse_http_raw(raw_bytes, dst_ip, dst_port)
+                    req = _parse_http_raw(raw_bytes, dst_ip, dst_port, src_ip, src_port)
                     if req:
                         http_list.append(req)
 
             # --- SMTP / FTP 페이로드 수집 ---
             if proto == "TCP" and Raw in pkt:
                 raw_bytes = bytes(pkt[Raw])
-                c2_key = (src_ip, dst_ip, dst_port)
+                c2_key = (src_ip, src_port, dst_ip, dst_port)
                 if dst_port in SMTP_PORTS:
                     smtp_raw[c2_key].extend(raw_bytes)
                 elif dst_port in FTP_PORTS:
@@ -1388,15 +1438,17 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
 
     # --- SMTP / FTP 세션 파싱 ---
     smtp_sessions: list[SmtpSession] = []
-    for (src, dst, dport), payload in smtp_raw.items():
+    for (src, sport, dst, dport), payload in smtp_raw.items():
         s = _parse_smtp_raw(bytes(payload), src, dst, dport)
         if s:
+            s.src_port = sport
             smtp_sessions.append(s)
 
     ftp_sessions: list[FtpSession] = []
-    for (src, dst, dport), payload in ftp_raw.items():
+    for (src, sport, dst, dport), payload in ftp_raw.items():
         s = _parse_ftp_raw(bytes(payload), src, dst, dport)
         if s:
+            s.src_port = sport
             ftp_sessions.append(s)
 
     # --- TCP SYN 미응답 연결 시도 ---

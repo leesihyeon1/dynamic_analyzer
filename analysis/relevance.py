@@ -67,6 +67,8 @@ OS_BACKGROUND_PROCS: frozenset[str] = frozenset({
     # Edge / 패키지 자동 업데이트
     "microsoftedgeupdate.exe", "microsoftedgeupdatecore.exe",
     "windowspackagemanagerserver.exe", "winget.exe", "msedge.exe",
+    # WebView2 런타임 — 위젯·검색·분석 도구 UI 가 상시 띄운다 (계보에 있으면 계보 우선)
+    "msedgewebview2.exe",
     # VM 게스트 도구 (분석 VM 자체의 배경 활동)
     "vmtoolsd.exe", "vmwareresolutionset.exe", "vmwaretray.exe",
     "vmwareuser.exe", "vm3dservice.exe", "vgauthservice.exe",
@@ -84,6 +86,9 @@ OS_BACKGROUND_DOMAIN_SUFFIXES: tuple[str, ...] = (
     "windows.net", "msedge.net", "office.com", "office.net", "live.com",
     "digicert.com", "verisign.com", "globalsign.com", "sectigo.com",
     "entrust.net", "letsencrypt.org",
+    # 분석 도구 자체의 업데이트 확인 (System Informer / Process Hacker / Wireshark)
+    "system-informer.com", "systeminformer.sourceforge.io", "processhacker.sourceforge.io",
+    "wireshark.org",
 )
 
 OS_BACKGROUND_PATH_FRAGMENTS: tuple[str, ...] = (
@@ -99,12 +104,19 @@ OS_BACKGROUND_PATH_FRAGMENTS: tuple[str, ...] = (
     r"\appdata\local\packages",
     r"\appdata\local\microsoft\edge",
     r"\appdata\local\connecteddevicesplatform",
+    # Chromium/WebView2 프로필·컴포넌트 자동 갱신 (계보가 쓴 파일은 lineage_paths 로 먼저 잡힌다)
+    r"\ebwebview" "\\", r"\edgewebview" "\\", r"\msedge_chrome_unpacker",
+    r"\msedgeedge_bits_", r"\component_crx_cache" "\\", r"\widevinecdm" "\\",
+    # OS 상태 파일
+    r"\windows\servicestate" "\\", r"\$logfile", r"\$mft",
 )
 
 # 분석 도구가 남기는 흔적
 _ANALYSIS_ARTIFACT_FRAGMENTS: tuple[str, ...] = (
     "procmon", "pe-sieve", "pe_sieve", "hollows_hunter", "hollows-hunter",
     "systeminformer", "processhacker", "tshark", "dumpcap", "wireshark",
+    # 분석기 자신의 산출물 — pe-sieve/HH 덤프, 리포트
+    "\\dumps\\process_", "_dynamic_report.",
 )
 
 
@@ -515,7 +527,7 @@ _JIT_FP_PRONE: frozenset[str] = frozenset({
     "shellexperiencehost.exe", "startmenuexperiencehost.exe",
     "runtimebroker.exe", "svchost.exe", "taskhostw.exe", "sihost.exe",
     "textinputhost.exe", "applicationframehost.exe", "systemsettings.exe",
-    "tieringengineservice.exe", "msedge.exe", "widgets.exe",
+    "tieringengineservice.exe", "msedge.exe", "msedgewebview2.exe", "widgets.exe",
     "phoneexperiencehost.exe", "lockapp.exe", "wmiprvse.exe",
 })
 
