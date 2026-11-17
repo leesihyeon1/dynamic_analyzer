@@ -16,6 +16,7 @@ Requires scapy; degrades gracefully when not installed.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import math
 import re
 import statistics
@@ -60,7 +61,7 @@ SUSPICIOUS_PORTS: frozenset[int] = frozenset({
 
 # 정보 탈취 C2에 사용되는 프로토콜별 포트 목록
 # 의심 포트와 별개로 관리 — 정상 서비스와 겹치지만 분석 컨텍스트에서는 C2로 사용됨
-SMTP_PORTS:  frozenset[int] = frozenset({25, 465, 587})
+SMTP_PORTS:  frozenset[int] = frozenset({25, 465, 587, 2525})   # 2525 = 대체 submission 포트
 FTP_PORTS:   frozenset[int] = frozenset({21, 2121})
 POP3_PORTS:  frozenset[int] = frozenset({110, 995})
 IMAP_PORTS:  frozenset[int] = frozenset({143, 993})
@@ -85,6 +86,10 @@ DNS_TUNNEL_LABEL_LEN = 30
 # 비콘 탐지: 최소 반복 횟수, 최대 지터 비율
 BEACON_MIN_COUNT = 5
 BEACON_MAX_JITTER = 0.30   # 30% 이내 편차면 비콘으로 판단
+
+# 비콘 판정에서 제외할 UDP 포트 — OS 이름 해석/탐색 프로토콜(mDNS, LLMNR, SSDP,
+# NetBIOS)은 주기적으로 반복되어 비콘처럼 보이지만 C2가 아니다.
+BEACON_EXEMPT_UDP_PORTS: frozenset[int] = frozenset({5353, 5355, 1900, 137, 138, 3702})
 
 # ── JA3 / JA3S 핑거프린팅 ─────────────────────────────────────────────
 # GREASE 값 (RFC 8701) — JA3 계산 시 제외
@@ -235,6 +240,8 @@ class NetworkConnection:
     last_seen:  float = 0.0
     suspicious_port: bool = False
     src_port:   int   = 0    # 로컬 ephemeral 포트 — ProcMon local_port 역추적용
+    # 요약 연결에 포함된 클라이언트 포트 전체 (흐름별 귀속용, 최대 200개)
+    src_ports:  list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -360,6 +367,9 @@ class PcapSummary:
 @dataclass
 class PcapResult:
     connections:          list[NetworkConnection]  = field(default_factory=list)
+    # 5-튜플(프로토콜, 클라이언트 IP:포트, 서버 IP:포트) 단위 흐름.
+    # connections 는 (프로토콜, 클라이언트 IP, 서버 IP, 서버 포트) 요약 뷰다.
+    flows:                list[NetworkConnection]  = field(default_factory=list)
     dns_queries:          list[DNSQuery]           = field(default_factory=list)
     raw_dns_queries:      list[DnsRawQuery]        = field(default_factory=list)
     http_requests:        list[HTTPRequest]        = field(default_factory=list)
@@ -386,20 +396,242 @@ class PcapResult:
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _is_private_ip(ip: str) -> bool:
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+# 문서용 대역(RFC 5737 / RFC 3849)은 실제 트래픽에 나오지 않지만 데모·테스트
+# 데이터에서 "외부 C2" 예시로 쓰이므로 외부 주소로 간주한다.
+_DOC_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32",
+))
+
+
+def normalize_ip(ip) -> str:
+    """IP 문자열 정규화 — 괄호·스코프 ID 제거, IPv4-mapped IPv6 → IPv4, 축약형 통일.
+
+    IP가 아니면 공백만 제거한 원문을 반환한다 (호스트명 등).
+    """
+    s = str(ip or "").strip().strip("[]")
+    a = _ip_obj(s)
+    return str(a) if a is not None else s
+
+
+def _ip_obj(ip):
+    """문자열 → ipaddress 객체. IP가 아니면 None."""
+    s = str(ip or "").strip().strip("[]")
+    if "%" in s:                       # fe80::1%12 (스코프 ID)
+        s = s.split("%", 1)[0]
     try:
-        parts = ip.split(".")
-        if len(parts) != 4:
+        a = ipaddress.ip_address(s)
+    except ValueError:
+        return None
+    if a.version == 6 and a.ipv4_mapped is not None:
+        a = a.ipv4_mapped
+    return a
+
+
+def is_external_ip(ip) -> bool:
+    """외부(공인 유니캐스트) 주소면 True.
+
+    사설(RFC1918/ULA), 루프백, 링크로컬(169.254/16, fe80::/10), 멀티캐스트
+    (224.0.0.0/4, ff00::/8 — mDNS·LLMNR·SSDP), 브로드캐스트, 예약·미지정,
+    CGNAT(100.64/10) 및 IP가 아닌 문자열은 모두 외부가 아니다.
+    외부/내부 판정의 단일 기준이므로 다른 모듈도 이 함수를 재사용할 것.
+    """
+    a = _ip_obj(ip)
+    if a is None:
+        return False
+    if any(a.version == n.version and a in n for n in _DOC_NETS):
+        return True
+    if (a.is_multicast or a.is_unspecified or a.is_loopback or a.is_link_local
+            or a.is_reserved or a.is_private):
+        return False
+    if a.version == 4 and a in _CGNAT_NET:
+        return False
+    if a.version == 6 and a.is_site_local:
+        return False
+    return True
+
+
+def _is_private_ip(ip: str) -> bool:
+    """외부 주소가 아니면 True (하위 호환 이름 — is_external_ip 의 부정)."""
+    return not is_external_ip(ip)
+
+
+# 서버 측으로 간주할 잘 알려진 포트 (흐름 방향 추정용)
+_SERVER_HINT_PORTS: frozenset[int] = frozenset({
+    1080, 1433, 1900, 2121, 2222, 2323, 2525, 3306, 3389, 3702, 4444, 5228,
+    5353, 5355, 5432, 5900, 6379, 8000, 8008, 8080, 8443, 8888, 9001, 9050,
+    9150, 27017,
+}) | SMTP_PORTS | FTP_PORTS | POP3_PORTS | IMAP_PORTS | IRC_PORTS
+
+
+def _is_server_port(port: int) -> bool:
+    return 0 < port < 1024 or port in _SERVER_HINT_PORTS
+
+
+def _client_is_src(proto: str, sport: int, dport: int,
+                   tcp_flags: Optional[int] = None) -> bool:
+    """첫 관측 패킷 기준으로 송신 측이 연결 개시자(클라이언트)인지 추정한다.
+
+    TCP SYN(ACK 없음) 송신자 = 클라이언트, SYN-ACK 송신자 = 서버.
+    핸드셰이크를 놓쳤으면 잘 알려진 포트 쪽을 서버로 본다. 둘 다 같은 성격이면
+    낮은 포트를 서버로, 판단 불가하면 처음 관측된 송신자를 클라이언트로 둔다.
+    """
+    if proto == "TCP" and tcp_flags is not None:
+        if (tcp_flags & 0x12) == 0x02:
+            return True
+        if (tcp_flags & 0x12) == 0x12:
             return False
-        a, b = int(parts[0]), int(parts[1])
-        if a == 10:            return True
-        if a == 172 and 16 <= b <= 31: return True
-        if a == 192 and b == 168:      return True
-        if a == 127:           return True
-        if a == 169 and b == 254:      return True
-    except (ValueError, AttributeError):
-        pass
-    return False
+    s_srv, d_srv = _is_server_port(sport), _is_server_port(dport)
+    if d_srv and not s_srv:
+        return True
+    if s_srv and not d_srv:
+        return False
+    if s_srv and d_srv and sport != dport:
+        return dport < sport
+    return True
+
+
+class _FlowTable:
+    """패킷을 방향 정규화된 5-튜플 흐름으로 집계한다.
+
+    응답 패킷(서버→클라이언트)은 별도 '연결'이 되지 않고 같은 흐름의 bytes_in
+    으로 누적된다. 흐름의 src 는 항상 연결 개시자(클라이언트)다.
+    """
+
+    _MAX_SRC_PORTS = 200
+
+    def __init__(self) -> None:
+        self._flows: dict[tuple, NetworkConnection] = {}
+
+    def add(self, proto: str, src_ip: str, sport: int, dst_ip: str, dport: int,
+            length: int, ts: float, tcp_flags: Optional[int] = None) -> bool:
+        """패킷 1개 반영. 반환값: 이 패킷이 클라이언트→서버 방향이면 True."""
+        a, b = (src_ip, sport), (dst_ip, dport)
+        canon = (proto,) + ((a, b) if a <= b else (b, a))
+        flow = self._flows.get(canon)
+        if flow is None:
+            if _client_is_src(proto, sport, dport, tcp_flags):
+                (cip, cport), (sip, sport_) = a, b
+            else:
+                (cip, cport), (sip, sport_) = b, a
+            flow = NetworkConnection(
+                proto=proto, src_ip=cip, dst_ip=sip, dst_port=sport_,
+                count=0, bytes_out=0, bytes_in=0,
+                first_seen=ts, last_seen=ts,
+                suspicious_port=(sport_ in SUSPICIOUS_PORTS),
+                src_port=cport, src_ports=[cport] if cport else [],
+            )
+            self._flows[canon] = flow
+        outbound = (src_ip, sport) == (flow.src_ip, flow.src_port)
+        flow.count += 1
+        if outbound:
+            flow.bytes_out += length
+        else:
+            flow.bytes_in += length
+        if ts:
+            if not flow.first_seen or ts < flow.first_seen:
+                flow.first_seen = ts
+            if ts > flow.last_seen:
+                flow.last_seen = ts
+        return outbound
+
+    def flows(self) -> list[NetworkConnection]:
+        return list(self._flows.values())
+
+    def summary_connections(self) -> list[NetworkConnection]:
+        return summarize_flows(self._flows.values())
+
+
+def summarize_flows(flows) -> list[NetworkConnection]:
+    """흐름 목록 → (프로토콜, 클라이언트 IP, 서버 IP, 서버 포트) 요약 연결 목록."""
+    agg: dict[tuple, NetworkConnection] = {}
+    for f in flows:
+        key = (f.proto, f.src_ip, f.dst_ip, f.dst_port)
+        c = agg.get(key)
+        if c is None:
+            agg[key] = NetworkConnection(
+                proto=f.proto, src_ip=f.src_ip, dst_ip=f.dst_ip, dst_port=f.dst_port,
+                count=f.count, bytes_out=f.bytes_out, bytes_in=f.bytes_in,
+                first_seen=f.first_seen, last_seen=f.last_seen,
+                suspicious_port=f.suspicious_port, src_port=f.src_port,
+                src_ports=[f.src_port] if f.src_port else [],
+            )
+            continue
+        c.count     += f.count
+        c.bytes_out += f.bytes_out
+        c.bytes_in  += f.bytes_in
+        if f.first_seen and (not c.first_seen or f.first_seen < c.first_seen):
+            c.first_seen = f.first_seen
+        c.last_seen = max(c.last_seen, f.last_seen)
+        if (f.src_port and f.src_port not in c.src_ports
+                and len(c.src_ports) < _FlowTable._MAX_SRC_PORTS):
+            c.src_ports.append(f.src_port)
+    return list(agg.values())
+
+
+def _is_beacon_target(proto: str, dst_ip: str, dst_port: int) -> bool:
+    """비콘 타임스탬프를 기록할 대상인지 — 외부 주소이고 OS 탐색 UDP 포트가 아님."""
+    if not is_external_ip(dst_ip):
+        return False
+    return not (proto == "UDP" and dst_port in BEACON_EXEMPT_UDP_PORTS)
+
+
+def _dns_name(v) -> str:
+    if isinstance(v, bytes):
+        v = v.decode(errors="replace")
+    return str(v or "").rstrip(".")
+
+
+def _iter_dns_rrs(section):
+    """scapy DNS 응답 섹션 순회 — 2.6+ 리스트 형식과 구형 체인 형식 모두 지원."""
+    if section is None or isinstance(section, (int, bytes, str)):
+        return
+    if isinstance(section, (list, tuple)):
+        for rr in section:
+            if rr is not None and hasattr(rr, "rrname"):
+                yield rr
+        return
+    rr = section
+    seen = 0
+    while rr is not None and hasattr(rr, "rrname") and seen < 256:
+        yield rr
+        seen += 1
+        rr = getattr(rr, "payload", None)
+
+
+def _dns_first_qname(dns_pkt) -> str:
+    qd = getattr(dns_pkt, "qd", None)
+    if isinstance(qd, (list, tuple)):
+        qd = qd[0] if qd else None
+    return _dns_name(getattr(qd, "qname", b"")) if qd is not None else ""
+
+
+def _dns_answer_pairs(dns_pkt) -> list[tuple[str, str]]:
+    """DNS 응답 → [(도메인, IP)].
+
+    A/AAAA 응답은 질의한 원래 이름(qd)과 레코드 소유자 이름(CNAME 대상) 모두에
+    매핑한다. 그래야 CNAME 체인을 거친 응답도 질의 이름으로 조회된다.
+    """
+    qname = _dns_first_qname(dns_pkt)
+    pairs: list[tuple[str, str]] = []
+    for rr in _iter_dns_rrs(getattr(dns_pkt, "an", None)):
+        try:
+            rtype = int(getattr(rr, "type", 0) or 0)
+        except (TypeError, ValueError):
+            rtype = 0
+        rdata = getattr(rr, "rdata", None)
+        if isinstance(rdata, bytes):
+            rdata = rdata.decode(errors="replace")
+        ip = str(rdata or "").strip()
+        if rtype not in (1, 28) and _ip_obj(ip) is None:
+            continue
+        if _ip_obj(ip) is None or not is_external_ip(ip):
+            continue
+        ip = normalize_ip(ip)
+        owner = _dns_name(getattr(rr, "rrname", b""))
+        for name in dict.fromkeys(n for n in (qname, owner) if n):
+            pairs.append((name, ip))
+    return pairs
 
 
 def _shannon_entropy(s: str) -> float:
@@ -823,17 +1055,32 @@ def _detect_beacons(
 # tshark 기반 파서 (scapy 없이 동작하는 fallback)
 # ---------------------------------------------------------------------------
 
+def _parse_int(v) -> Optional[int]:
+    """'123' / '0x0012' 형식 정수 파싱. 실패 시 None."""
+    v = str(v or "").strip()
+    if not v:
+        return None
+    try:
+        return int(v, 0)
+    except ValueError:
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+
 def _run_tshark_fields(
     tshark_path: str,
     pcap_path: Path,
     fields: list[str],
     display_filter: str = "",
     occurrence: str = "f",
+    extra_args: Optional[list[str]] = None,
 ) -> list[list[str]]:
     """tshark -T fields 실행 → 행×열 리스트 반환"""
     import subprocess
 
-    cmd = [tshark_path, "-r", str(pcap_path), "-T", "fields"]
+    cmd = [tshark_path, "-r", str(pcap_path), *(extra_args or []), "-T", "fields"]
     for f in fields:
         cmd += ["-e", f]
     cmd += ["-E", "separator=\t", f"-E", f"occurrence={occurrence}", "-E", "quote=n"]
@@ -854,8 +1101,13 @@ def _tshark_transfer_sessions(pcap_path, tshark_path):
               "tcp.dstport", "smtp.req.command", "smtp.req.parameter",
               "ftp.request.command", "ftp.request.arg"]
     sessions = defaultdict(list)
+    # 비표준 포트(2525 등)는 tshark 기본 디섹터 등록에 없어 Decode-As 로 지정한다.
+    decode_as = []
+    for port in sorted(SMTP_PORTS - {25, 465, 587}):
+        decode_as += ["-d", f"tcp.port=={port},smtp"]
     for row in _run_tshark_fields(tshark_path, pcap_path, fields,
-                                  display_filter="smtp.req.command || ftp.request.command"):
+                                  display_filter="smtp.req.command || ftp.request.command",
+                                  extra_args=decode_as):
         if len(row) != len(fields):
             continue
         stream, v4, v6, sport, dst4, dst6, dport, smtp, param, ftp, arg = row
@@ -887,9 +1139,11 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
     Pass 2 — DNS 응답:  IP↔도메인 매핑
     Pass 3 — HTTP 요청: 메서드·호스트·User-Agent
     """
-    conn_map:     dict[tuple, NetworkConnection]  = {}
+    flow_table = _FlowTable()
     dns_seen:     dict[str, DNSQuery]             = {}
     ip_to_domain: dict[str, list[str]]            = defaultdict(list)
+    dns_responses:dict[str, list[str]]            = defaultdict(list)  # name→[ip]
+    raw_dns_list: list[DnsRawQuery]               = []                 # 프로세스 귀속용
     http_list:    list[HTTPRequest]               = []
     tls_list:     list[TLSInfo]                   = []
     beacon_ts:    dict[tuple, list[float]]        = defaultdict(list)
@@ -918,6 +1172,9 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         "tls.record.version",                      # 12  TLS 레코드 버전
         "tcp.srcport",                             # 13  로컬 포트 — ProcMon 역추적용
         "udp.srcport",                             # 14
+        "tcp.flags",                               # 15  흐름 방향 판정 (SYN/SYN-ACK)
+        "dns.flags.response",                      # 16  DNS 질의(0)/응답(1)
+        "dns.id",                                  # 17  DNS Transaction ID
     ]
     for row in _run_tshark_fields(tshark_path, pcap_path, P1):
         packets_loaded += 1
@@ -947,42 +1204,40 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
                 packets_skipped += 1
                 continue
 
-            # 연결 추적
-            key = (proto, src_ip, dst_ip, dst_port)
-            if key in conn_map:
-                c = conn_map[key]
-                c.count     += 1
-                c.bytes_out += flen
-                c.last_seen  = ts
-            else:
-                conn_map[key] = NetworkConnection(
-                    proto=proto, src_ip=src_ip, dst_ip=dst_ip,
-                    dst_port=dst_port, count=1,
-                    bytes_out=flen, bytes_in=0,
-                    first_seen=ts, last_seen=ts,
-                    suspicious_port=(dst_port in SUSPICIOUS_PORTS),
-                    src_port=src_port,
-                )
+            # 연결 추적 — 방향 정규화된 5-튜플 흐름
+            src_ip, dst_ip = normalize_ip(src_ip), normalize_ip(dst_ip)
+            flags = _parse_int(_f(15)) if proto == "TCP" else None
+            flow_table.add(proto, src_ip, src_port, dst_ip, dst_port, flen, ts, flags)
 
-            if not _is_private_ip(dst_ip):
+            if is_external_ip(dst_ip):
                 raw_ips.add(dst_ip)
                 total_bytes_out += flen
-                beacon_ts[(dst_ip, dst_port)].append(ts)
+                if _is_beacon_target(proto, dst_ip, dst_port):
+                    beacon_ts[(dst_ip, dst_port)].append(ts)
             else:
                 total_bytes_in += flen
 
-            # DNS 쿼리
+            # DNS 쿼리 — 응답 패킷의 질의 섹션은 집계하지 않는다 (scapy 경로와 동일)
             dns_name = _f(8).rstrip(".")
+            is_response = _f(16).lower() in ("1", "true")
+            if dns_name and not is_response:
+                qt_raw = _f(9)
+                raw_dns_list.append(DnsRawQuery(
+                    name=dns_name,
+                    qtype=_QTYPE_MAP.get(_parse_int(qt_raw) or 0, qt_raw or "A"),
+                    src_port=src_port, pkt_time=ts,
+                    tx_id=_parse_int(_f(17)) or 0,
+                ))
             # PTR 레코드(.in-addr.arpa / .ip6.arpa)와 분석 서비스 도메인은
             # DGA/터널링 판정 대상에서 제외한다. scapy 경로와 동일한 가드로,
             # dns_base_cnt 집계 전에 걸러야 base domain "in-addr.arpa" 가
             # 터널링 임계치를 넘겨 PTR 전체를 오탐하는 것을 막을 수 있다.
-            if dns_name and not _is_excluded_dns_name(dns_name):
+            if dns_name and not is_response and not _is_excluded_dns_name(dns_name):
                 raw_domains.add(dns_name)
                 dns_base_cnt[_base_domain(dns_name)] += 1
                 if dns_name not in dns_seen:
                     qt_raw = _f(9)
-                    qtype  = _QTYPE_MAP.get(int(qt_raw) if qt_raw.isdigit() else 0, qt_raw or "A")
+                    qtype  = _QTYPE_MAP.get(_parse_int(qt_raw) or 0, qt_raw or "A")
                     ent    = _subdomain_entropy(dns_name)
                     dns_seen[dns_name] = DNSQuery(
                         name=dns_name, qtype=qtype, entropy=round(ent, 3),
@@ -1007,23 +1262,38 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
             continue
 
     # ── Pass 2: DNS 응답 → IP 매핑 ───────────────────────────────────
+    # occurrence=a 로 모든 A/AAAA 레코드를 받는다 (여러 값은 ',' 로 구분).
+    # CNAME 체인을 거친 응답도 질의 이름(dns.qry.name)에 매핑한다.
     P2 = ["dns.qry.name", "dns.a", "dns.aaaa"]
     for row in _run_tshark_fields(
         tshark_path, pcap_path, P2,
         display_filter="dns.flags.response == 1",
+        occurrence="a",
     ):
         try:
-            qname = row[0].rstrip(".") if len(row) > 0 else ""
-            for ip in [row[1] if len(row) > 1 else "",
-                       row[2] if len(row) > 2 else ""]:
-                ip = ip.strip()
-                if ip and not _is_private_ip(ip):
-                    if qname in dns_seen:
-                        if ip not in dns_seen[qname].response_ips:
-                            dns_seen[qname].response_ips.append(ip)
+            def _vals(i: int) -> list[str]:
+                if i >= len(row):
+                    return []
+                return [v.strip() for v in row[i].split(",") if v.strip()]
+            qnames = _vals(0)
+            qname = qnames[0].rstrip(".") if qnames else ""
+            if not qname:
+                continue
+            for ip in _vals(1) + _vals(2):
+                if not is_external_ip(ip):
+                    continue
+                ip = normalize_ip(ip)
+                if ip not in dns_responses[qname]:
+                    dns_responses[qname].append(ip)
+                if qname not in ip_to_domain[ip]:
                     ip_to_domain[ip].append(qname)
         except Exception:
             continue
+    for qname, ips in dns_responses.items():
+        if qname in dns_seen:
+            for ip in ips:
+                if ip not in dns_seen[qname].response_ips:
+                    dns_seen[qname].response_ips.append(ip)
 
     # ── Pass 3: HTTP 요청 ─────────────────────────────────────────────
     # display_filter 없이 tcp.dstport==80 전체를 가져와 HTTP 레이어 유무와 무관하게 파싱
@@ -1068,27 +1338,27 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
     _syn_map:     dict[tuple[str, int], int] = defaultdict(int)
     _syn_ack_set: set[tuple[str, int]]       = set()
 
-    P4_syn = ["ip.dst", "tcp.dstport"]
+    P4_syn = ["ip.dst", "tcp.dstport", "ipv6.dst"]
     for row in _run_tshark_fields(
         tshark_path, pcap_path, P4_syn, display_filter="tcp.flags == 0x002",
     ):
         try:
-            ip = row[0].strip() if len(row) > 0 else ""
+            ip = (row[0].strip() if len(row) > 0 else "") or (row[2].strip() if len(row) > 2 else "")
             pt = row[1].strip() if len(row) > 1 else ""
-            if ip and pt.isdigit() and not _is_private_ip(ip):
-                _syn_map[(ip, int(pt))] += 1
+            if ip and pt.isdigit() and is_external_ip(ip):
+                _syn_map[(normalize_ip(ip), int(pt))] += 1
         except Exception:
             continue
 
-    P4_ack = ["ip.src", "tcp.srcport"]
+    P4_ack = ["ip.src", "tcp.srcport", "ipv6.src"]
     for row in _run_tshark_fields(
         tshark_path, pcap_path, P4_ack, display_filter="tcp.flags == 0x012",
     ):
         try:
-            ip = row[0].strip() if len(row) > 0 else ""
+            ip = (row[0].strip() if len(row) > 0 else "") or (row[2].strip() if len(row) > 2 else "")
             pt = row[1].strip() if len(row) > 1 else ""
-            if ip and pt.isdigit() and not _is_private_ip(ip):
-                _syn_ack_set.add((ip, int(pt)))
+            if ip and pt.isdigit() and is_external_ip(ip):
+                _syn_ack_set.add((normalize_ip(ip), int(pt)))
         except Exception:
             continue
 
@@ -1130,10 +1400,15 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         unique_domains=len(raw_domains),
     )
 
+    for _rq in raw_dns_list:
+        _rq.answers = list(dns_responses.get(_rq.name, []))
+
     smtp_sessions, ftp_sessions = _tshark_transfer_sessions(pcap_path, tshark_path)
     return PcapResult(
-        connections=list(conn_map.values()),
+        connections=flow_table.summary_connections(),
+        flows=flow_table.flows(),
         dns_queries=list(dns_seen.values()),
+        raw_dns_queries=raw_dns_list,
         smtp_sessions=smtp_sessions,
         ftp_sessions=ftp_sessions,
         http_requests=http_list,
@@ -1177,7 +1452,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
         return PcapResult(parse_error=f"PCAP 읽기 실패: {e}")
 
     # --- 수집 자료구조 ---
-    conn_map:     dict[tuple, NetworkConnection]  = {}
+    flow_table = _FlowTable()
     dns_seen:     dict[str, DNSQuery]             = {}
     dns_responses:dict[str, list[str]]            = defaultdict(list)  # name→[ip]
     ip_to_domain: dict[str, list[str]]            = defaultdict(list)  # ip→[domain]
@@ -1207,11 +1482,11 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
 
             # IP 레이어 확인
             if IP in pkt:
-                src_ip = pkt[IP].src
-                dst_ip = pkt[IP].dst
+                src_ip = normalize_ip(pkt[IP].src)
+                dst_ip = normalize_ip(pkt[IP].dst)
             elif IPv6 in pkt:
-                src_ip = pkt[IPv6].src
-                dst_ip = pkt[IPv6].dst
+                src_ip = normalize_ip(pkt[IPv6].src)
+                dst_ip = normalize_ip(pkt[IPv6].dst)
             else:
                 packets_skipped += 1
                 continue
@@ -1219,8 +1494,8 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
             pkt_len = len(pkt)
             ts      = float(pkt.time)
 
-            # 외부 IP 추적
-            if not _is_private_ip(dst_ip):
+            # 외부 IP 추적 (멀티캐스트·브로드캐스트·링크로컬은 외부가 아님)
+            if is_external_ip(dst_ip):
                 raw_ips.add(dst_ip)
                 total_bytes_out += pkt_len
             else:
@@ -1233,40 +1508,27 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                 src_port = pkt[TCP].sport
                 # TCP SYN/SYN-ACK 추적 (외부 C2 연결 시도 탐지)
                 _tcp_flags = int(pkt[TCP].flags)
-                if (_tcp_flags & 0x12) == 0x02 and not _is_private_ip(dst_ip):
+                if (_tcp_flags & 0x12) == 0x02 and is_external_ip(dst_ip):
                     # SYN only (SYN=1, ACK=0) — client→server
                     syn_map[(dst_ip, dst_port)] += 1
-                elif (_tcp_flags & 0x12) == 0x12 and not _is_private_ip(src_ip):
+                elif (_tcp_flags & 0x12) == 0x12 and is_external_ip(src_ip):
                     # SYN-ACK — server(src_ip:src_port) responded
                     syn_ack_set.add((src_ip, src_port))
             elif UDP in pkt:
                 proto    = "UDP"
                 dst_port = pkt[UDP].dport
                 src_port = pkt[UDP].sport
+                _tcp_flags = None
             else:
                 packets_skipped += 1
                 continue
 
-            # --- 연결 추적 ---
+            # --- 연결 추적 (방향 정규화된 5-튜플 흐름) ---
             if proto in ("TCP", "UDP"):
-                key = (proto, src_ip, dst_ip, dst_port)
-                is_susp = dst_port in SUSPICIOUS_PORTS
-                if key in conn_map:
-                    c = conn_map[key]
-                    c.count += 1
-                    c.bytes_out += pkt_len
-                    c.last_seen = ts
-                else:
-                    conn_map[key] = NetworkConnection(
-                        proto=proto, src_ip=src_ip, dst_ip=dst_ip,
-                        dst_port=dst_port, count=1,
-                        bytes_out=pkt_len, bytes_in=0,
-                        first_seen=ts, last_seen=ts,
-                        suspicious_port=is_susp,
-                        src_port=src_port,
-                    )
-                # 비콘 타임스탬프 기록 (외부 IP만)
-                if not _is_private_ip(dst_ip):
+                flow_table.add(proto, src_ip, int(src_port), dst_ip, int(dst_port),
+                               pkt_len, ts, _tcp_flags)
+                # 비콘 타임스탬프 기록 (외부 IP만, OS 탐색 UDP 포트 제외)
+                if _is_beacon_target(proto, dst_ip, dst_port):
                     beacon_ts[(dst_ip, dst_port)].append(ts)
 
             # --- DNS 파싱 ---
@@ -1274,14 +1536,17 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                 dns_pkt = pkt[DNS]
 
                 # 쿼리 (QR=0)
-                if dns_pkt.qr == 0 and DNSQR in pkt:
-                    qr = pkt[DNSQR]
+                if dns_pkt.qr == 0:
+                    qd = getattr(dns_pkt, "qd", None)
+                    if isinstance(qd, (list, tuple)):
+                        qd = qd[0] if qd else None
+                    if qd is None and DNSQR in pkt:
+                        qd = pkt[DNSQR]
                     try:
-                        raw_name = qr.qname
-                        name = (raw_name.decode(errors="replace")
-                                if isinstance(raw_name, bytes) else str(raw_name))
-                        name = name.rstrip(".")
-                        qtype_str = _QTYPE_MAP.get(int(qr.qtype), str(qr.qtype))
+                        if qd is None:
+                            raise ValueError("질의 섹션 없음")
+                        name = _dns_name(qd.qname)
+                        qtype_str = _QTYPE_MAP.get(int(qd.qtype), str(qd.qtype))
 
                         # 프로세스 귀속용 raw 쿼리 — PTR·분석서비스 포함 모든 쿼리 기록
                         raw_dns_list.append(DnsRawQuery(
@@ -1312,20 +1577,14 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         pass
 
                 # 응답 (QR=1) → IP 매핑
+                # scapy 2.6+ 는 an 이 리스트, 구형은 체인 — _dns_answer_pairs 가 둘 다 처리.
                 if dns_pkt.qr == 1:
                     try:
-                        an = dns_pkt.an
-                        while an and an != 0:
-                            qname = getattr(an, "rrname", b"")
-                            if isinstance(qname, bytes):
-                                qname = qname.decode(errors="replace").rstrip(".")
-                            rdata = getattr(an, "rdata", None)
-                            if rdata and isinstance(rdata, str) and not _is_private_ip(rdata):
-                                dns_responses[qname].append(rdata)
-                                ip_to_domain[rdata].append(qname)
-                            an = getattr(an, "payload", None)
-                            if not hasattr(an, "rrname"):
-                                break
+                        for qname, ip in _dns_answer_pairs(dns_pkt):
+                            if ip not in dns_responses[qname]:
+                                dns_responses[qname].append(ip)
+                            if qname not in ip_to_domain[ip]:
+                                ip_to_domain[ip].append(qname)
                     except Exception:
                         pass
 
@@ -1410,7 +1669,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
 
     # --- DNS 응답 IP 병합 ---
     for name, q in dns_seen.items():
-        q.response_ips = list(set(dns_responses.get(name, [])))
+        q.response_ips = list(dns_responses.get(name, []))
 
     # --- no_response 플래그: A/AAAA 쿼리인데 응답 없음 (C2 오프라인 등) ---
     for q in dns_seen.values():
@@ -1477,10 +1736,11 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
 
     # raw_dns_list: answers 채우기 (응답 패킷은 이미 dns_responses에 수집됨)
     for _rq in raw_dns_list:
-        _rq.answers = list(set(dns_responses.get(_rq.name, [])))
+        _rq.answers = list(dns_responses.get(_rq.name, []))
 
     return PcapResult(
-        connections=list(conn_map.values()),
+        connections=flow_table.summary_connections(),
+        flows=flow_table.flows(),
         dns_queries=list(dns_seen.values()),
         raw_dns_queries=raw_dns_list,
         http_requests=http_list,

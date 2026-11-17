@@ -35,7 +35,12 @@ pe-sieve /dmode 는 살아있는 프로세스의 가상 메모리를 읽어 덤�
 - psutil 미설치 또는 scanner 불가 시 자동 비활성화 (예외 없음)
 - pe-sieve 스캔은 개별 스레드로 실행 — 감지/재스캔 루프를 차단하지 않음
 - 분석 도구(ProcMon, tshark, pe-sieve 등) 프로세스는 자동 제외
-- dump_mode=3 (raw dump) 으로 PE + 쉘코드 바이트를 디스크로 추출
+- dump_mode=3 (/dmode 3 = realigned 덤프). 쉘코드 영역 덤프 여부는 /shellc 와
+  탐지 결과가 정한다 (dmode 는 PE 덤프 방식만 바꾼다)
+- 프로세스 식별은 (PID, 생성 시각) 쌍으로 한다 — 분석 전 프로세스가 끝나고
+  같은 PID 가 재사용돼도 새 프로세스를 놓치지 않는다
+- 시작 시점에 이미 의심 경로 모듈을 로드한 기존 프로세스는 기준선으로 기록해
+  '새 injection 신호' 로 오인하지 않는다
 """
 from __future__ import annotations
 
@@ -44,6 +49,7 @@ import time
 from typing import Callable
 
 from analysis.injection_paths import is_suspicious_module_path
+from parsers.pesieve_result import raw_suspicious_count
 
 try:
     import psutil as _psutil
@@ -77,13 +83,16 @@ class ProcessWatcher:
         스캔 완료 시 호출되는 콜백. 서명: ``on_result(pid: int, raw: dict)``.
         같은 PID 가 재스캔되면 여러 번 호출될 수 있다(호출부에서 dedupe).
     dump_mode:
-        pe-sieve /dmode 값. 3 = raw dump (PE + shellcode 모두 추출, 기본값).
+        pe-sieve /dmode 값 (0=자동, 1=virtual, 2=unmapped, 3=realigned).
     poll_interval:
         psutil 폴백 모드의 신규 프로세스 폴링 간격 (초). WMI ETW 모드에선 미사용.
     rescan_interval:
         injection 신호 검사 및 주기 재스캔 간격 (초).
     max_rescans:
         clean 판정 신규 프로세스의 최대 (재)스캔 횟수. 무한 재스캔 방지용.
+    initial_create_times:
+        {PID: 생성 시각} — 기존 프로세스의 생성 시각. 주어지면 PID 가 재사용된
+        새 프로세스를 생성 시각 차이로 구별한다.
     """
 
     def __init__(
@@ -95,8 +104,18 @@ class ProcessWatcher:
         poll_interval: float = 1.0,
         rescan_interval: float = 5.0,
         max_rescans: int = 3,
+        initial_create_times: dict | None = None,
     ) -> None:
         self._known    = set(initial_pids)
+        # PID → 생성 시각 (0.0 = 모름 → PID 만으로 비교)
+        self._known_ctime: dict[int, float] = {}
+        for _k, _v in (initial_create_times or {}).items():
+            try:
+                self._known_ctime[int(_k)] = float(_v or 0.0)
+            except (TypeError, ValueError):
+                continue
+        for _pid in self._known:
+            self._known_ctime.setdefault(_pid, 0.0)
         self._scanner  = scanner
         self._callback = on_result
         self._dmode    = dump_mode
@@ -116,6 +135,9 @@ class ProcessWatcher:
         self._seen_susp:   dict[int, set[str]] = {}      # PID별 이미 신호 처리한 의심 모듈 경로
         self._scanning:    set[int]            = set()   # 진행 중 스캔(동시 중복 방지)
         self._scan_threads: list[threading.Thread] = []
+        self._seen_keys:   set[tuple]          = set()   # 신규로 처리한 (PID, 생성 시각)
+        self._signal_pids: set[int]            = set()   # injection 신호로 스캔한 기존 프로세스
+        self._new_ctime:   dict[int, float]    = {}      # 신규 PID → 생성 시각
 
         self._detect_thread = threading.Thread(
             target=self._run_detect, daemon=True, name="PW-detect"
@@ -143,11 +165,56 @@ class ProcessWatcher:
         """실제 사용된 신규 프로세스 감지 방식 ('wmi_etw' 또는 'psutil_poll')."""
         return self._mode
 
-    def start(self) -> None:
-        """백그라운드 감지 + 재스캔 스레드 시작."""
-        if self.available:
-            self._detect_thread.start()
-            self._rescan_thread.start()
+    @property
+    def new_pids(self) -> set[int]:
+        """분석 중 새로 생성된 것으로 감지된 PID 집합."""
+        with self._lock:
+            return set(self._new_pids)
+
+    @property
+    def inject_signal_pids(self) -> set[int]:
+        """의심 모듈 신규 로드(injection 신호)로 스캔한 기존 프로세스 PID 집합."""
+        with self._lock:
+            return set(self._signal_pids) - set(self._new_pids)
+
+    def start(self, baseline_modules: bool = True, baseline_budget: float = 15.0) -> None:
+        """백그라운드 감지 + 재스캔 스레드 시작.
+
+        baseline_modules 가 True 면 기존 프로세스의 의심 경로 모듈을 먼저 기준선으로
+        기록한다(최대 baseline_budget 초). 분석 전부터 Temp 경로 DLL 을 쓰던
+        프로세스(PyInstaller _MEI, 설치기 등)를 첫 주기에서 '새 신호' 로 오인하지 않게 한다.
+        """
+        if not self.available:
+            return
+        if baseline_modules:
+            try:
+                self.prime_module_baseline(budget=baseline_budget)
+            except Exception:
+                pass
+        self._detect_thread.start()
+        self._rescan_thread.start()
+
+    def prime_module_baseline(self, budget: float = 15.0) -> int:
+        """기존 프로세스의 의심 경로 모듈을 _seen_susp 기준선으로 채운다.
+
+        Returns
+        -------
+        int
+            기준선에 기록된 프로세스 수.
+        """
+        deadline = time.monotonic() + max(0.0, budget)
+        n = 0
+        with self._lock:
+            pids = sorted(self._known)
+        for pid in pids:
+            if time.monotonic() > deadline:
+                break
+            mods = self._suspicious_modules(pid)
+            if mods:
+                with self._lock:
+                    self._seen_susp.setdefault(pid, set()).update(mods)
+                n += 1
+        return n
 
     def stop(self) -> set[int]:
         """감지를 중지하고, 진행 중인 스캔이 모두 끝날 때까지 대기.
@@ -155,7 +222,9 @@ class ProcessWatcher:
         Returns
         -------
         set[int]
-            (재)스캔을 시도한 모든 PID 집합.
+            (재)스캔을 시도한 모든 PID 집합 (하위 호환).
+            신규 프로세스만 필요하면 :attr:`new_pids`, injection 신호로 스캔한
+            기존 프로세스는 :attr:`inject_signal_pids` 를 쓴다.
         """
         self._stop.set()
         for t in (self._detect_thread, self._rescan_thread):
@@ -202,11 +271,9 @@ class ProcessWatcher:
             try:
                 ev  = _wt(timeout_ms=200)   # 200ms 대기 — stop 신호 감지 주기
                 pid = int(ev.ProcessID)
-                with self._lock:
-                    is_new = pid not in self._known and pid not in self._scanned
-                    if is_new:
-                        self._known.add(pid)
-                if is_new:
+                # ETW 시작 이벤트 자체가 '생성' 이므로 _known(기존 PID) 검사는 하지 않는다.
+                # PID 가 재사용된 프로세스도 새 프로세스다. 중복은 (PID, 생성 시각)으로만 막는다.
+                if self._register_new(pid, _create_time(pid)):
                     self._on_new_pid(pid)
             except _wmi_mod.x_wmi_timed_out:
                 pass   # 정상 타임아웃 — stop 플래그 재확인 후 계속 대기
@@ -222,15 +289,59 @@ class ProcessWatcher:
         self._mode = "psutil_poll"
         while not self._stop.is_set():
             try:
-                current: set[int] = {p.pid for p in _psutil.process_iter(["pid"])}
-                with self._lock:
-                    new_pids = current - self._known - self._scanned
-                    self._known.update(current)
-                for pid in new_pids:
+                current: dict[int, float] = {}
+                for p in _psutil.process_iter(["pid", "create_time"]):
+                    try:
+                        current[p.info["pid"]] = float(p.info.get("create_time") or 0.0)
+                    except Exception:
+                        continue
+                new_list: list[int] = []
+                for pid, ctime in current.items():
+                    if self._is_new_identity(pid, ctime) and self._register_new(pid, ctime):
+                        new_list.append(pid)
+                for pid in new_list:
                     self._on_new_pid(pid)
             except Exception:
                 pass
             self._stop.wait(self._poll)
+
+    def _is_new_identity(self, pid: int, ctime: float) -> bool:
+        """폴링에서 본 (PID, 생성 시각)이 이미 아는 프로세스와 다른가."""
+        with self._lock:
+            if pid not in self._known_ctime:
+                return True
+            known = self._known_ctime.get(pid, 0.0)
+        # 생성 시각을 모르면 PID 만으로 판단 (같은 프로세스로 간주)
+        if not known or not ctime:
+            return False
+        return abs(known - ctime) > 0.01
+
+    def _register_new(self, pid: int, ctime: float) -> bool:
+        """(PID, 생성 시각)을 신규로 등록. 이미 처리한 조합이면 False.
+
+        PID 가 재사용된 경우 이전 프로세스의 스캔 상태(_found·_scan_counts 등)를
+        초기화해 새 프로세스가 스캔에서 빠지지 않게 한다.
+        """
+        ctime = float(ctime or 0.0)
+        key = (pid, round(ctime, 2))
+        with self._lock:
+            if key in self._seen_keys:
+                return False
+            if not ctime and pid in self._new_pids:
+                return False          # 생성 시각을 모르는 중복 알림
+            self._seen_keys.add(key)
+            prev_new = self._new_ctime.get(pid)
+            reused = pid in self._known_ctime or prev_new is not None
+            if reused:
+                self._found.discard(pid)
+                self._scan_counts.pop(pid, None)
+                self._last_scan.pop(pid, None)
+                self._seen_susp.pop(pid, None)
+                self._signal_pids.discard(pid)
+            self._known.add(pid)
+            self._known_ctime[pid] = ctime
+            self._new_ctime[pid] = ctime
+            return True
 
     def _on_new_pid(self, pid: int) -> None:
         """신규 PID 를 추적 목록에 등록하고 즉시 1회 스캔."""
@@ -284,6 +395,8 @@ class ProcessWatcher:
             if new_susp:
                 with self._lock:
                     self._seen_susp.setdefault(pid, set()).update(new_susp)
+                    if not is_new:
+                        self._signal_pids.add(pid)
                 self._launch_scan(pid, reason="inject-signal")
                 continue
 
@@ -341,21 +454,27 @@ class ProcessWatcher:
                 with self._lock:
                     self._found.add(pid)
             self._callback(pid, raw)
-        except Exception:
-            pass
+        except Exception as exc:
+            # 스캔 예외를 조용히 버리지 않고 오류 결과로 넘긴다 (호출부 집계용)
+            try:
+                self._callback(pid, {"error": f"실시간 스캔 예외 ({reason}): {exc}", "pid": pid})
+            except Exception:
+                pass
         finally:
             with self._lock:
                 self._scanning.discard(pid)
 
 
 def _raw_suspicious(raw: dict) -> int:
-    """pe-sieve raw JSON 에서 suspicious 카운트를 추출 (형식 방어적)."""
-    if not isinstance(raw, dict) or "error" in raw:
-        return 0
-    scanned = raw.get("scanned")
-    if isinstance(scanned, dict):
-        v = scanned.get("suspicious", 0)
-        return v if isinstance(v, int) else 0
-    # 일부 버전은 최상위에 기록
-    v = raw.get("suspicious", 0)
-    return v if isinstance(v, int) else 0
+    """pe-sieve raw JSON 에서 suspicious 카운트를 추출 (현재·구버전 형식 모두)."""
+    return raw_suspicious_count(raw)
+
+
+def _create_time(pid: int) -> float:
+    """psutil 로 프로세스 생성 시각을 읽는다 (실패 시 0.0)."""
+    if not _PSUTIL_OK:
+        return 0.0
+    try:
+        return float(_psutil.Process(pid).create_time())
+    except Exception:
+        return 0.0

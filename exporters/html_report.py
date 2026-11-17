@@ -18,9 +18,10 @@ from exporters.evidence_tab import evidence_html as _evidence_html
 from exporters.report_visuals import (
     VISUALS_CSS as _VISUALS_CSS,
     verdict_overview_html as _verdict_overview_html,
-    behavior_graph_html as _behavior_graph_html,
     proc_detail_html as _proc_detail_html,
     attack_inline_html as _attack_inline_html,
+    report_verdict as _report_verdict,
+    is_external_only as _is_external_only,
 )
 # 자격증명/anti-VM ReadFile 표시 판정 — analysis/sensitive_paths.py 단일 소스
 from analysis.sensitive_paths import is_sensitive_read_path
@@ -360,15 +361,18 @@ var _SVC_NAMES = {
 };
 
 // ── 릴레이 fetch 헬퍼 ─────────────────────────────────────────────────
-// HUNT_CFG.relay_port 가 설정된 경우 로컬 릴레이(Python)를 통해 요청합니다.
-// 릴레이 실패 시 abuse.ch 직접 호출로 폴백합니다.
+// 리포트가 hunt_relay(http://127.0.0.1:PORT)에서 서빙될 때만 같은 오리진의
+// /hunt/relay/<svc> 로 보낸다. 릴레이가 abuse.ch 인증 키(Auth-Key)를 서버 쪽에서 붙인다.
+// file:// 처럼 다른 오리진에서 열린 경우 릴레이는 요청을 거부하므로 직접 호출한다(키 없음).
+function _relayAvailable() {
+    return !!HUNT_CFG.relay_port && /^https?:$/.test(location.protocol)
+        && String(location.port) === String(HUNT_CFG.relay_port);
+}
 async function _relayFetch(svcKey, directUrl, options) {
-    if (HUNT_CFG.relay_port) {
-        var relayUrl = 'http://127.0.0.1:' + HUNT_CFG.relay_port + '/hunt/relay/' + svcKey;
+    if (_relayAvailable()) {
         try {
-            var r = await fetch(relayUrl, options);
-            if (r.ok || r.status === 502) return r;  // 502 = relay got upstream error, still JSON
-        } catch(e) { /* 릴레이 없음 → 직접 요청 */ }
+            return await fetch('/hunt/relay/' + encodeURIComponent(svcKey), options);
+        } catch(e) { /* 릴레이 프로세스 종료 → 직접 요청 */ }
     }
     return fetch(directUrl, options);
 }
@@ -450,38 +454,87 @@ async function huntSearch() {
 }
 
 // ── 카드 빌더 ──────────────────────────────────────────
+// abuse.ch 응답 값(file_name · signature · tags · ioc · malware · url …)은 제3자가
+// 제출한 문자열이다. innerHTML 로 들어가기 전에 전부 _h() 로 이스케이프한다.
+
+function _h(s) {
+    return String(s === undefined || s === null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function _safeLink(u) {
+    u = String(u || '');
+    return /^https:[/][/][^"'<>]+$/i.test(u) ? u : '';
+}
 
 function _card(svcKey, cls, badgeHtml, bodyHtml, link) {
-    var linkHtml = link
-        ? '<a href="' + link + '" target="_blank" class="hunt-link">↗ 페이지</a>' : '';
-    return '<div class="hunt-card ' + cls + '">'
+    var safe = _safeLink(link);
+    var linkHtml = safe
+        ? '<a href="' + _h(safe) + '" target="_blank" rel="noopener noreferrer" class="hunt-link">↗ 페이지</a>' : '';
+    return '<div class="hunt-card ' + _h(cls) + '">'
         + '<div class="hunt-card-head">'
-        +   '<span class="hunt-card-title">' + _SVC_NAMES[svcKey] + '</span>'
+        +   '<span class="hunt-card-title">' + _h(_SVC_NAMES[svcKey] || svcKey) + '</span>'
         +   '<span>' + badgeHtml + ' ' + linkHtml + '</span>'
         + '</div>'
         + '<div class="hunt-card-body">' + bodyHtml + '</div>'
         + '</div>';
 }
 
+function _authHint(status) {
+    if (status !== 401 && status !== 403) return '';
+    return HUNT_CFG.auth_key_set
+        ? ' — abuse.ch 인증 키(hunt.auth_key)가 거부되었습니다. 키를 확인하세요'
+        : ' — abuse.ch 인증 키 미설정: config.json 의 hunt.auth_key 를 설정하세요';
+}
+
+// HTTP 오류 · 릴레이 오류 · 인증/형식 거부를 '미등록'으로 오인하지 않도록 먼저 걸러낸다.
+async function _readApi(r) {
+    var d = null;
+    try { d = await r.json(); } catch (e) { d = null; }
+    if (d && d.relay_error) {
+        var up = d.upstream_status || 0;
+        throw new Error('릴레이 오류' + (up ? ' (HTTP ' + up + ')' : '') + ': ' + d.relay_error + _authHint(up));
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status + _authHint(r.status));
+    if (!d || typeof d !== 'object') throw new Error('응답을 해석할 수 없음 (JSON 아님)');
+    var qs = String(d.query_status || '');
+    if (/auth|illegal|invalid|unknown|missing|provided|error|limit|denied/i.test(qs))
+        throw new Error('조회 거부: ' + qs + (/auth/i.test(qs) ? _authHint(401) : ''));
+    return d;
+}
+
+function _unexpected(d) {
+    return new Error('예상하지 못한 응답 상태: ' + (d && d.query_status ? d.query_status : '상태 없음'));
+}
+
 function _errCard(svcKey, err) {
     var msg = (err && err.message) || '알 수 없는 오류';
     if (/failed to fetch|networkerror|load failed/i.test(msg))
-        msg = 'API 연결 실패 — 인터넷 연결 또는 CORS 확인 필요';
+        msg = 'API 연결 실패 — 인터넷 연결 또는 CORS 확인 필요 (file:// 로 열었다면 릴레이 주소로 여세요)';
     return _card(svcKey, 'error',
-        '<span class="badge badge-gray">오류</span>',
-        '<span class="hunt-none">⚠ ' + msg + '</span>');
+        '<span class="badge badge-gray">조회 실패</span>',
+        '<span class="hunt-none">⚠ ' + _h(msg) + '</span>');
 }
 
+function _cleanCard(svcKey, text) {
+    huntSetSvc(svcKey, 'clean');
+    return _card(svcKey, 'clean', _badge('미등록', 'green'), '<span class="hunt-none">' + _h(text) + '</span>');
+}
+
+// rows: [[라벨, 값(텍스트)] | [라벨, {html: 이미 이스케이프된 HTML}]]
 function _kv(rows) {
     return '<table class="hunt-kv"><tbody>'
         + rows.map(function(r) {
-            return '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td></tr>';
+            var v = (r[1] && typeof r[1] === 'object' && 'html' in r[1]) ? r[1].html : _h(r[1]);
+            return '<tr><td>' + _h(r[0]) + '</td><td>' + v + '</td></tr>';
           }).join('')
         + '</tbody></table>';
 }
 
 function _badge(text, color) {
-    return '<span class="badge badge-' + color + '">' + text + '</span>';
+    var c = /^[a-z]+$/.test(String(color)) ? color : 'gray';
+    return '<span class="badge badge-' + c + '">' + _h(text) + '</span>';
 }
 
 // ── MalwareBazaar ──────────────────────────────────────
@@ -494,30 +547,26 @@ async function _huntMB(hash, type) {
         else if (type === 'sha1') body.append('sha1_hash', hash);
         else                      body.append('hash',      hash);
         var r = await _relayFetch('mb', HUNT_CFG.services.mb.url, {method:'POST', body:body});
-        var d = await r.json();
-        if (d.query_status !== 'hash_found' || !d.data || !d.data.length) {
-            huntSetSvc('mb', 'clean');
-            return _card('mb', 'clean', _badge('미등록','green'),
-                '<span class="hunt-none">MalwareBazaar에 등록된 샘플 없음</span>');
-        }
+        var d = await _readApi(r);
+        if (d.query_status === 'hash_not_found' || d.query_status === 'no_results')
+            return _cleanCard('mb', 'MalwareBazaar에 등록된 샘플 없음');
+        if (d.query_status !== 'hash_found' || !d.data || !d.data.length) throw _unexpected(d);
         huntSetSvc('mb', 'found');
-        var item = d.data[0];
-        var tags = (item.tags || []).map(function(t) {
-            return '<span class="badge badge-orange">' + t + '</span>';
-        }).join(' ');
+        var item = d.data[0] || {};
+        var tags = (item.tags || []).map(function(t) { return _badge(t, 'orange'); }).join(' ');
         var vtCount = item.vendor_intel ? Object.keys(item.vendor_intel).length : 0;
         return _card('mb', 'found', _badge('등록됨','red'),
             _kv([
                 ['파일명',   item.file_name  || '-'],
-                ['서명',     '<strong>' + (item.signature || '미분류') + '</strong>'],
+                ['서명',     {html: '<strong>' + _h(item.signature || '미분류') + '</strong>'}],
                 ['파일 유형', item.file_type  || '-'],
-                ['크기',     item.file_size ? item.file_size.toLocaleString() + ' bytes' : '-'],
-                ['태그',     tags ? '<div class="hunt-tags">' + tags + '</div>' : '-'],
+                ['크기',     item.file_size ? Number(item.file_size).toLocaleString() + ' bytes' : '-'],
+                ['태그',     tags ? {html: '<div class="hunt-tags">' + tags + '</div>'} : '-'],
                 ['AV 탐지',  vtCount ? vtCount + '개 엔진' : '-'],
                 ['최초 발견', item.first_seen || '-'],
                 ['최종 발견', item.last_seen  || '-'],
             ]),
-            'https://bazaar.abuse.ch/sample/' + hash + '/');
+            'https://bazaar.abuse.ch/sample/' + encodeURIComponent(hash) + '/');
     } catch(e) { huntSetSvc('mb', 'error'); return _errCard('mb', e); }
 }
 
@@ -530,22 +579,22 @@ async function _huntTF(ioc) {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({query: 'search_ioc', search_term: ioc})
         });
-        var d = await r.json();
-        if (d.query_status !== 'ok' || !d.data || !d.data.length) {
-            huntSetSvc('tf', 'clean');
-            return _card('tf', 'clean', _badge('미등록','green'),
-                '<span class="hunt-none">ThreatFox에 등록된 IOC 없음</span>');
-        }
+        var d = await _readApi(r);
+        if (d.query_status === 'no_result' || d.query_status === 'no_results'
+            || (d.query_status === 'ok' && (!d.data || !d.data.length || typeof d.data === 'string')))
+            return _cleanCard('tf', 'ThreatFox에 등록된 IOC 없음');
+        if (d.query_status !== 'ok' || !Array.isArray(d.data)) throw _unexpected(d);
         huntSetSvc('tf', 'found');
         var rows = d.data.slice(0, 15).map(function(item) {
-            var conf = item.confidence_level || 0;
+            item = item || {};
+            var conf = parseInt(item.confidence_level, 10) || 0;
             var cc = conf >= 75 ? 'red' : conf >= 50 ? 'orange' : 'yellow';
             return '<tr>'
-                + '<td class="mono">' + (item.ioc || '-') + '</td>'
-                + '<td>' + (item.ioc_type || '-') + '</td>'
-                + '<td><strong>' + (item.malware || '-') + '</strong></td>'
+                + '<td class="mono">' + _h(item.ioc || '-') + '</td>'
+                + '<td>' + _h(item.ioc_type || '-') + '</td>'
+                + '<td><strong>' + _h(item.malware || '-') + '</strong></td>'
                 + '<td>' + _badge(conf + '%', cc) + '</td>'
-                + '<td style="color:#8b949e;font-size:.75rem">' + (item.first_seen || '-') + '</td>'
+                + '<td style="color:#8b949e;font-size:.75rem">' + _h(item.first_seen || '-') + '</td>'
                 + '</tr>';
         }).join('');
         return _card('tf', 'found', _badge(d.data.length + '건', 'red'),
@@ -567,38 +616,40 @@ async function _huntUH(ioc, type) {
         body.append(isURL ? 'url' : 'host', ioc);
         var relayKey = isURL ? 'uh_url' : 'uh_host';
         var r = await _relayFetch(relayKey, ep, {method:'POST', body:body});
-        var d = await r.json();
-        var notFound = (d.query_status === 'no_results' || d.query_status === 'invalid_url'
-                        || (!isURL && d.query_status !== 'is_host'));
-        if (notFound) {
-            huntSetSvc('uh', 'clean');
-            return _card('uh', 'clean', _badge('미등록','green'),
-                '<span class="hunt-none">URLhaus에 등록된 항목 없음</span>');
-        }
+        var d = await _readApi(r);
+        // 'no_results' 만 미등록이다. 그 밖의 알 수 없는 상태는 오류로 보여준다.
+        if (d.query_status === 'no_results')
+            return _cleanCard('uh', 'URLhaus에 등록된 항목 없음');
+        var found = isURL ? d.query_status === 'ok'
+                          : (d.query_status === 'ok' || d.query_status === 'is_host');
+        if (!found) throw _unexpected(d);
         huntSetSvc('uh', 'found');
         var body2 = '';
-        if (!isURL && d.urls && d.urls.length) {
+        if (!isURL) {
             var bl = d.blacklists || {};
             body2 += _kv([
                 ['Spamhaus DBL', bl.spamhaus_dbl || '-'],
                 ['SURBL',        bl.surbl        || '-'],
             ]);
-            var urows = d.urls.slice(0, 10).map(function(u) {
+            var urls = Array.isArray(d.urls) ? d.urls : [];
+            var urows = urls.slice(0, 10).map(function(u) {
+                u = u || {};
                 var sc = u.url_status === 'online' ? 'red' : 'gray';
-                return '<tr><td class="mono" style="font-size:.72rem">' + (u.url || '-') + '</td>'
+                return '<tr><td class="mono" style="font-size:.72rem">' + _h(u.url || '-') + '</td>'
                     + '<td>' + _badge(u.url_status || '-', sc) + '</td>'
-                    + '<td style="color:#8b949e">' + (u.threat || '-') + '</td></tr>';
+                    + '<td style="color:#8b949e">' + _h(u.threat || '-') + '</td></tr>';
             }).join('');
-            body2 += '<h3 style="margin-top:.7rem">연관 URL (' + d.urls.length + '건)</h3>'
-                + '<table><tr><th>URL</th><th>상태</th><th>위협</th></tr>' + urows + '</table>';
-        } else if (isURL) {
+            if (urows)
+                body2 += '<h3 style="margin-top:.7rem">연관 URL (' + urls.length + '건)</h3>'
+                    + '<table><tr><th>URL</th><th>상태</th><th>위협</th></tr>' + urows + '</table>';
+        } else {
             var sc2 = d.url_status === 'online' ? 'red' : 'gray';
             body2 = _kv([
-                ['상태',     _badge(d.url_status || '-', sc2)],
+                ['상태',     {html: _badge(d.url_status || '-', sc2)}],
                 ['위협',     d.threat    || '-'],
                 ['호스트',   d.host      || '-'],
                 ['등록일',   d.date_added|| '-'],
-                ['태그',     (d.tags||[]).join(', ') || '-'],
+                ['태그',     (Array.isArray(d.tags) ? d.tags : []).join(', ') || '-'],
             ]);
         }
         return _card('uh', 'found', _badge('등록됨','red'), body2,
@@ -615,26 +666,33 @@ async function _huntFeodo(ip) {
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({host: ip})
         });
-        var d = await r.json();
-        if (!d || d.result !== 'known_tracker') {
-            huntSetSvc('feodo', 'clean');
-            return _card('feodo', 'clean', _badge('미등록','green'),
-                '<span class="hunt-none">Feodo Tracker 봇넷 C2 목록에 없음</span>');
+        var d = await _readApi(r);
+        if (d.result !== 'known_tracker') {
+            // 결과 필드가 있거나 '결과 없음' 상태일 때만 미등록으로 본다
+            if ((typeof d.result === 'string' && d.result) || /^no_results?$/.test(String(d.query_status || '')))
+                return _cleanCard('feodo', 'Feodo Tracker 봇넷 C2 목록에 없음');
+            throw _unexpected(d);
         }
         huntSetSvc('feodo', 'found');
         var sc = d.status === 'online' ? 'red' : 'gray';
         return _card('feodo', 'found', _badge('C2 등록됨','red'),
             _kv([
-                ['악성코드',  '<strong>' + (d.malware || '-') + '</strong>'],
-                ['상태',      _badge(d.status || '-', sc)],
+                ['악성코드',  {html: '<strong>' + _h(d.malware || '-') + '</strong>'}],
+                ['상태',      {html: _badge(d.status || '-', sc)}],
                 ['국가',      d.country || '-'],
                 ['ASN',       d.asn     || '-'],
                 ['최초 발견', d.first_seen || '-'],
                 ['최종 발견', d.last_seen  || '-'],
             ]),
-            'https://feodotracker.abuse.ch/browse/host/' + ip + '/');
+            'https://feodotracker.abuse.ch/browse/host/' + encodeURIComponent(ip) + '/');
     } catch(e) { huntSetSvc('feodo', 'error'); return _errCard('feodo', e); }
 }
+
+// 인증 키 미설정 / file:// 안내
+document.addEventListener('DOMContentLoaded', function () {
+    var w = document.getElementById('hunt-auth-warn');
+    if (w && !HUNT_CFG.auth_key_set) w.style.display = 'block';
+});
 """
 
 _PG_INIT = """<script>
@@ -705,6 +763,17 @@ def _source_badges(sources: list) -> str:
         f"<span class='badge badge-{_SOURCE_COLOR.get(s, 'gray')}'>{_e(s)}</span>"
         for s in sources
     )
+
+def _js_json(obj) -> str:
+    """인라인 <script> 에 그대로 넣어도 안전한 JSON 리터럴.
+
+    '<' '>' '&' 와 U+2028/2029 를 \\u 이스케이프로 바꿔 </script>, <!-- 로 스크립트
+    블록을 빠져나가거나 파싱을 깨뜨리지 못하게 한다 (값 자체는 그대로 복원된다).
+    """
+    return (_json.dumps(obj, ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
+
 
 def _b(text: str, color: str = "gray") -> str:
     return f'<span class="badge badge-{color}">{_html.escape(str(text))}</span>'
@@ -780,16 +849,19 @@ def _cmdline_html(cmdline, limit: int = 160) -> str:
 
 
 def _suspicious_pid_set(result) -> set:
-    """pe-sieve / hollows-hunter 가 인젝션 의심으로 판정한 PID 집합."""
+    """주입 신뢰도 판정(classify_injections)이 HIGH/MEDIUM 으로 본 PID 집합.
+
+    pe-sieve / hollows-hunter 의 suspicious>0 를 그대로 쓰면 JIT·재배치 영역 오탐(LOW)
+    까지 explorer·dwm 같은 정상 프로세스를 맨 위로 끌어올린다.
+    """
     susp: set[int] = set()
-    for r in (getattr(result, "pe_sieve_results", None) or []):
-        if not getattr(r, "error", False) and getattr(r, "suspicious", 0) > 0:
-            susp.add(r.pid)
-    hh = getattr(result, "hh_result", None)
-    if hh and not getattr(hh, "error", None):
-        for pr in getattr(hh, "process_results", []):
-            if getattr(pr, "suspicious", 0) > 0:
-                susp.add(pr.pid)
+    for f in (getattr(result, "injection_findings", None) or []):
+        if not isinstance(f, dict) or f.get("confidence") not in ("HIGH", "MEDIUM"):
+            continue
+        try:
+            susp.add(int(f.get("pid")))
+        except (TypeError, ValueError):
+            continue
     return susp
 
 
@@ -1127,14 +1199,17 @@ def _section_html(result) -> str:
         return status_html + "<p class='alert alert-success'>탐지된 MITRE 기법 없음</p>"
     _EV_LIMIT = 5
     rows = []
-    for t in sorted(techs, key=lambda t: set(t.sources or []) == {"VirusTotal"}):
-        external = set(t.sources or []) == {"VirusTotal"}
-        relevance = _b("외부 분석", "gray") if external else _tier_badge(t)
+    for t in sorted(techs, key=_is_external_only):
+        # VirusTotal·CAPA·AI 만 출처인 기법 — 이번 실행 텔레메트리에서 관측되지 않았다
+        external = _is_external_only(t)
+        relevance = _b("외부 출처 (미관측)", "gray") if external else _tier_badge(t)
         # 미등록 ID 방어: 이름·전술이 비면 폴백 (외부/AI 소스가 빈 값을 줄 수 있음)
         tname  = t.technique_name or t.technique_id
         tactic = t.tactic or "Unknown"
         color  = _TACTIC_COLOR.get(tactic, "gray")
         ref    = t.reference or f"https://attack.mitre.org/techniques/{t.technique_id.replace('.','/')}/"
+        if not str(ref).lower().startswith("https://"):
+            ref = ""
         evidence_html = "".join(
             f"<div class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(ev[:120])}</div>"
             for ev in t.evidence[:_EV_LIMIT]
@@ -1150,8 +1225,8 @@ def _section_html(result) -> str:
         src_badges = _source_badges(getattr(t, "sources", []) or [])
         rows.append(
             f"<tr{_tier_attr(t)}>"
-            f"<td><a href='{_e(ref)}' target='_blank' style='color:#f97583;text-decoration:none'>"
-            f"{_e(t.technique_id)}</a></td>"
+            + (f"<td><a href='{_e(ref)}' target='_blank' rel='noopener' style='color:#f97583;text-decoration:none'>"
+               f"{_e(t.technique_id)}</a></td>" if ref else f"<td>{_e(t.technique_id)}</td>") +
             f"<td>{_e(tname)}</td>"
             f"<td>{_b(tactic, color)}</td>"
             f"<td style='white-space:nowrap'>{relevance}</td>"
@@ -1442,14 +1517,12 @@ def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
     """process_network_map 진단 패널 HTML."""
     if not pnmap:
         return (
-            "<details open style='margin:.5rem 0 1rem;"
-            "background:rgba(255,123,114,.07);border:1px solid #ff7b72;"
-            "border-radius:6px;padding:.5rem .75rem'>"
-            "<summary style='color:#ff7b72;font-size:.82rem;cursor:pointer;font-weight:600'>"
-            "⚠ 프로세스 매핑 없음 — process_network_map 비어있음</summary>"
+            "<details style='margin:.5rem 0 1rem;border-left:3px solid #e3b341;padding:.2rem .75rem'>"
+            "<summary style='color:#e3b341;font-size:.82rem;cursor:pointer'>"
+            "프로세스-네트워크 매핑 없음 — 연결을 프로세스에 귀속하지 못함</summary>"
             "<p style='font-size:.78rem;color:#8b949e;margin:.4rem 0 0'>"
             "ProcMon CSV에 TCP/UDP 네트워크 이벤트가 없습니다.<br>"
-            "원인: ProcMon 디스플레이 필터에서 Network 카테고리 비활성화.<br>"
+            "가능한 원인: 분석 중 연결 없음 · ProcMon 필터에서 Network 카테고리 제외 · CSV 변환 누락.<br>"
             "<code style='font-size:.75rem'>procmon.csv</code> 에서 "
             "<code>TCP Connect</code> / <code>TCP Send</code> 행 존재 여부를 확인하세요.<br>"
             "netstat 스냅샷도 캡처되지 않았거나 분석 중 연결이 없었습니다."
@@ -1534,14 +1607,61 @@ def _extract_pids_from_labels(labels: list[str]) -> set[int]:
     return pids
 
 
-def _execution_verdict_banner(br) -> str:
-    """실행 진단 배너 — 네트워크 탭 최상단에 표시."""
+def _host_activity_evidence(result) -> list:
+    """네트워크와 무관하게 샘플이 실행됐음을 보여주는 호스트 근거."""
+    if result is None:
+        return []
+    out = []
+    lineage = set(getattr(result, "lineage_pids", None) or ())
+    sample_pid = getattr(result, "sample_pid", None)
+    children = [p for p in lineage if p != sample_pid]
+    if children:
+        out.append(f"샘플 계보 하위 프로세스 {len(children)}개 생성")
+    for f in (getattr(result, "sideload_findings", None) or []):
+        if isinstance(f, dict) and f.get("confidence") == "HIGH":
+            out.append(f"DLL 사이드로딩(HIGH) — {f.get('loader_name', '?')}")
+            break
+    for f in (getattr(result, "injection_findings", None) or []):
+        if isinstance(f, dict) and f.get("confidence") in ("HIGH", "MEDIUM"):
+            out.append(f"코드 주입({f.get('confidence')}) — {f.get('name', '?')} (PID {f.get('pid', '?')})")
+            break
+    ioc = getattr(result, "ioc_report", None)
+    tiers = getattr(ioc, "dropped_file_tiers", None) or {}
+    pe = [f for f in (getattr(ioc, "dropped_files", None) or [])
+          if tiers.get(f, 2) == 1 and str(f).lower().endswith((".exe", ".dll", ".scr", ".sys"))]
+    if pe:
+        out.append(f"샘플 계보의 PE 드롭 {len(pe)}건")
+    return out
+
+
+def _execution_verdict_banner(br, result=None) -> str:
+    """실행 진단 배너 — 네트워크 탭 최상단에 표시.
+
+    execution_verdict 는 네트워크 유무 중심 판정이라, 호스트 행위(계보 프로세스·
+    사이드로딩·주입·PE 드롭)가 뚜렷한데도 '불명확/실패'로 나올 수 있다. result 를
+    넘기면 그런 경우 '호스트 행위 확인 — 샘플 귀속 네트워크 없음'으로 바꿔 표시한다.
+    """
     if not br:
         return ""
     verdict  = getattr(br, "execution_verdict", "UNKNOWN")
-    details  = getattr(br, "execution_details", [])
+    details  = list(getattr(br, "execution_details", None) or [])
     if verdict == "UNKNOWN" and not details:
         return ""
+    host_ev = _host_activity_evidence(result) if verdict in ("UNKNOWN", "FAILED") else []
+    if host_ev:
+        items = "".join(f"<li style='color:#8b949e;font-size:.78rem;margin:.1rem 0'>{_e(d)}</li>"
+                        for d in host_ev + details)
+        return (
+            "<div style='border-left:3px solid #56d364;padding:.4rem 1rem;margin-bottom:1.2rem'>"
+            "<div style='display:flex;align-items:center;gap:.6rem;margin-bottom:.3rem'>"
+            "<span style='color:#56d364;font-weight:700;font-size:.9rem'>호스트 행위 확인 — 샘플 귀속 네트워크 없음</span>"
+            f"<span style='color:#8b949e;font-size:.76rem;font-style:italic'>execution_verdict = {_e(verdict)}</span>"
+            "</div>"
+            "<p style='color:#cdd9e5;font-size:.82rem;margin:0'>샘플은 실행되어 호스트에 흔적을 남겼습니다. "
+            "이 실행에서 샘플 계보로 귀속된 네트워크 활동은 확인되지 않았습니다 "
+            "(C2 미응답·격리망·지연 실행 가능성).</p>"
+            f"<ul style='margin:.5rem 0 0 1rem;padding:0'>{items}</ul></div>"
+        )
 
     _CFG = {
         "CONFIRMED": ("#56d364", "#0d2119", "✅ 실행 확인됨",
@@ -1555,7 +1675,7 @@ def _execution_verdict_banner(br) -> str:
                       "이벤트가 거의 없어 샘플이 제대로 실행되지 않은 것으로 추정됩니다. "
                       "아키텍처(x86/x64) 불일치, 의존 DLL 누락, 실행 권한 문제를 확인하세요."),
         "UNKNOWN":   ("#8b949e", "#21262d", "❓ 실행 여부 불명확",
-                      "이벤트는 있으나 네트워크 활동이 없습니다. "
+                      "이벤트는 있으나 샘플에 귀속된 네트워크 활동이 확인되지 않았습니다. "
                       "긴 Sleep 후 C2 접속 또는 조건부 실행(특정 파일·레지스트리 필요) 가능성을 확인하세요."),
     }
     color, bg, title, desc = _CFG.get(verdict, _CFG["UNKNOWN"])
@@ -1675,7 +1795,7 @@ def _network_html(result) -> str:
     parts = []
 
     # ── 실행 진단 배너 ──────────────────────────────────────────────────
-    parts.append(_execution_verdict_banner(_br))
+    parts.append(_execution_verdict_banner(_br, result))
 
     # pcap 없으면 기본 안내 배너만 추가 (decrypted/fakenet은 계속 처리)
     if not pcap:
@@ -2116,8 +2236,10 @@ def _network_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3 style='color:#ff7b72'>🚨 SMTP C2 세션</h3>"
-            "<table id='tbl-net-smtp'><tr><th>C2 서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
+            "<h3 style='color:#ff7b72'>SMTP 세션</h3>"
+            "<p style='font-size:.76rem;color:#8b949e;margin:.2rem 0 .5rem'>전체 캡처에서 관측된 세션입니다. "
+            "프로세스 열이 비어 있으면 샘플 귀속이 확인되지 않은 것이므로 C2/유출로 단정하지 마세요.</p>"
+            "<table id='tbl-net-smtp'><tr><th>서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
             "<th>발신자 (MAIL FROM)</th><th>수신자 (RCPT TO)</th>"
             "<th>AUTH 사용자명</th><th>플래그</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
@@ -2142,8 +2264,10 @@ def _network_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3 style='color:#ff7b72'>🚨 FTP C2 세션</h3>"
-            "<table id='tbl-net-ftp'><tr><th>C2 서버 IP</th><th>포트</th><th>사용자명</th>"
+            "<h3 style='color:#ff7b72'>FTP 세션</h3>"
+            "<p style='font-size:.76rem;color:#8b949e;margin:.2rem 0 .5rem'>전체 캡처에서 관측된 세션입니다. "
+            "프로세스 열이 비어 있으면 샘플 귀속이 확인되지 않은 것입니다.</p>"
+            "<table id='tbl-net-ftp'><tr><th>서버 IP</th><th>포트</th><th>사용자명</th>"
             "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
         )
@@ -2633,12 +2757,12 @@ def _process_tree_html(result) -> str:
     return "\n".join(parts)
 
 
-def _process_html(result) -> str:
+def _process_html(result, *, detailed=True) -> str:
     all_new = result.process_diff.get("new_processes", [])
     if not all_new:
         return "<p class='alert alert-success'>신규 프로세스 없음</p>"
 
-    return _all_procs_html(result, chain_pids=set(result.lineage_pids))
+    return _all_procs_html(result, chain_pids=set(result.lineage_pids), detailed=detailed)
 
 
 def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
@@ -3008,19 +3132,10 @@ def _quick_scan_card_html(result) -> str:
     )
 
 
-def _all_procs_html(result, chain_pids: set) -> str:
+def _all_procs_html(result, chain_pids: set, *, detailed=True) -> str:
     """화이트리스트 오탐만 제외한 신규 프로세스 전체 기록 테이블."""
-    all_new = result.process_diff.get("new_processes", [])
-    _WL = frozenset()
-    table_procs = [p for p in all_new if p.name.lower() not in _WL]
-    wl_excl = len(all_new) - len(table_procs)
-
-    note = (
-        f"<p style='font-size:.78rem;color:#6e7681;margin:1.2rem 0 .4rem'>"
-        f"<strong style='color:#cdd9e5'>전체 프로세스 기록</strong>"
-        f"&nbsp;— 오탐(화이트리스트) {wl_excl}개 제외 · {len(table_procs)}개"
-        f"&nbsp;·&nbsp;<span style='opacity:.5'>흐린 행</span> = 악성 체인 외부</p>"
-    )
+    table_procs = result.process_diff.get("new_processes", [])
+    note = f"<h3>전체 프로세스 기록 <small>{len(table_procs):,}개</small></h3>"
 
     behaviors = getattr(result, "process_behaviors", {}) or {}
 
@@ -3040,7 +3155,7 @@ def _all_procs_html(result, chain_pids: set) -> str:
     rows = []
     for p in table_procs:
         cmd_html = _cmdline_html(p.cmdline, 120)
-        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors, _http_by_conn2)
+        beh_btn, beh_detail_row = _beh_cells(p.pid, behaviors, _http_by_conn2) if detailed else ("", "")
         badges = _activity_badges_html(behaviors.get(p.pid))
         timing = _proc_timing_html(p, _start_time2)
         _meta = ""
@@ -3052,8 +3167,6 @@ def _all_procs_html(result, chain_pids: set) -> str:
         # 의심 행 배경 강조, 체인 외부는 흐리게 (의심이 우선)
         if p.pid in _susp_pids2:
             style = " style='background:rgba(248,81,73,.09)'"
-        elif p.pid not in chain_pids:
-            style = " style='opacity:.45'"
         else:
             style = ""
         tr_behrow = f" data-behrow='beh-row-{p.pid}'" if beh_detail_row else ""
@@ -3075,11 +3188,14 @@ def _all_procs_html(result, chain_pids: set) -> str:
 
     return (
         note
+        + "<div class='report-table-scroll process-record-scroll' tabindex='0' role='region' "
+          "aria-label='전체 프로세스 기록'>"
         + "<table id='tbl-process-all'>"
-        + "<tr><th></th><th>PID</th><th>프로세스</th><th>관련도</th><th>경로</th><th>명령줄</th><th>기법</th></tr>"
+        + "<tr><th aria-label='상세'></th><th>PID</th><th>프로세스</th><th>관련도</th>"
+          "<th>실행 경로</th><th>명령줄</th><th>기법</th></tr>"
 
         + "".join(rows)
-        + "</table>"
+        + "</table></div>"
     )
 
 
@@ -3356,7 +3472,11 @@ def _ioc_plaintext(ioc, sample_sha256: str = "") -> dict:
     if getattr(ioc, "urls", None):
         cats["url"] = "\n".join(ioc.urls)
     if getattr(ioc, "dropped_files", None):
-        cats["file"] = "\n".join(ioc.dropped_files)
+        # 관련도 '환경 배경'(tier 3) 경로는 차단 목록에 섞이지 않게 뺀다
+        _tiers = getattr(ioc, "dropped_file_tiers", None) or {}
+        _drops = [f for f in ioc.dropped_files if _tiers.get(f, 2) <= 2]
+        if _drops:
+            cats["file"] = "\n".join(_drops)
     if getattr(ioc, "registry_keys", None):
         cats["reg"] = "\n".join(ioc.registry_keys)
 
@@ -3368,6 +3488,67 @@ def _ioc_plaintext(ioc, sample_sha256: str = "") -> dict:
               if k in cats]
     cats["all"] = "\n\n".join(blocks)
     return cats
+
+
+def _geo_cfg() -> dict:
+    """IP 국가/ASN 조회 설정 — 기본은 꺼짐. 켜져 있어도 버튼을 눌러야만 전송한다."""
+    try:
+        from core.config_loader import get_hunt_cfg
+        hunt = get_hunt_cfg() or {}
+    except Exception:
+        hunt = {}
+    url = str(hunt.get("geo_url") or _GEO_DEFAULT_URL)
+    if not url.lower().startswith(("http://", "https://")):
+        url = _GEO_DEFAULT_URL
+    return {"enabled": bool(hunt.get("geo_lookup", False)), "url": url}
+
+
+_GEO_DEFAULT_URL = "http://ip-api.com/batch?fields=status,country,countryCode,org,as,query"
+
+
+def _geo_lookup_html(ips: list) -> str:
+    """외부 IP 표 위의 국가/ASN 조회 안내 + (설정 시) 조회 버튼.
+
+    리포트를 여는 것만으로 IOC IP 가 외부 서비스로 나가면 안 된다 — 자동 호출하지 않는다.
+    """
+    from urllib.parse import urlparse
+    cfg = _geo_cfg()
+    host = urlparse(cfg["url"]).netloc or "ip-api.com"
+    plain = cfg["url"].lower().startswith("http://")
+    note_style = "font-size:.74rem;color:#8b949e;margin:.2rem 0 .5rem"
+    if not ips:
+        return ""
+    if not cfg["enabled"]:
+        return (f"<p style='{note_style}'>국가/ASN 조회 꺼짐 — <code>config.json</code> 의 "
+                f"<code>hunt.geo_lookup</code> 을 <code>true</code> 로 바꾸면 조회 버튼이 나타납니다 "
+                f"(누르면 이 표의 IP 목록이 {_e(host)} 로 전송됨).</p>")
+    return (
+        f"<div style='{note_style};display:flex;gap:.6rem;align-items:center;flex-wrap:wrap'>"
+        "<button type='button' class='ev-copy' onclick='geoLookup(this)'>국가/ASN 조회</button>"
+        f"<span>누르면 외부 IP {len(ips)}개(이 표의 IP 주소만)가 <b>{_e(host)}</b> 로 전송됩니다"
+        + (" — 평문 HTTP, 릴레이로 열었으면 릴레이를 거쳐 전송" if plain else "")
+        + ". 그 외 정보는 보내지 않습니다.</span></div>"
+        "<script>var GEO_IPS=" + _js_json(list(ips)) + ";"
+        "function geoLookup(btn){"
+        "if(!GEO_IPS.length)return;btn.disabled=true;btn.textContent='조회 중…';"
+        "var cells={};document.querySelectorAll('[data-geo-ip]').forEach(function(el){cells[el.getAttribute('data-geo-ip')]=el;});"
+        "function h(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;');}"
+        "function flag(cc){if(!/^[A-Za-z]{2}$/.test(cc||''))return '';"
+        "try{return String.fromCodePoint.apply(null,cc.toUpperCase().split('').map(function(c){return 0x1F1E6+c.charCodeAt(0)-65;}));}catch(e){return '';}}"
+        "var body=JSON.stringify(GEO_IPS.map(function(ip){return {query:ip};}));"
+        "var opt={method:'POST',headers:{'Content-Type':'application/json'},body:body};"
+        "var useRelay=(typeof _relayAvailable==='function')&&_relayAvailable();"
+        "var p=useRelay?fetch('/hunt/relay/geo',opt):fetch(HUNT_CFG.geo_url,opt);"
+        "p.then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(list){"
+        "if(!Array.isArray(list))throw new Error('응답 형식 오류');"
+        "list.forEach(function(it){if(!it||it.status!=='success')return;var cell=cells[it.query];if(!cell)return;"
+        "var asn=String(it.as||'').split(' ')[0];var org=String(it.org||it.as||'').replace(/^AS[0-9]+[ ]*/,'').split(' ').slice(0,4).join(' ');"
+        "var f=flag(it.countryCode);"
+        "cell.innerHTML=(f?f+' ':'')+h(it.country||'-')+'<br><span style=\"color:#8b949e;font-size:.7rem\">'+h(asn)+(org?' · '+h(org):'')+'</span>';});"
+        "btn.textContent='조회 완료';"
+        "}).catch(function(e){btn.disabled=false;btn.textContent='조회 실패 — 다시 시도';btn.title=String(e&&e.message||e);});}"
+        "</script>"
+    )
 
 
 def _ioc_copy_btn(key: str) -> str:
@@ -3392,7 +3573,7 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
     # ── IOC 복사 UI (전체 + 카테고리별) ──────────────────────────
     _ioc_texts = _ioc_plaintext(ioc, sample_sha256)
     if _ioc_texts.get("all"):
-        _texts_js = _json.dumps(_ioc_texts, ensure_ascii=False).replace("</", "<\\/")
+        _texts_js = _js_json(_ioc_texts)
         _copy_js = (
             "<script>var IOC_TEXTS=" + _texts_js + ";"
             "function copyIOC(k,b){var t=(IOC_TEXTS||{})[k]||'';if(!t)return;"
@@ -3413,7 +3594,7 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
             "cursor:pointer;font-weight:600'>\U0001F4CB 전체 IOC 복사</button>"
             "<span style='color:#6e7681;font-size:.74rem'>"
             "IP·도메인·URL·드롭파일·"
-            "레지스트리를 텍스트로 클립보드에 복사</span>"
+            "레지스트리를 텍스트로 클립보드에 복사 (환경 배경 드롭 파일 제외)</span>"
             "</div>" + _copy_js
         )
 
@@ -3460,8 +3641,6 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
             if _label not in _mipl:
                 _mipl.append(_label)
 
-    parts.append(_pnmap_debug_panel(pnmap, ip_proc_lookup))
-
     # ── 외부 IP 테이블 (풍부한 컬럼) ─────────────────────────────
     if ioc.ip_addresses:
         pub_ips = ioc.ip_addresses[:_IOC_LIMIT]
@@ -3490,54 +3669,17 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
                 f"<td>{dom_html}</td>"
                 f"<td style='white-space:nowrap'>{port_html}</td>"
                 f"<td data-geo-ip='{_e(ip)}' style='color:#8b949e;font-size:.78rem'>"
-                f"<span style='color:#484f58'>…</span></td>"
+                f"<span style='color:#484f58'>-</span></td>"
                 + _proc_cell(ip_proc_lookup.get(ip, [])) +
                 f"</tr>"
             )
-        geo_ips_js = _json.dumps(pub_ips[:100])
         parts.append(
             "<h3>외부 IP" + _ioc_copy_btn("ip") + "</h3>"
+            + _geo_lookup_html(pub_ips[:100])
             + _trunc_notice(len(ioc.ip_addresses), _IOC_LIMIT)
             + "<table id='tbl-ioc-ip'>"
             + "<tr><th>IP 주소</th><th>연관 도메인</th><th>포트</th><th>국가 / 기관</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
-            + f"""<script>
-(function(){{
-  var ips={geo_ips_js};
-  if(!ips.length) return;
-  var cells={{}};
-  document.querySelectorAll('[data-geo-ip]').forEach(function(el){{
-    cells[el.getAttribute('data-geo-ip')]=el;
-  }});
-  function flag(cc){{
-    if(!cc||cc.length!==2) return '';
-    try{{return String.fromCodePoint(...[...cc.toUpperCase()].map(function(c){{return 0x1F1E0+c.charCodeAt(0)-65;}}));}}
-    catch(e){{return '';}}
-  }}
-  var batches=[];
-  for(var i=0;i<ips.length;i+=100) batches.push(ips.slice(i,i+100));
-  Promise.all(batches.map(function(batch){{
-    return fetch('http://ip-api.com/batch?fields=status,country,countryCode,org,as,query',{{
-      method:'POST',
-      headers:{{'Content-Type':'application/json'}},
-      body:JSON.stringify(batch.map(function(ip){{return {{query:ip}}; }}))
-    }}).then(function(r){{return r.ok?r.json():[];}}).catch(function(){{return [];}});
-  }})).then(function(results){{
-    (results||[]).flat().forEach(function(item){{
-      if(!item||item.status!=='success') return;
-      var cell=cells[item.query];
-      if(!cell) return;
-      var f=flag(item.countryCode);
-      var asn=(item.as||'').split(' ')[0];
-      var org=(item.org||item.as||'').replace(/^AS\\d+\\s*/,'').split(' ').slice(0,4).join(' ');
-      cell.innerHTML=(f?f+' ':'')+_e2(item.country||'-')
-        +'<br><span style="color:#8b949e;font-size:.7rem">'+_e2(asn)
-        +(org?' · '+_e2(org):'')+'</span>';
-    }});
-  }});
-  function _e2(s){{return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}}
-}})();
-</script>"""
         )
 
     # 파일 이벤트 → 파일경로(소문자): 프로세스 매핑
@@ -3677,20 +3819,20 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
     if sample_sha256:
         short = sample_sha256[:20] + "…"
         chips.append(
-            f"<span class='hunt-qchip hash' title='{_e(sample_sha256)}' "
-            f"onclick=\"huntQuick('{_e(sample_sha256)}')\">🔑 {_e(short)}</span>"
+            f"<span class='hunt-qchip hash' title='{_e(sample_sha256)}' data-q='{_e(sample_sha256)}' "
+            f"onclick='huntQuick(this.dataset.q)'>🔑 {_e(short)}</span>"
         )
 
     # IOC IP 칩 (최대 8개)
     for ip in (ioc.ip_addresses[:8] if ioc else []):
         chips.append(
-            f"<span class='hunt-qchip ip' onclick=\"huntQuick('{_e(ip)}')\">🌐 {_e(ip)}</span>"
+            f"<span class='hunt-qchip ip' data-q='{_e(ip)}' onclick='huntQuick(this.dataset.q)'>🌐 {_e(ip)}</span>"
         )
 
     # IOC 도메인 칩 (최대 6개)
     for d in (ioc.domains[:6] if ioc else []):
         chips.append(
-            f"<span class='hunt-qchip domain' onclick=\"huntQuick('{_e(d)}')\">🔗 {_e(d)}</span>"
+            f"<span class='hunt-qchip domain' data-q='{_e(d)}' onclick='huntQuick(this.dataset.q)'>🔗 {_e(d)}</span>"
         )
 
     quick_html = ""
@@ -3707,8 +3849,15 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
 
 <div class="alert alert-info" style="font-size:.82rem;margin-bottom:.6rem">
   <strong>MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker</strong>
-  를 브라우저에서 직접 조회합니다.
+  를 조회합니다. 조회 버튼을 누를 때만 입력한 값(해시·IP·도메인·URL)이 abuse.ch 로 전송됩니다.
   인터넷 연결이 필요하며, 격리 VM에서는 네트워크 정책을 확인하세요.
+</div>
+
+<div id="hunt-auth-warn" class="alert alert-warning"
+     style="display:none;font-size:.82rem;margin-bottom:.8rem">
+  abuse.ch 인증 키 미설정 — abuse.ch API 는 <code>Auth-Key</code> 가 필요해 조회가 "조회 실패(HTTP 401)" 로 끝날 수 있습니다.
+  <code>config.json</code> → <code>hunt.auth_key</code> 에 키를 넣으면 릴레이(http://127.0.0.1:PORT)가 서버 쪽에서 붙여 보냅니다
+  (키는 리포트 HTML 에 들어가지 않습니다).
 </div>
 
 <div id="hunt-cors-warn" class="alert alert-warning"
@@ -3774,14 +3923,59 @@ def _build_hunt_cfg_js() -> str:
         }
     # relay_port: JS 가 릴레이 사용 여부를 판단하는 데 사용
     relay_port = hunt.get("serve_port", 0)
+    try:
+        relay_port = int(relay_port or 0)
+    except (TypeError, ValueError):
+        relay_port = 0
+    try:
+        from core.config_loader import get_hunt_auth_key
+        auth_key_set = bool(get_hunt_auth_key())
+    except Exception:
+        auth_key_set = False
+    services = {}
+    for k, v in (hunt.get("services", {}) or {}).items():
+        if isinstance(v, dict) and not str(k).startswith("_"):
+            # url·label·enabled 만 — 혹시 들어 있을 키 같은 값은 HTML 로 내보내지 않는다
+            services[k] = {kk: v[kk] for kk in ("enabled", "label", "url") if kk in v}
+    geo = _geo_cfg()
     js_obj = {
-        "relay_port": relay_port if relay_port and relay_port > 0 else None,
-        "services":   hunt.get("services", {}),
+        "relay_port": relay_port if relay_port > 0 else None,
+        "services":   services,
+        # 인증 키는 절대 HTML 에 넣지 않는다 — 설정 여부만 알려 안내 문구에 쓴다
+        "auth_key_set": auth_key_set,
+        "geo_lookup": geo["enabled"],
+        "geo_url":    geo["url"],
     }
-    return _json.dumps(js_obj, ensure_ascii=False)
+    return _js_json(js_obj)
+
+
+def _without_disclosures(fragment: str) -> str:
+    """생성된 HTML 조각의 접힌 부록을 중첩된 항목까지 제거한다."""
+    import re
+
+    parts = []
+    depth = 0
+    for token in re.split(r"(</?details\b[^>]*>)", fragment, flags=re.IGNORECASE):
+        tag = token.lower()
+        if tag.startswith("<details"):
+            depth += 1
+        elif tag.startswith("</details"):
+            depth -= 1
+        elif not depth:
+            parts.append(token)
+    return "".join(parts)
 
 
 def generate_html_report(result, output_path: str) -> None:
+    """기본 보고서를 저장하고, 분석 종료 시 근거 포함 비교본을 보존한다."""
+    path = Path(output_path)
+    _render_html_report(result, output_path, detailed=False)
+    if not (getattr(result, "ai_analysis", None) or {}).get("pending"):
+        backup = path.with_name(f"{path.stem}_detailed{path.suffix}")
+        _render_html_report(result, str(backup), detailed=True)
+
+
+def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
     """AnalysisResult → HTML 파일 저장"""
     generated   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     sample_name = result.config.sample_path.name if result.config.sample_path else "전체 시스템 모니터링"
@@ -3844,35 +4038,21 @@ def generate_html_report(result, output_path: str) -> None:
                   + (len(ioc.urls) if ioc else 0))
 
     # ── 위협 수준 ────────────────────────────────────────────────
-    threat_score = tech_count + (1 if shc_total else 0)
+    # 헤더의 '규칙 기반 지표'와 판정 요약이 서로 다른 값을 보이지 않도록
+    # build_indicators/score_indicators 결과를 한 번만 계산해 둘 다에 쓴다.
+    _verdict = _report_verdict(result)
     _sample_active = getattr(result, "sample_active", True)
-    if not _sample_active and threat_score == 0:
+    _strong = [i for i in _verdict["indicators"] if i.get("level") in ("mal", "sus")]
+    if not _sample_active and not _strong:
         # 비활성 + 탐지 없음 → 판정 불가로 표시
-        threat_color = "gray"
         threat_label = "UNKNOWN (비활성)"
     else:
-        threat_color = "red" if threat_score >= 3 else ("orange" if threat_score >= 1 else "green")
-        threat_label = "HIGH" if threat_score >= 3 else ("MEDIUM" if threat_score >= 1 else "CLEAN")
+        threat_label = f"{_verdict['label']} · {_verdict['score']}점"
 
-    def _tool_badge(k: str, v) -> str:
-        """bool 또는 문자열 도구 상태를 배지로 변환."""
-        if isinstance(v, bool):
-            return _b("✔ " + k, "green") if v else _b("✘ " + k, "gray")
-        # 문자열 — 내용으로 성공/실패 판별
-        s = str(v)
-        _negative = ("비활성", "미설치", "없음", "오류", "건너뜀", "실패", "비PE")
-        if not s or any(n in s for n in _negative):
-            icon, color = "✘", "gray"
-        else:
-            icon, color = "✔", "green"
-        short = s[:28] + "…" if len(s) > 28 else s
-        return f"<span title='{_e(s)}'>{_b(f'{icon} {k}: {short}', color)}</span>"
-
-    tools_html = "  ".join(_tool_badge(k, v) for k, v in result.tools_used.items())
 
     # ── 샘플 SHA256 (Hunt 탭 빠른 조회용) ───────────────────────────
-    sample_sha256 = ""
-    if result.config.sample_path:
+    sample_sha256 = str(getattr(result, "sample_sha256", "") or "")
+    if not sample_sha256 and result.config.sample_path:
         try:
             sample_sha256 = hashlib.sha256(
                 Path(result.config.sample_path).read_bytes()
@@ -3929,17 +4109,26 @@ def generate_html_report(result, output_path: str) -> None:
         sample_name=sample_name, sample_path=result.config.sample_path or "전체 시스템 모니터링",
         generated=generated, timeout=result.config.timeout, duration=result.end_time-result.start_time,
         techniques=tech_count, events=len(result.procmon_events), connections=conn_count, ips=ip_count,
-        tools_html=tools_html, indicator=threat_label,
-        needs_review=bool(result.errors) or bool(result.tools_used.get("procmon") and not result.procmon_events),
+        indicator=threat_label,
     )
-    # 행위 그래프 — 계보를 못 찾았으면 트리에 표시되는 프로세스로 대신 그린다
-    try:
-        _g = _behavior_graph_html(result, _compute_display_procs(result)[0])
-    except Exception:
-        _g = ""
+    # 행위 그래프 — 프로세스 체인과 각 프로세스의 관측 행위를 한 화면에.
+    # 계보를 못 찾았으면 트리에 표시되는 프로세스로 대신 그린다.
     from exporters.capability_graph import capability_preview_html
-    _overview_graph = _g or "<p>표시할 프로세스 관계가 없습니다.</p>"
+    try:
+        _overview_graph = capability_preview_html(
+            result, fallback_pids=[p.pid for p in _compute_display_procs(result)[0]],
+            include_evidence=detailed)
+    except Exception as _ge:
+        _overview_graph = f"<p>행위 그래프 생성 실패: {_e(type(_ge).__name__)}</p>"
 
+    fragment = (lambda html: html) if detailed else _without_disclosures
+    evidence_button = '<button class="tab-btn" data-tab="tab-evidence">증거</button>' if detailed else ""
+    evidence_panel = (f'<div id="tab-evidence" class="tab-panel">{_evidence_html(result, output_path)}</div>'
+                      if detailed else "")
+    attack_appendix = (f'<details class="plain"><summary>ATT&amp;CK 전체 표 (VirusTotal·CAPA·AI 포함)</summary>'
+                       f'{_section_html(result)}</details>' if detailed else "")
+    memory_open = "<details><summary>메모리 분석 결과</summary>" if detailed else ""
+    memory_close = "</details>" if detailed else ""
     body = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -3985,57 +4174,32 @@ def generate_html_report(result, output_path: str) -> None:
   <button class="tab-btn" data-tab="tab-ioc">
     관찰 지표 · IOC{tab5_b}
   </button>
-  <button class="tab-btn" data-tab="tab-evidence">
-    증거
-  </button>
+  {evidence_button}
   <button class="tab-btn" data-tab="tab-hunt">
     위협 조회 · Hunt
-  </button>
-  <button class="tab-btn" data-tab="tab-ai">
-    AI 분석
   </button>
 </nav>
 
 <!-- ══════════ 탭 1: 기본 분석 ══════════ -->
 <div id="tab-basic" class="tab-panel active">
   {_VISUALS_CSS}
-  {_verdict_overview_html(result, sample_name, sample_sha256)}
+  {fragment(_verdict_overview_html(result, sample_name, sample_sha256, verdict=_verdict))}
+
+  {fragment(_ai_html(result))}
 
   <h2>행위 그래프</h2>{_overview_graph}
-  <h2>관측 행위 도식</h2>{capability_preview_html(result)}
 
-  <details><summary>수집 통계</summary>
-  <div class="grid2">
-    <div class="card">
-      <table class="kv">
-        <tr><td>샘플 이름</td><td class="mono">{_e(sample_name)}</td></tr>
-        <tr><td>샘플 PID</td><td class="mono">{result.sample_pid or '-'}</td></tr>
-        <tr><td>추적 PID</td><td class="mono">{', '.join(str(p) for p in sorted(result.all_pids)) or '-'}</td></tr>
-        <tr><td>전체 이벤트</td><td>{len(result.procmon_events):,}</td></tr>
-        <tr><td>필터 후 이벤트</td><td>{len(result.filtered_events):,}</td></tr>
-      </table>
-    </div>
-    <div class="card">
-      <table class="kv">
-        <tr><td>신규 프로세스</td><td>{proc_count}</td></tr>
-        <tr><td>레지스트리 추가</td><td>{reg_added}</td></tr>
-        <tr><td>레지스트리 변경</td><td>{reg_mod} <span style='color:#8b949e;font-size:.78rem'>(Regshot) / {procmon_reg_count:,} (ProcMon)</span></td></tr>
-        <tr><td>네트워크 연결</td><td>{conn_count}</td></tr>
-        <tr><td>DNS 쿼리</td><td>{dns_count}</td></tr>
-        <tr><td>TLS 세션 키</td><td>{getattr(result, 'tls_key_count', 0)} <span style='color:#8b949e;font-size:.78rem'>{"(복호화 " + str(len(getattr(result,'decrypted_requests',[]))) + "건)" if getattr(result,'decrypted_requests',None) else ""}</span></td></tr>
-        <tr><td>인젝션·쉘코드 의심</td><td><b style="color:{'#ff7b72' if shc_total else '#56d364'}">{shc_total}개 프로세스</b>{"<span style='color:#8b949e;font-size:.78rem'>&nbsp;(오탐 " + str(shc_fp_excluded) + "개 제외)</span>" if shc_fp_excluded else ""}</td></tr>
-      </table>
-    </div>
-  </div>
+  {attack_appendix}
 
-  </details>
 </div>
 
 <!-- ══════════ 탭 3: 프로세스 ══════════ -->
 <div id="tab-process" class="tab-panel">
 
   <h2>프로세스 실행 내역</h2>
-  {_process_html(result)}
+  {_attack_inline_html(result, "process") if detailed else ""}
+  {_process_html(result, detailed=detailed)}
+  {_sideload_html(result)}
 
 </div>
 
@@ -4043,8 +4207,9 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-filesystem" class="tab-panel">
 
   <h2>파일 시스템 활동</h2>
-  {_attack_inline_html(result, "file")}
-  {_file_events_html(result)[0]}
+  {_attack_inline_html(result, "file") if detailed else ""}
+  {fragment(_file_events_html(result)[0])}
+  {_artifact_intel_html(result) if detailed else ""}
 
 </div>
 
@@ -4052,8 +4217,8 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-registry" class="tab-panel">
 
   <h2>레지스트리 변경</h2>
-  {_attack_inline_html(result, "registry")}
-  {_registry_events_html(result)}
+  {_attack_inline_html(result, "registry") if detailed else ""}
+  {fragment(_registry_events_html(result))}
 
 </div>
 
@@ -4061,8 +4226,8 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-network" class="tab-panel">
 
   <h2>네트워크 활동</h2>
-  {_attack_inline_html(result, "network")}
-  {_network_html(result)}
+  {_attack_inline_html(result, "network") if detailed else ""}
+  {fragment(_network_html(result))}
 
 </div>
 
@@ -4070,12 +4235,12 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-memory" class="tab-panel">
 
   <h2>메모리 인젝션 · 쉘코드</h2>
-  <details><summary>메모리 분석 결과</summary>
-  {_attack_inline_html(result, "memory")}
-  {_lineage_dumps_html(result)}
-  {_shellcode_html(result)}
-  {_volatility_html(result)}
-  </details>
+  {memory_open}
+  {_attack_inline_html(result, "memory") if detailed else ""}
+  {fragment(_lineage_dumps_html(result))}
+  {fragment(_shellcode_html(result))}
+  {fragment(_volatility_html(result))}
+  {memory_close}
 
 </div>
 
@@ -4083,29 +4248,16 @@ def generate_html_report(result, output_path: str) -> None:
 <div id="tab-ioc" class="tab-panel">
 
   <h2>관찰 지표 · IOC</h2>
-  {_ioc_html(result, sample_sha256)}
-
-  <details class="plain"><summary>ATT&amp;CK 전체 표 (VirusTotal·CAPA 포함)</summary>
-  {_section_html(result)}
-  {_sideload_html(result)}
-  {_artifact_intel_html(result)}
-  </details>
+  {fragment(_ioc_html(result, sample_sha256))}
 
 </div>
 
 <!-- ══════════ 탭: 증거 ══════════ -->
-<div id="tab-evidence" class="tab-panel">
-  {_evidence_html(result, output_path)}
-</div>
+{evidence_panel}
 
 <!-- ══════════ 탭 7: Hunt ══════════ -->
 <div id="tab-hunt" class="tab-panel">
-  {_hunt_html(sample_sha256, ioc)}
-</div>
-
-<!-- ══════════ 탭 8: AI 분석 ══════════ -->
-<div id="tab-ai" class="tab-panel">
-  {_ai_html(result)}
+  {fragment(_hunt_html(sample_sha256, ioc))}
 </div>
 
 </div>
@@ -4113,7 +4265,53 @@ def generate_html_report(result, output_path: str) -> None:
 </body>
 </html>"""
 
-    Path(output_path).write_text(body, encoding="utf-8")
+    try:
+        from exporters.json_report import atomic_write_text
+        atomic_write_text(output_path, body)
+    except ImportError:
+        Path(output_path).write_text(body, encoding="utf-8")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 수집 상태 · AI 진행 중 안내
+# ══════════════════════════════════════════════════════════════════════
+
+# 1차 보고서(AI 진행 중)가 http(s) 로 서빙될 때만 15초마다 HEAD 로 파일 갱신을 확인한다.
+# file:// 에서는 아무것도 하지 않는다.
+_AI_PENDING_POLL_JS = """<script>
+(function(){
+  if(!/^https?:$/.test(location.protocol)) return;
+  var base=null, timer=null;
+  var loaded=Date.parse(document.lastModified||'');
+  function show(){
+    clearInterval(timer);
+    location.reload();
+  }
+  function check(){
+    fetch(location.href,{method:'HEAD',cache:'no-store'}).then(function(r){
+      var lm=r.headers.get('Last-Modified')||'';
+      if(!lm) return;
+      if(base===null){
+        base=lm;
+        var t=Date.parse(lm);
+        if(!isNaN(t)&&!isNaN(loaded)&&t>loaded) show();
+        return;
+      }
+      if(lm!==base) show();
+    }).catch(function(){});
+  }
+  check(); timer=setInterval(check,15000);
+})();
+</script>"""
+
+
+def _ai_pending_notice_html() -> str:
+    return (
+        "<div class='ai-pending' style='border-left:3px solid #f0b429;padding:6px 14px;margin:0 0 14px;"
+        "font-size:.86rem;color:#e9eff8'>"
+        "AI 해석 진행 중 · <button type=\"button\" onclick=\"location.reload()\">새로고침</button>"
+        "</div>"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -4921,10 +5119,10 @@ def _ai_html(result) -> str:
 
     parts = ["<h2>AI 위협 분석</h2>"]
 
-    # 빠른 위협 요약 카드 — LLM 없이 데이터 기반으로 즉시 생성
-    quick_card = _quick_scan_card_html(result)
-    if quick_card:
-        parts.append(quick_card)
+    if not ai:
+        return ""
+    if ai.get("pending"):
+        return parts[0] + _ai_pending_notice_html() + _AI_PENDING_POLL_JS
 
     # 메타
     parts.append(
@@ -4934,16 +5132,6 @@ def _ai_html(result) -> str:
         f"응답 시간: {elapsed}s &nbsp;|&nbsp; 입력: {prompt_ch:,}자"
         f"</p>"
     )
-
-    if not ai:
-        parts.append(
-            "<div class='alert alert-info'>"
-            "AI 분석 결과가 없습니다. GUI의 AI 설정에서 NVIDIA API 키와 모델을 설정한 뒤 AI 분석을 켜세요.<br>"
-            "환경변수 <code>NVIDIA_API_KEY</code>로도 키를 지정할 수 있습니다."
-
-            "</div>"
-        )
-        return "\n".join(parts)
 
     if error:
         if provider == "nvidia":

@@ -479,7 +479,18 @@ def main() -> None:
     def on_status(msg: str) -> None:
         console.print(f"  {msg}")
 
-    result = run_analysis(config, on_status=on_status)
+    def save_preliminary_report(partial) -> None:
+        from exporters.json_report import save_json_report
+        from exporters.html_report import generate_html_report
+
+        stem = sample_path.stem if sample_path else "monitor"
+        html_path = out_dir / f"{stem}_dynamic_report.html"
+        save_json_report(partial, str(out_dir / f"{stem}_dynamic_report.json"))
+        generate_html_report(partial, str(html_path))
+        console.print(f"[보고서] 1차 보고서 저장 완료 — {html_path}", markup=False)
+
+    result = run_analysis(config, on_status=on_status,
+                          on_preliminary_report=None if args.no_export else save_preliminary_report)
     console.print()
 
     # ── 요약 출력 ───────────────────────────────────────────────
@@ -527,6 +538,11 @@ def main() -> None:
             _open_report(html_path, console)
 
     console.rule("[bold white]분석 완료")
+    from core.collection_health import collection_status
+    failed_collection = any(row.get("state") == "fail" for row in collection_status(result)
+                            if row.get("tool") in ("ProcMon", "패킷 캡처"))
+    if failed_collection or any(error.startswith("샘플 실행 실패:") for error in result.errors):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -180,6 +180,7 @@ class MalfindEntry:
     hexdump:        str        # 앞 32 바이트 hex
     disasm:         str        # 앞 몇 개 인스트럭션
     shellcode_type: str        = ""  # 쉘코드 유형 자동 분류
+    in_focus:       bool       = True  # 분석 추적 PID(all_pids) 소속 여부 — False 는 참고용
 
 
 @dataclass
@@ -287,6 +288,8 @@ class MemForensicsResult:
     procdumps:    list[ProcDumpEntry]  = field(default_factory=list)
     plugin_errors: dict[str, str]      = field(default_factory=dict)
     error:        str                  = ""
+    dump_time:    float                = 0.0    # 덤프 획득 시작 시각 (epoch)
+    sample_alive_at_dump: Optional[bool] = None  # 덤프 시점 샘플 프로세스 생존 여부
 
 
 # ── 분석 헬퍼 상수 ───────────────────────────────────────────────────────
@@ -1077,6 +1080,17 @@ _SUSPICIOUS_PROTECTIONS = frozenset({
 })
 
 
+def _tag_malfind(entries: list, focus_pids: "set[int] | None") -> list:
+    """malfind 행에 in_focus 를 표시하고 추적 PID 행을 앞으로 정렬한다 (행은 지우지 않음)."""
+    focus = set(focus_pids or ())
+    for e in entries:
+        try:
+            e.in_focus = (not focus) or (e.pid in focus)
+        except Exception:
+            pass
+    return sorted(entries, key=lambda e: 0 if getattr(e, "in_focus", True) else 1)
+
+
 def run_memory_forensics(
     output_dir: Path,
     sample_pids: set[int] | None = None,
@@ -1088,6 +1102,8 @@ def run_memory_forensics(
     skip_dump: bool = False,
     existing_dump: Optional[Path] = None,
     symbols_path: Optional[str] = None,
+    dump_time: float = 0.0,
+    sample_alive: Optional[bool] = None,
 ) -> MemForensicsResult:
     """
     메모리 덤프 획득 + Volatility3 분석 통합 실행.
@@ -1098,12 +1114,20 @@ def run_memory_forensics(
     skip_dump:      True면 덤프 없이 existing_dump 사용
     existing_dump:  이미 있는 덤프 파일 경로
     symbols_path:   Volatility3 심볼 디렉터리 (None이면 자동 탐색)
+    dump_time:      existing_dump 를 이 분석에서 미리 획득했을 때 그 시각 (epoch)
+    sample_alive:   덤프 시점 샘플 생존 여부 (호출부가 알 때만)
+
+    malfind 는 PID 필터 없이 전부 보관하고 sample_pids 소속 여부를 in_focus 로
+    표시한다 (탐지되지 않은 주입 대상의 RWX 영역도 남기기 위함). 추적 PID 행이
+    앞에 오도록 정렬하며, PE 추출(procdump)은 in_focus 행만 대상으로 한다.
     """
     def _st(msg: str) -> None:
         if on_status:
             on_status(msg)
 
     result = MemForensicsResult()
+    result.dump_time = float(dump_time or 0.0)
+    result.sample_alive_at_dump = sample_alive
 
     # ── Volatility3 탐색 ─────────────────────────────────────────────
     vol_cmd_info = None
@@ -1127,6 +1151,7 @@ def run_memory_forensics(
     else:
         dump_path = output_dir / "memory.raw"
         _st("[메모리] 물리 메모리 덤프 획득 중 (수분 소요)...")
+        result.dump_time = time.time()
         ok, elapsed, err, dump_path = acquire_memory(
             dump_path,
             tool_path=winpmem_path or find_winpmem(),
@@ -1211,7 +1236,7 @@ def run_memory_forensics(
     t_vol = time.monotonic()
 
     plugins = {
-        "malfind":  lambda: runner.malfind(pid_filter=sample_pids),
+        "malfind":  lambda: _tag_malfind(runner.malfind(pid_filter=None), sample_pids),
         "pstree":   lambda: runner.pstree(),
         "netscan":  lambda: runner.netscan(),
         "connscan": lambda: runner.connscan(),
@@ -1252,6 +1277,8 @@ def run_memory_forensics(
     _pstree_names: dict[int, str] = {e.pid: e.name for e in result.pstree}
     pid_reasons: dict[int, str] = {}
     for e in result.malfind:
+        if not getattr(e, "in_focus", True):
+            continue   # 추적 밖 프로세스는 기록만 하고 PE 추출은 하지 않음 (JIT 오탐 다수)
         if e.protection in _SUSPICIOUS_PROTECTIONS and e.pid:
             pname = _pstree_names.get(e.pid, e.process or "").lower()
             if pname not in _PROCDUMP_FP:
@@ -1280,12 +1307,16 @@ def memforensics_to_dict(r: MemForensicsResult) -> dict:
         "vol_elapsed":  r.vol_elapsed,
         "error":        r.error,
         "plugin_errors": r.plugin_errors,
+        "dump_time":    r.dump_time,
+        "sample_alive_at_dump": r.sample_alive_at_dump,
+        "malfind_in_focus": sum(1 for e in r.malfind if getattr(e, "in_focus", True)),
         "malfind": [
             {"pid": e.pid, "process": e.process, "start_vpn": e.start_vpn,
              "end_vpn": e.end_vpn, "protection": e.protection,
              "private_memory": e.private_memory,
              "hexdump": e.hexdump, "disasm": e.disasm,
-             "shellcode_type": e.shellcode_type}
+             "shellcode_type": e.shellcode_type,
+             "in_focus": getattr(e, "in_focus", True)}
             for e in r.malfind
         ],
         "pstree": [

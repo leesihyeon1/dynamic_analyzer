@@ -5,7 +5,7 @@ report_visuals.py — 리포트 개요 화면의 판정 요약 · 위험 지표 
 
   * Hybrid Analysis — 판정(악성/의심) + 점수 링 + "악성 / 의심 / 정보성 지표" 목록.
     리포트를 열자마자 "그래서 악성인가, 근거가 뭔가"에 답한다.
-  * Joe Sandbox     — 행위 그래프. 프로세스 체인과 각 프로세스가 남긴
+  * Joe Sandbox     — 행위 그래프(exporters/capability_graph.py). 프로세스 체인과 각 프로세스가 남긴
     파일·레지스트리·네트워크 흔적을 한 장의 그림으로 보여준다.
   * ANY.RUN         — 프로세스 트리 행마다 활동 배지와 펼침 상세.
     (트리 본체는 html_report._process_tree_html, 여기서는 상세 패널과 스타일만 제공)
@@ -90,21 +90,6 @@ h3{border-bottom:1px solid var(--line);padding-bottom:6px;color:var(--text);font
 .va-tid a{color:inherit}
 .va-empty{font-size:.84rem;color:var(--muted);padding:2px 0 10px 20px}
 
-/* ── 행위 그래프 ── */
-.bg-fig{margin:0 0 24px;padding:0}
-.bg-scroll{overflow:auto;max-height:760px;border:1px solid var(--line);background:#0e1828}
-.bg-svg{display:block;color:var(--text)}
-.bg-svg text{font-family:'Cascadia Code',Consolas,'Malgun Gothic',monospace;fill:currentColor}
-.bg-svg .bg-sub{fill:#9fb0c8;font-size:10px}
-.bg-svg .bg-el{fill:#a9bbd6;font-size:10px;paint-order:stroke;stroke:#0e1828;stroke-width:4px;stroke-linejoin:round}
-.bg-svg .bg-edge{fill:none;stroke:#5a7196;stroke-width:1.3}
-.bg-svg .bg-edge-art{stroke-dasharray:4 3}
-.bg-svg .bg-proc{cursor:pointer}
-.bg-svg .bg-proc:hover rect{filter:brightness(1.4)}
-.bg-legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:.76rem;color:var(--muted);margin-top:10px}
-.bg-legend i{display:inline-block;width:16px;height:10px;border:1.5px solid var(--c);margin-right:6px;vertical-align:-1px}
-.bg-fig figcaption{font-size:.8rem;color:var(--muted);margin-top:8px}
-
 /* ── 구간별 ATT&CK (별도 목록 대신 해당 텔레메트리 옆에) ── */
 .atk{margin:4px 0 24px;border-bottom:1px solid var(--line)}
 .atk-h{font-size:.72rem;letter-spacing:.1em;color:var(--muted);font-weight:650;padding:0 0 6px}
@@ -185,7 +170,15 @@ _TACTIC_KO = {
 # 계보에서 관측되면 그 자체로 악성 판단 근거가 되는 기법 (접두 일치)
 _HIGH_SEV = ("T1055", "T1547", "T1543", "T1053", "T1574", "T1555", "T1539", "T1562",
              "T1486", "T1490", "T1003", "T1056", "T1041", "T1048")
-_EXTERNAL_SOURCES = {"virustotal", "capa"}
+# 이번 실행의 텔레메트리가 아니라 다른 곳(타 샌드박스·정적 분석·AI 추론)이 보고한 기법 출처
+_EXTERNAL_SOURCES = {"virustotal", "capa", "ai"}
+_TID_RE = __import__("re").compile(r"T\d{4}(?:\.\d{3})?")
+
+
+def is_external_only(t) -> bool:
+    """기법의 출처가 전부 외부(VirusTotal·CAPA·AI)면 True — 이번 실행에서 관측된 근거가 없다."""
+    srcs = {str(x).strip().lower() for x in (getattr(t, "sources", None) or []) if str(x).strip()}
+    return bool(srcs) and srcs <= _EXTERNAL_SOURCES
 _EXE_EXT = (".exe", ".dll", ".sys", ".scr", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".hta", ".lnk")
 
 
@@ -197,6 +190,14 @@ def _short(s: str, n: int) -> str:
     keep = n - 1
     head = keep // 3
     return s[:head] + "…" + s[-(keep - head):]
+
+
+def _norm_path(p) -> str:
+    """비교용 경로 정규화 — 대소문자·구분자·\\??\\ 접두를 무시한다."""
+    s = str(p or "").strip().strip('"').replace("/", "\\")
+    if s.startswith("\\??\\"):
+        s = s[4:]
+    return os.path.normcase(os.path.normpath(s)) if s else ""
 
 
 def _is_external(ip: str) -> bool:
@@ -298,15 +299,25 @@ def build_indicators(result) -> list:
     # ── 드롭 파일 ──
     ioc = getattr(result, "ioc_report", None)
     tiers = getattr(ioc, "dropped_file_tiers", {}) or {}
+    sample = _norm_path(getattr(getattr(result, "config", None), "sample_path", None) or "")
+
+    def _is_drop(f: str) -> bool:
+        # 샘플 자신(분석기가 실행한 원본)과 ADS(파일명:스트림)는 "드롭"이 아니다
+        tail = f.replace("/", "\\").rsplit("\\", 1)[-1]
+        return (f.lower().endswith(_EXE_EXT) and ":" not in tail
+                and (not sample or _norm_path(f) != sample))
+
     drops = [str(f) for f in (getattr(ioc, "dropped_files", None) or [])]
-    d1 = [f for f in drops if tiers.get(f, 2) == 1 and f.lower().endswith(_EXE_EXT)]
-    d2 = [f for f in drops if tiers.get(f, 2) == 2 and f.lower().endswith(_EXE_EXT)]
+    d1 = [f for f in drops if tiers.get(f, 2) == 1 and _is_drop(f)]
+    d2 = [f for f in drops if tiers.get(f, 2) == 2 and _is_drop(f)]
     if d1:
         add("mal", "파일 드롭", f"샘플 계보가 실행 가능 파일 {len(d1)}건 드롭",
-            ", ".join(os.path.basename(f.replace("\\", "/")) for f in d1[:5]))
-    if d2 and not lineage:
-        add("sus", "파일 드롭", f"분석 중 실행 가능 파일 {len(d2)}건 생성 (프로세스 계보 미확정)",
-            ", ".join(os.path.basename(f.replace("\\", "/")) for f in d2[:5]))
+            ", ".join(_short(f, 70) for f in d1[:5]) + (" …" if len(d1) > 5 else ""))
+    if d2:
+        add("sus", "파일 드롭",
+            f"분석 중 실행 가능 파일 {len(d2)}건 생성 (샘플 계보와의 연결 미확정)" if lineage
+            else f"분석 중 실행 가능 파일 {len(d2)}건 생성 (프로세스 계보 미확정)",
+            ", ".join(_short(f, 70) for f in d2[:5]) + (" …" if len(d2) > 5 else ""))
 
     # ── 네트워크 ──
     pcap = getattr(result, "pcap_result", None)
@@ -349,10 +360,9 @@ def build_indicators(result) -> list:
         tier = getattr(t, "relevance_tier", 0) or 2
         if tier >= 3:
             continue
-        srcs = {str(s).lower() for s in (getattr(t, "sources", None) or [])}
         tactic = getattr(t, "tactic", "") or "기타"
         name = getattr(t, "technique_name", "") or tid
-        if srcs and srcs <= _EXTERNAL_SOURCES:
+        if is_external_only(t):
             ext_by_tactic.setdefault(tactic, []).append(f"{name} ({tid})")
             continue
         high = tid.startswith(_HIGH_SEV)
@@ -363,8 +373,8 @@ def build_indicators(result) -> list:
         ev = next((x for x in (getattr(t, "evidence", None) or []) if x), "")
         add(lvl, _TACTIC_KO.get(tactic, tactic), name, str(ev)[:200], tid)
     for tactic, names in ext_by_tactic.items():
-        add("info", "외부 출처 (이번 실행에서 미관측)",
-            f"{_TACTIC_KO.get(tactic, tactic)} — 타 샌드박스·정적 분석이 보고한 기법 {len(names)}건",
+        add("info", "AI·정적·타 샌드박스 (미관측)",
+            f"{_TACTIC_KO.get(tactic, tactic)} — AI 추론·정적 분석·타 샌드박스가 보고한 기법 {len(names)}건",
             ", ".join(names[:6]) + (" …" if len(names) > 6 else ""))
 
     # ── 실행 진단 ──
@@ -401,14 +411,28 @@ def _stat(label: str, big: str, unit: str, segments: list) -> str:
 
 
 def _attack_url(tid: str) -> str:
+    """ATT&CK 기법 페이지 URL. 형식(T1234 / T1234.001)이 아니면 빈 문자열 — 링크를 만들지 않는다.
+
+    AI·외부 소스가 준 ID 가 href 속성을 깨고 나가지 못하게 하는 관문이다.
+    """
+    tid = str(tid or "").strip()
+    if not _TID_RE.fullmatch(tid):
+        return ""
     return "https://attack.mitre.org/techniques/" + tid.replace(".", "/") + "/"
+
+
+def _attack_link(tid: str) -> str:
+    """ID 를 ATT&CK 링크로. 형식이 맞지 않으면 이스케이프된 텍스트만."""
+    url = _attack_url(tid)
+    if not url:
+        return _e(str(tid or ""))
+    return f"<a href='{_e(url, quote=True)}' target='_blank' rel='noopener'>{_e(str(tid).strip())}</a>"
 
 
 def _indicator_block(title: str, color: str, items: list, opened: bool) -> str:
     rows = []
     for i in sorted(items, key=lambda x: x["cat"]):
-        tid = (f"<a href='{_attack_url(i['tid'])}' target='_blank' rel='noopener'>{_e(i['tid'])}</a>"
-               if i["tid"] else "")
+        tid = _attack_link(i["tid"]) if i["tid"] else ""
         ev = f"<span class='va-ev'>{_e(i['ev'])}</span>" if i["ev"] else ""
         rows.append(f"<div class='va-row'><div class='va-cat'>{_e(i['cat'])}</div>"
                     f"<div>{_e(i['title'])}{ev}</div><div class='va-tid'>{tid}</div></div>")
@@ -419,10 +443,44 @@ def _indicator_block(title: str, color: str, items: list, opened: bool) -> str:
             f"{''.join(rows)}</details>")
 
 
-def verdict_overview_html(result, sample_name: str, sample_sha256: str = "") -> str:
-    """개요 탭 최상단 — 판정, 점수 링, 지표 목록."""
-    inds = build_indicators(result)
-    score, _key, verdict, vcolor = score_indicators(inds)
+def report_verdict(result) -> dict:
+    """판정 요약·헤더·JSON 이 같은 값을 쓰도록 한 번만 계산한다.
+
+    {level: mal|sus|ok, label, score, color, indicators}
+    """
+    try:
+        inds = build_indicators(result)
+    except Exception:
+        inds = []
+    score, key, label, color = score_indicators(inds)
+    return {"level": key, "label": label, "score": score, "color": color, "indicators": inds}
+
+
+def _technique_split(result) -> tuple:
+    """(계보, 의심, 배경, 외부) — 외부 출처만 있는 기법은 등급과 무관하게 '외부'로 센다."""
+    br = getattr(result, "behavior_report", None)
+    techs = getattr(br, "techniques", None) or []
+    if not techs:
+        counts = (getattr(result, "relevance_counts", {}) or {}).get("techniques") or {}
+        return tuple(int(counts.get(k, counts.get(str(k), 0)) or 0) for k in (1, 2, 3)) + (0,)
+    c = {1: 0, 2: 0, 3: 0, "ext": 0}
+    for t in techs:
+        if is_external_only(t):
+            c["ext"] += 1
+            continue
+        tier = getattr(t, "relevance_tier", 0) or 2
+        c[tier if tier in (1, 2, 3) else 2] += 1
+    return c[1], c[2], c[3], c["ext"]
+
+
+def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", verdict: dict = None) -> str:
+    """개요 탭 최상단 — 판정, 점수 링, 지표 목록.
+
+    verdict: report_verdict(result) 결과를 넘기면 다시 계산하지 않는다 (헤더와 같은 값 보장).
+    """
+    v = verdict or report_verdict(result)
+    inds = v["indicators"]
+    score, verdict, vcolor = v["score"], v["label"], v["color"]
     mal = [i for i in inds if i["level"] == "mal"]
     sus = [i for i in inds if i["level"] == "sus"]
     info = [i for i in inds if i["level"] == "info"]
@@ -434,14 +492,15 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "") -> 
         return tuple(int(d.get(k, d.get(str(k), 0)) or 0) for k in (1, 2, 3))
 
     p1, p2, p3 = _tc("processes")
-    t1, t2, t3 = _tc("techniques")
+    t1, t2, t3, tx = _technique_split(result)
     _BG = "#5b6f8c"
     rings = [
         _stat("위협 점수", str(score), "/ 100", [(score, "", vcolor), (100 - score, "", C_MUTE)]),
         _stat("위험 지표", str(len(inds)), "건",
               [(len(mal), "악성", C_MAL), (len(sus), "의심", C_SUS), (len(info), "정보", C_INFO)]),
         _stat("신규 프로세스", str(p1 + p2 + p3), "개", [(p1, "계보", C_MAL), (p2, "의심", C_SUS), (p3, "배경", _BG)]),
-        _stat("ATT&CK 기법", str(t1 + t2 + t3), "건", [(t1, "계보", C_MAL), (t2, "의심", C_SUS), (t3, "배경", _BG)]),
+        _stat("ATT&CK 기법", str(t1 + t2 + t3 + tx), "건",
+              [(t1, "계보", C_MAL), (t2, "의심", C_SUS), (t3, "배경", _BG), (tx, "외부", C_INFO)]),
     ]
 
     ext = os.path.splitext(sample_name)[1].lower().lstrip(".")
@@ -467,255 +526,6 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "") -> 
         + _indicator_block("의심 지표", C_SUS, sus, len(sus) <= 3)
         + _indicator_block("정보성 지표", C_INFO, info, False)
         + "</div></section>"
-    )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# 행위 그래프
-# ═════════════════════════════════════════════════════════════════════════════
-
-_COL_W, _PW, _PH, _AW, _AH, _GAP, _PAD = 300, 196, 44, 232, 28, 14, 18
-_MAX_NODES = 90
-_LEVEL_COLOR = {"mal": C_MAL, "sus": C_SUS, "info": C_INFO, "root": "#58a6ff", "plain": "#5b7397", "ghost": "#5b7397"}
-
-
-class _N:
-    __slots__ = ("kind", "label", "sub", "level", "title", "edge", "pid", "children", "x", "y")
-
-    def __init__(self, kind, label, sub="", level="plain", title="", edge="", pid=None):
-        self.kind, self.label, self.sub, self.level = kind, label, sub, level
-        self.title, self.edge, self.pid = title or label, edge, pid
-        self.children, self.x, self.y = [], 0, 0.0
-
-    @property
-    def h(self):
-        return _PH if self.kind in ("proc", "ghost") else _AH
-
-    @property
-    def w(self):
-        return _PW if self.kind in ("proc", "ghost") else _AW
-
-
-def _build_graph(result, fallback_procs: list) -> list:
-    procs_all = (getattr(result, "process_diff", None) or {}).get("new_processes", []) or []
-    lineage = set(getattr(result, "lineage_pids", None) or ())
-    procs = [p for p in procs_all if getattr(p, "pid", None) in lineage] or list(fallback_procs or [])
-    if not procs:
-        return []
-    behaviors = getattr(result, "process_behaviors", {}) or {}
-    sample_pid = getattr(result, "sample_pid", None)
-    ioc = getattr(result, "ioc_report", None)
-    tiers = {str(k).lower(): v for k, v in (getattr(ioc, "dropped_file_tiers", {}) or {}).items()}
-    dropped = {str(f).lower() for f in (getattr(ioc, "dropped_files", None) or [])
-               if tiers.get(str(f).lower(), 2) <= 2}
-    pcap = getattr(result, "pcap_result", None)
-    ip2dom = getattr(pcap, "ip_to_domain", {}) or {}
-    inj = {f.get("pid"): f.get("confidence") for f in (getattr(result, "injection_findings", None) or [])}
-    try:
-        from analysis.registry_relevance import registry_key_interest
-    except Exception:
-        registry_key_interest = lambda _p: ""          # noqa: E731
-
-    by_pid = {p.pid: p for p in procs}
-    nodes: dict = {}
-    budget = [_MAX_NODES]
-
-    def _arts(node: _N, b) -> None:
-        def _group(items, mk, edge, more_kind, cap):
-            for it in items[:cap]:
-                if budget[0] <= 0:
-                    return
-                n = mk(it)
-                n.edge = edge
-                node.children.append(n)
-                budget[0] -= 1
-            if len(items) > cap:
-                node.children.append(_N(more_kind, f"… 외 {len(items) - cap}건", level="plain", edge=edge,
-                                        title="\n".join(str(i) for i in items[cap:cap + 30])))
-
-        files = [f for f in (getattr(b, "files_written", None) or []) if str(f).lower() in dropped]
-        files.sort(key=lambda f: (not str(f).lower().endswith(_EXE_EXT), str(f).lower()))
-        _group(files, lambda f: _N("file", _short(os.path.basename(str(f).replace("\\", "/")), 30),
-                                   level="mal" if str(f).lower().endswith(_EXE_EXT) else "sus", title=str(f)),
-               "드롭", "file", 4)
-
-        regs = [(r, registry_key_interest(r)) for r in (getattr(b, "reg_written", None) or [])]
-        regs = [(r, w) for r, w in regs if w]
-        _group(regs, lambda rw: _N("reg", _short(rw[0].split("\\", 1)[-1], 30),
-                                   level="mal" if ("Run" in rw[1] or "자동실행" in rw[1]) else "sus",
-                                   title=f"{rw[0]}\n({rw[1]})"),
-               "등록", "reg", 3)
-
-        conns = [(ip, port) for ip, port in (getattr(b, "tcp_conns", None) or []) if _is_external(str(ip))]
-
-        def _mk_net(c):
-            d = ip2dom.get(c[0]) or []
-            dom = d[0] if isinstance(d, list) and d else ""
-            return _N("net", _short(f"{dom or c[0]}:{c[1]}", 30), level="sus", title=f"{c[0]}:{c[1]} {dom}")
-        _group(conns, _mk_net, "연결", "net", 4)
-        _group(list(getattr(b, "dns_queries", None) or []),
-               lambda q: _N("dns", _short(str(q), 30), level="sus", title=str(q)), "DNS", "dns", 3)
-
-    for p in procs:
-        b = behaviors.get(p.pid)
-        nm = getattr(p, "name", "") or f"PID {p.pid}"
-        # 흔적 없는 콘솔 호스트는 그림에서 뺀다 (트리에는 그대로 남는다)
-        if nm.lower() == "conhost.exe" and not any(q.ppid == p.pid for q in procs):
-            continue
-        n = _N("proc", _short(nm, 22), sub=f"PID {p.pid}", pid=p.pid,
-               title=" ".join(getattr(p, "cmdline", None) or []) or (getattr(p, "exe", "") or nm))
-        if b is not None:
-            _arts(n, b)
-        if inj.get(p.pid) == "HIGH":
-            n.level, n.sub = "mal", n.sub + " · 코드 주입 탐지"
-        elif any(c.level == "mal" for c in n.children):
-            n.level = "mal"
-        elif n.children:
-            n.level = "sus"
-        if p.pid == sample_pid:
-            n.sub += " · 샘플"
-            if n.level == "plain":
-                n.level = "root"
-        nodes[p.pid] = n
-
-    roots = []
-    for p in procs:
-        n = nodes.get(p.pid)
-        if n is None:
-            continue
-        parent = nodes.get(getattr(p, "ppid", None))
-        if parent is not None and parent is not n:
-            n.edge = "생성"
-            parent.children.insert(sum(1 for c in parent.children if c.kind == "proc"), n)
-        else:
-            roots.append(n)
-    roots.sort(key=lambda n: (n.pid != sample_pid, n.pid or 0))
-
-    # 프로세스에 귀속하지 못한 C2 후보 — 숨기지 않고 "귀속 미확인"으로 따로 세운다
-    attributed = {getattr(q, "name", "") for q in (getattr(result, "dns_attributed", None) or [])
-                  if getattr(q, "attributed", False)}
-    loose = [d for d in _unanswered_dns(result) if d not in attributed]
-    if loose:
-        g = _N("ghost", "프로세스 귀속 미확인", sub="응답 없는 DNS 질의", level="ghost",
-               title="DNS 질의는 Dnscache 서비스가 대신 보내므로 어느 프로세스의 요청인지 확정하지 못했습니다")
-        for d in loose[:5]:
-            c = _N("dns", _short(d, 30), level="sus", title=d)
-            c.edge = "DNS"
-            g.children.append(c)
-        roots.append(g)
-    return roots
-
-
-def _layout(roots: list) -> tuple:
-    cur = [float(_PAD)]
-    maxd = [0]
-
-    def place(n: _N, depth: int) -> None:
-        n.x = depth
-        maxd[0] = max(maxd[0], depth)
-        if not n.children:
-            n.y = cur[0] + n.h / 2
-            cur[0] += n.h + _GAP
-            return
-        top = cur[0]
-        for c in n.children:
-            place(c, depth + 1)
-        n.y = max((n.children[0].y + n.children[-1].y) / 2, top + n.h / 2)
-        cur[0] = max(cur[0], n.y + n.h / 2 + _GAP)
-
-    for r in roots:
-        place(r, 0)
-        cur[0] += 10
-    width = _PAD * 2 + maxd[0] * _COL_W + max(_PW, _AW if maxd[0] else _PW)
-    return int(width), int(cur[0] + _PAD)
-
-
-def _node_svg(n: _N) -> str:
-    x = _PAD + n.x * _COL_W
-    y = n.y - n.h / 2
-    color = _LEVEL_COLOR.get(n.level, "#5b7397")
-    title = f"<title>{_e(n.title)}</title>"
-    if n.kind in ("proc", "ghost"):
-        dash = " stroke-dasharray='5 4'" if n.kind == "ghost" else ""
-        fill = "#1a2a43" if n.level in ("plain", "ghost") else "#1d2536"
-        body = (f"<rect x='{x}' y='{y:.1f}' width='{n.w}' height='{n.h}' rx='0' fill='{fill}' "
-                f"stroke='{color}' stroke-width='1.8'{dash}/>"
-                f"<rect x='{x}' y='{y:.1f}' width='4' height='{n.h}' fill='{color}'/>"
-                f"<text x='{x + 14}' y='{n.y - 3:.1f}' font-size='12.5' font-weight='700'>{_e(n.label)}</text>"
-                f"<text x='{x + 14}' y='{n.y + 12:.1f}' class='bg-sub'>{_e(n.sub)}</text>")
-        if n.kind == "proc" and n.pid is not None:
-            return (f"<g class='bg-proc' onclick='rvGoProc({int(n.pid)})' role='link' "
-                    f"aria-label='{_e(n.label)} {_e(n.sub)} 프로세스 트리로 이동'>{title}{body}</g>")
-        return f"<g>{title}{body}</g>"
-    # 흔적 노드 — 종류를 모양으로 구분: 파일=접힌 모서리, 레지스트리=각진 상자, 네트워크/DNS=알약
-    tx = x + 30
-    icon = {"file": "F", "reg": "R", "net": "N", "dns": "D"}.get(n.kind, "")
-    if n.kind == "file":
-        shape = (f"<path d='M{x} {y:.1f} h{n.w - 10} l10 10 v{n.h - 10} h-{n.w} z' fill='#142136' "
-                 f"stroke='{color}' stroke-width='1.4'/>")
-    elif n.kind == "reg":
-        shape = (f"<rect x='{x}' y='{y:.1f}' width='{n.w}' height='{n.h}' fill='#142136' "
-                 f"stroke='{color}' stroke-width='1.4'/>")
-    else:
-        dash = " stroke-dasharray='4 3'" if n.kind == "dns" else ""
-        shape = (f"<rect x='{x}' y='{y:.1f}' width='{n.w}' height='{n.h}' rx='0' fill='#142136' "
-                 f"stroke='{color}' stroke-width='1.4'{dash}/>")
-    return (f"<g>{title}{shape}"
-            f"<text x='{x + 13}' y='{n.y + 4:.1f}' font-size='10.5' font-weight='700' fill='{color}' "
-            f"text-anchor='middle' style='fill:{color}'>{icon}</text>"
-            f"<text x='{tx - 6}' y='{n.y + 4:.1f}' font-size='11'>{_e(n.label)}</text></g>")
-
-
-def behavior_graph_html(result, fallback_procs: list = None) -> str:
-    """프로세스 체인과 흔적을 한 장으로 — 없으면 빈 문자열."""
-    try:
-        roots = _build_graph(result, fallback_procs or [])
-    except Exception:
-        return ""
-    if not roots:
-        return ""
-    W, H = _layout(roots)
-    edges, shapes = [], []
-    n_proc = n_art = 0
-
-    def walk(n: _N) -> None:
-        nonlocal n_proc, n_art
-        if n.kind == "proc":
-            n_proc += 1
-        elif n.kind != "ghost":
-            n_art += 1
-        shapes.append(_node_svg(n))
-        x1 = _PAD + n.x * _COL_W + n.w
-        for c in n.children:
-            x2 = _PAD + c.x * _COL_W
-            mx = (x1 + x2) / 2
-            cls = "bg-edge" + ("" if c.kind == "proc" else " bg-edge-art")
-            edges.append(f"<path class='{cls}' d='M{x1} {n.y:.1f} C{mx:.0f} {n.y:.1f} {mx:.0f} {c.y:.1f} "
-                         f"{x2 - 5} {c.y:.1f}' marker-end='url(#bg-arrow)'/>")
-            if c.edge:
-                edges.append(f"<text class='bg-el' x='{x2 - 9}' y='{c.y - 8:.1f}' text-anchor='end'>{_e(c.edge)}</text>")
-            walk(c)
-
-    for r in roots:
-        walk(r)
-
-    legend = "".join(
-        f"<span><i style='--c:{c}'></i>{_e(t)}</span>" for t, c, _r in (
-            ("샘플·호스트 프로세스", _LEVEL_COLOR["root"], "4px"), ("악성 근거가 있는 프로세스·흔적", C_MAL, "4px"),
-            ("의심 흔적", C_SUS, "4px"), ("흔적 없는 프로세스", _LEVEL_COLOR["plain"], "4px"),
-            ("F 드롭 파일", "#8ea2bf", "1px"), ("R 레지스트리", "#8ea2bf", "0"),
-            ("N 네트워크 · D DNS", "#8ea2bf", "8px")))
-    caption = (f"샘플 계보 프로세스 {n_proc}개와 각 프로세스가 남긴 흔적 {n_art}건. 실선은 프로세스 생성, "
-               "점선은 파일 드롭·레지스트리 등록·통신입니다. 프로세스 상자를 누르면 프로세스 탭의 해당 행으로 이동하고, "
-               "노드에 마우스를 올리면 전체 경로·명령줄이 보입니다. 배경(Tier 3) 활동은 그리지 않습니다.")
-    return (
-        "<figure class='bg-fig'>"
-        f"<div class='bg-scroll'><svg class='bg-svg' viewBox='0 0 {W} {H}' width='{W}' height='{H}' "
-        f"role='img' aria-label='행위 그래프: 샘플 계보 프로세스 {n_proc}개와 흔적 {n_art}건'>"
-        "<defs><marker id='bg-arrow' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' "
-        "orient='auto-start-reverse'><path d='M0 1 L10 5 L0 9 z' fill='#6b83a6'/></marker></defs>"
-        + "".join(edges) + "".join(shapes) +
-        f"</svg></div><div class='bg-legend'>{legend}</div><figcaption>{_e(caption)}</figcaption></figure>"
     )
 
 
@@ -782,6 +592,10 @@ def _evidence_section(ev: str) -> str:
         return "file"
     if _IP_RE.search(low) or _re.match(r"^[a-z0-9.-]+\.[a-z]{2,}(:\d+)?(\s|$)", low):
         return "network"
+    # "DNS: x", "SNI=…", "비콘 …", "고엔트로피 도메인: …" 형식 근거도 네트워크 텔레메트리다
+    if low.startswith(("dns:", "dns ", "sni=", "sni:", "tls sni", "비콘", "beacon", "고엔트로피 도메인",
+                       "http ", "http:", "smtp", "ftp")):
+        return "network"
     return ""
 
 
@@ -802,7 +616,7 @@ def attack_inline_html(result, section: str, limit: int = 3) -> str:
         tactic = getattr(t, "tactic", "") or ""
         rows.append((tier, tid,
             f"<div class='atk-row' data-tier='{tier}' style='--c:{color}'>"
-            f"<div class='atk-id'><a href='{_attack_url(tid)}' target='_blank' rel='noopener'>{_e(tid)}</a></div>"
+            f"<div class='atk-id'>{_attack_link(tid)}</div>"
             f"<div>{_e(getattr(t, 'technique_name', '') or tid)}</div>"
             f"<div class='atk-tac'>{_e(_TACTIC_KO.get(tactic, tactic))}</div>"
             f"<div class='atk-ev'>{ev_html}</div></div>"))

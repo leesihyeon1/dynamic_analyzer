@@ -27,7 +27,6 @@ def restyle_report(source: Path, output: Path) -> None:
         timeout=data.get("timeout", 0), duration=data.get("duration", 0),
         techniques=len(data.get("mitre_techniques", [])), events=data.get("events_summary", {}).get("total", 0),
         connections=len(data.get("network", {}).get("connections", [])), ips=len(data.get("iocs", {}).get("ip_addresses", [])),
-        tools_html=tools[1], needs_review=bool(data.get("errors")) or bool(data.get("tools_used", {}).get("procmon") and not data.get("events_summary", {}).get("total")),
         indicator="기존 상세 결과 참고",
     )
     html, replaced = re.subn(r'<h1>.*?</h1>.*?<p style="margin-bottom:1.5rem">.*?</p>', lambda _: header, html, count=1, flags=re.S)

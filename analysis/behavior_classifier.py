@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
-from parsers.procmon_csv import ProcMonEvent, EventCategory
+from parsers.procmon_csv import (
+    ProcMonEvent, EventCategory,
+    is_delete_event, is_file_create_event, is_rename_event, rename_target,
+    is_reg_key_created,
+)
 from parsers.pcap_parser import PcapResult
 # 자격증명/anti-VM 경로는 analysis/sensitive_paths.py 단일 소스 사용
 # (노이즈 필터의 ReadFile carve-out 과 동일 기준 공유)
@@ -94,6 +99,35 @@ _RANSOMWARE_EXTENSIONS: frozenset[str] = frozenset(
 
 _WRITE_CREATE_OPS: frozenset[str] = frozenset({"WriteFile", "CreateFile"})
 
+
+def _placed_file_path(ev) -> str:
+    """파일을 실제로 "놓은" 이벤트면 그 대상 경로, 아니면 빈 문자열.
+
+    ProcMon 의 CreateFile 에는 단순 열기(Disposition: Open / OpenResult: Opened)가
+    섞여 있다. 셸이 Startup 폴더를 열거하거나 desktop.ini 를 읽는 것만으로
+    "지속성 등록"이 되면 안 되므로 다음만 인정한다 (ioc_extractor 와 같은 기준).
+      * WriteFile                                  → 경로
+      * CreateFile + OpenResult Created/Overwritten/Superseded → 경로
+      * 이름 변경(RenameFile/SetRenameInformation*) → Detail 의 목적지 경로
+    """
+    op = getattr(ev, "operation", "") or ""
+    if op == "WriteFile":
+        return ev.path or ""
+    if op == "CreateFile":
+        return (ev.path or "") if is_file_create_event(ev) else ""
+    if is_rename_event(ev):
+        return rename_target(ev)
+    return ""
+
+
+def _is_startup_folder_item(lower: str) -> bool:
+    """Startup 폴더 "안의" 항목인지 — 폴더 자체와 desktop.ini 는 제외."""
+    lower = lower.rstrip("\\/")
+    if "\\startup\\" not in lower:
+        return False
+    fname = lower.rsplit("\\", 1)[-1]
+    return fname not in ("desktop.ini", "startup")
+
 # Anti-VM/Sandbox 탐지 패턴 — T1497.001
 _ANTI_VM_REG_FRAGMENTS: tuple[str, ...] = (
     "vmware, inc", "vmware tools", "vmware virtual",
@@ -147,48 +181,52 @@ def _classify_file_events(
         sep_idx = max(lower.rfind("\\"), lower.rfind("/"))
         fname   = lower[sep_idx + 1:] if sep_idx >= 0 else lower
 
-        # T1547.001 – startup/run-key file placement
-        if op in _WRITE_CREATE_OPS:
-            if any(frag in lower for frag in _STARTUP_PATH_FRAGMENTS):
-                _add_evidence(
-                    technique_map, "T1547.001",
-                    "Registry Run Keys / Startup Folder", "Persistence",
-                    evidence=path,
-                    reference="https://attack.mitre.org/techniques/T1547/001/",
-                    process=ev.process,
-                )
-                report.suspicious_files.append(path)
-                _tag_entity(report.tag_map, lower, "T1547.001")
+        # 실제로 파일을 놓은 경우의 대상 경로 (단순 열기는 빈 문자열)
+        placed   = _placed_file_path(ev)
+        placed_l = placed.lower()
+        placed_x = _file_extension(placed) if placed else ""
 
-        # T1027 – executable/script dropped in AppData or Temp
-        if op in _WRITE_CREATE_OPS:
-            if ext in _TEMP_EXEC_EXTENSIONS and any(
-                frag in lower for frag in _APPDATA_TEMP_FRAGMENTS
-            ):
-                _add_evidence(
-                    technique_map, "T1027",
-                    "Obfuscated Files or Information", "Defense Evasion",
-                    evidence=path,
-                    reference="https://attack.mitre.org/techniques/T1027/",
-                    process=ev.process,
-                )
-                report.suspicious_files.append(path)
-                _tag_entity(report.tag_map, lower, "T1027")
+        # T1547.001 – startup folder file placement (생성·쓰기·이름변경만)
+        if placed and _is_startup_folder_item(placed_l):
+            _add_evidence(
+                technique_map, "T1547.001",
+                "Registry Run Keys / Startup Folder", "Persistence",
+                evidence=placed,
+                reference="https://attack.mitre.org/techniques/T1547/001/",
+                process=ev.process,
+            )
+            report.suspicious_files.append(placed)
+            _tag_entity(report.tag_map, placed_l, "T1547.001")
 
-        # T1486 – ransomware-style extension
-        if op == "WriteFile" and ext in _RANSOMWARE_EXTENSIONS:
+        # T1027 – executable/script dropped in AppData or Temp (같은 생성 기준)
+        if placed and placed_x in _TEMP_EXEC_EXTENSIONS and any(
+            frag in placed_l for frag in _APPDATA_TEMP_FRAGMENTS
+        ):
+            _add_evidence(
+                technique_map, "T1027",
+                "Obfuscated Files or Information", "Defense Evasion",
+                evidence=placed,
+                reference="https://attack.mitre.org/techniques/T1027/",
+                process=ev.process,
+            )
+            report.suspicious_files.append(placed)
+            _tag_entity(report.tag_map, placed_l, "T1027")
+
+        # T1486 – ransomware-style extension (쓰기 또는 그 확장자로 이름 변경)
+        if placed and (op == "WriteFile" or is_rename_event(ev)) \
+                and placed_x in _RANSOMWARE_EXTENSIONS:
             _add_evidence(
                 technique_map, "T1486",
                 "Data Encrypted for Impact", "Impact",
-                evidence=path,
+                evidence=placed,
                 reference="https://attack.mitre.org/techniques/T1486/",
                 process=ev.process,
             )
-            report.suspicious_files.append(path)
-            _tag_entity(report.tag_map, lower, "T1486")
+            report.suspicious_files.append(placed)
+            _tag_entity(report.tag_map, placed_l, "T1486")
 
-        # T1070.004 – self-deletion
-        if op == "DeleteFile":
+        # T1070.004 – self-deletion (ProcMon 실제 연산명 SetDisposition* 포함)
+        if is_delete_event(ev):
             proc_stem = ev.process.lower().replace(".exe", "")
             if proc_stem and proc_stem in lower:
                 _add_evidence(
@@ -286,6 +324,59 @@ def _is_service_persistence_key(path_lower: str) -> bool:
     return "\\" not in tail
 
 
+def _service_name(path_lower: str) -> str:
+    """``...\\services\\<이름>\\...`` 에서 서비스 이름(소문자). 없으면 빈 문자열."""
+    if "\\services\\" not in path_lower:
+        return ""
+    return path_lower.split("\\services\\", 1)[1].strip("\\").split("\\", 1)[0]
+
+
+# 기존 서비스의 시작 유형 값 — SCM(services.exe)이 BITS·업데이트 서비스 등에서
+# 상시 갱신한다. 이번 실행에서 새로 만든 서비스가 아니면 등록 근거가 아니다.
+# (sc.exe config 경유 변경은 sc.exe 프로세스 생성 패턴으로 따로 잡힌다.)
+_SERVICE_START_VALUES: frozenset[str] = frozenset({"start", "delayedautostart"})
+
+# SCM 이 대신 쓰는 프로세스 — 근거 귀속을 "[services.exe]" 로 두면 OS 배경으로
+# 강등되므로, 신규 서비스 생성은 프로세스 접두 없이 남긴다.
+_SCM_PROCS: frozenset[str] = frozenset({"services.exe"})
+
+
+def _created_service_names(events) -> set:
+    """이번 실행 중 새로 만들어진 서비스 키 이름 집합 (RegCreateKey REG_CREATED_NEW_KEY)."""
+    out: set = set()
+    for ev in events or []:
+        try:
+            if is_reg_key_created(ev):
+                lower = (ev.path or "").lower()
+                tail = lower.split("\\services\\", 1)[1].strip("\\") if "\\services\\" in lower else ""
+                if tail and "\\" not in tail:
+                    out.add(tail)
+        except Exception:
+            continue
+    return out
+
+
+# ── T1053.005 (Scheduled Task) — 작업 스케줄러 서비스 경유 등록 ────────────────
+# schtasks.exe 없이 COM(Schedule.Service/ITaskService)으로 등록하면 작업
+# 스케줄러 서비스(svchost)가 TaskCache 키와 System32\Tasks 파일을 쓴다.
+# Microsoft 기본 작업 폴더의 갱신은 OS 배경이므로 제외한다.
+_TASKCACHE_TREE = "\\schedule\\taskcache\\tree\\"
+_TASKS_DIR      = "\\windows\\system32\\tasks\\"
+
+
+def _task_name_from_path(lower: str) -> str:
+    """TaskCache\\Tree\\<이름> 또는 System32\\Tasks\\<이름> 의 작업 경로 (소문자)."""
+    for anchor in (_TASKCACHE_TREE, _TASKS_DIR):
+        if anchor in lower:
+            return lower.split(anchor, 1)[1].strip("\\")
+    return ""
+
+
+def _is_user_task(lower: str) -> bool:
+    name = _task_name_from_path(lower)
+    return bool(name) and not name.startswith("microsoft\\") and name != "microsoft"
+
+
 def _classify_registry_events(
     events: list[ProcMonEvent],
     reg_diff: dict,
@@ -293,9 +384,12 @@ def _classify_registry_events(
     report: BehaviorReport,
 ) -> None:
 
+    created_services = _created_service_names(events)
+
     def _check_reg_path(path: str, detail: str = "", process: str = "") -> None:
         lower = path.lower()
         det   = detail.lower()
+        proc_l = (process or "").lower()
 
         if any(frag in lower for frag in _REG_RUN_KEYS):
             _add_evidence(
@@ -309,15 +403,41 @@ def _classify_registry_events(
             _tag_entity(report.tag_map, lower, "T1547.001")
 
         if _is_service_persistence_key(lower):
+            svc  = _service_name(lower)
+            leaf = lower.rstrip("\\").rsplit("\\", 1)[-1]
+            is_new_svc = svc in created_services
+            # SCM 이 기존(내장) 서비스의 시작 유형을 갱신한 것은 등록이 아니다
+            if (proc_l in _SCM_PROCS and leaf in _SERVICE_START_VALUES
+                    and not is_new_svc):
+                pass
+            else:
+                if proc_l in _SCM_PROCS and is_new_svc:
+                    # CreateService → SCM 이 대신 쓴 신규 서비스 — 프로세스 접두 없이
+                    # 남겨 services.exe(OS 배경) 귀속으로 강등되지 않게 한다.
+                    _ev_text, _ev_proc = f"신규 서비스 등록(SCM 경유): {path}", ""
+                else:
+                    _ev_text, _ev_proc = path, process
+                _add_evidence(
+                    technique_map, "T1543.003",
+                    "Windows Service", "Persistence",
+                    evidence=_ev_text,
+                    reference="https://attack.mitre.org/techniques/T1543/003/",
+                    process=_ev_proc,
+                )
+                report.suspicious_registry.append(path)
+                _tag_entity(report.tag_map, lower, "T1543.003")
+
+        # T1053.005 – 작업 스케줄러 서비스 경유 예약 작업 등록 (TaskCache\Tree)
+        if _TASKCACHE_TREE in lower and _is_user_task(lower):
             _add_evidence(
-                technique_map, "T1543.003",
-                "Windows Service", "Persistence",
-                evidence=path,
-                reference="https://attack.mitre.org/techniques/T1543/003/",
+                technique_map, "T1053.005",
+                "Scheduled Task", "Persistence",
+                evidence=f"예약 작업 등록: {path}",
+                reference="https://attack.mitre.org/techniques/T1053/005/",
                 process=process,
             )
             report.suspicious_registry.append(path)
-            _tag_entity(report.tag_map, lower, "T1543.003")
+            _tag_entity(report.tag_map, lower, "T1053.005")
 
         if "winlogon" in lower and ("userinit" in det or "shell" in det):
             _add_evidence(
@@ -388,17 +508,70 @@ def _classify_registry_events(
                 report.suspicious_registry.append(ev.path)
                 _tag_entity(report.tag_map, _lower, "T1497.001")
 
-    for entry in reg_diff.get("added", []):
+    # T1053.005 – System32\Tasks 에 새 작업 XML 생성 (작업 스케줄러 서비스 경유 포함)
+    for ev in events:
         try:
-            if isinstance(entry, dict):
-                path   = entry.get("path", "")
-                detail = entry.get("detail", "") or entry.get("name", "")
-            else:
-                path   = str(entry)
-                detail = ""
-            _check_reg_path(path, detail)
+            if ev.category != EventCategory.FILE:
+                continue
+            # 새로 생긴 작업 파일만 (기존 작업 재등록·갱신 쓰기는 제외)
+            if ev.operation == "CreateFile":
+                if "openresult: created" not in (ev.detail or "").lower():
+                    continue
+            elif not is_rename_event(ev):
+                continue
+            placed = _placed_file_path(ev)
+            pl = placed.lower()
+            if placed and _TASKS_DIR in pl and _is_user_task(pl):
+                _add_evidence(
+                    technique_map, "T1053.005",
+                    "Scheduled Task", "Persistence",
+                    evidence=f"예약 작업 파일: {placed}",
+                    reference="https://attack.mitre.org/techniques/T1053/005/",
+                    process=ev.process,
+                )
+                report.suspicious_files.append(placed)
+                _tag_entity(report.tag_map, pl, "T1053.005")
         except Exception:
             continue
+
+    # winreg 스냅샷 diff — 항목은 (키, 값이름, 데이터) 튜플 (core/registry_snapshot).
+    # 예전에는 str(튜플) 로 판정해 repr 의 이중 백슬래시 때문에 아무것도 맞지 않았다.
+    for bucket in ("added", "modified"):
+        for entry in (reg_diff or {}).get(bucket, []) or []:
+            try:
+                path, detail = _reg_diff_entry_path(entry)
+                if not path:
+                    continue
+                pl = path.lower()
+                # 기존 서비스의 시작 유형 변경은 SCM 상시 갱신 — 등록 근거 아님
+                if (bucket == "modified" and _service_name(pl)
+                        and pl.rstrip("\\").rsplit("\\", 1)[-1] in _SERVICE_START_VALUES):
+                    continue
+                _check_reg_path(path, detail)
+            except Exception:
+                continue
+
+
+def _reg_diff_entry_path(entry) -> "tuple[str, str]":
+    """registry_diff 항목 → (판정용 경로 ``키\\값이름``, detail 문자열).
+
+    지원 형태: dict{path, detail|name} · (키, 값이름, 데이터[, 새데이터]) 튜플 · 문자열.
+    """
+    if isinstance(entry, dict):
+        return (str(entry.get("path", "") or ""),
+                str(entry.get("detail", "") or entry.get("name", "") or ""))
+    if isinstance(entry, (tuple, list)):
+        if not entry:
+            return "", ""
+        key  = str(entry[0] or "")
+        name = str(entry[1]) if len(entry) > 1 and entry[1] is not None else ""
+        data = entry[-1] if len(entry) > 2 else ""
+        data_s = str(data)[:300] if data is not None else ""
+        # 스냅샷의 키 생성 표식("(키 생성)")이나 기본값("")은 키 경로만 쓴다
+        if name and not name.startswith("("):
+            return f"{key}\\{name}", f"{name} {data_s}".strip()
+        return key, data_s
+    return str(entry or ""), ""
 
 
 # ---------------------------------------------------------------------------
@@ -481,15 +654,39 @@ _PROC_PATTERNS: list[tuple[str, str, str, str, str]] = [
 
 _APPDATA_TEMP_PROC_FRAGS: tuple[str, ...] = ("\\appdata\\", "\\temp\\")
 
+# .js/.jse 를 인자로 받은 wscript/cscript → T1059.007 (".json" 은 제외)
+_JS_SCRIPT_RE = re.compile(r"\.(?:js|jse)\b(?!\.)")
+
+# ShellExecute 로 샘플을 열면 Process Create 의 "부모"가 explorer.exe 나 분석기
+# 자신(python.exe)으로 기록된다. 그 근거를 부모에 귀속하면 샘플 실행이
+# explorer 의 행위처럼 보이므로, 이 부모들이 띄운 프로세스는 자식 이름에 귀속한다.
+_SHELL_LAUNCHER_PROCS: frozenset[str] = frozenset({
+    "explorer.exe", "python.exe", "pythonw.exe", "py.exe",
+})
+
+
+def _process_create_attribution(ev) -> str:
+    parent = getattr(ev, "process", "") or ""
+    if parent.lower() in _SHELL_LAUNCHER_PROCS:
+        child = (getattr(ev, "path", "") or "").replace("/", "\\").rsplit("\\", 1)[-1]
+        if child:
+            return child
+    return parent
+
 
 def _classify_powershell_cmdline(
     detail_lower: str,
     ev: ProcMonEvent,
     technique_map: dict[str, MitreTechnique],
     report: BehaviorReport,
+    process: "str | None" = None,
 ) -> None:
     """Deep-analyze PowerShell command-line flags for specific sub-techniques."""
     evidence = (ev.detail or "")[:300]
+    if process is not None:
+        # 귀속 프로세스 교체 (셸/분석기가 대신 띄운 경우 자식 이름)
+        from types import SimpleNamespace as _NS
+        ev = _NS(detail=ev.detail, process=process)
 
     # T1027.010 — Command Obfuscation (encoded command)
     if ("-encodedcommand" in detail_lower or " -enc " in detail_lower
@@ -573,6 +770,7 @@ def _classify_process_events(
 
         detail_lower = ev.detail.lower()
         path_lower   = ev.path.lower()
+        attrib       = _process_create_attribution(ev)
 
         # vssadmin delete shadows → T1490
         if "vssadmin" in detail_lower and "delete" in detail_lower:
@@ -580,18 +778,22 @@ def _classify_process_events(
                 technique_map, "T1490", "Inhibit System Recovery", "Impact",
                 evidence=ev.detail,
                 reference="https://attack.mitre.org/techniques/T1490/",
-                process=ev.process,
+                process=attrib,
             )
             report.suspicious_processes.append(ev.detail)
 
         # LOLBin / scripting interpreter patterns
         for frag, tid, tname, tactic, ref in _PROC_PATTERNS:
             if frag in detail_lower or frag in path_lower:
+                if frag in ("wscript.exe", "cscript.exe") and _JS_SCRIPT_RE.search(detail_lower):
+                    # Windows Script Host 가 JScript(.js/.jse)를 실행 — VBScript 가 아니다
+                    tid, tname = "T1059.007", "JavaScript"
+                    ref = "https://attack.mitre.org/techniques/T1059/007/"
                 _add_evidence(
                     technique_map, tid, tname, tactic,
                     evidence=ev.detail or ev.path,
                     reference=ref,
-                    process=ev.process,
+                    process=attrib,
                 )
                 report.suspicious_processes.append(ev.detail or ev.path)
                 _tag_entity(report.tag_map, frag, tid)
@@ -599,7 +801,7 @@ def _classify_process_events(
 
         # PowerShell deep analysis — runs regardless of LOLBin match above
         if "powershell" in detail_lower or "powershell" in path_lower:
-            _classify_powershell_cmdline(detail_lower, ev, technique_map, report)
+            _classify_powershell_cmdline(detail_lower, ev, technique_map, report, process=attrib)
 
         # net.exe sub-command intent
         if "net.exe" in detail_lower or "net1.exe" in detail_lower:
@@ -608,14 +810,14 @@ def _classify_process_events(
                     technique_map, "T1069", "Permission Groups Discovery", "Discovery",
                     evidence=ev.detail,
                     reference="https://attack.mitre.org/techniques/T1069/",
-                    process=ev.process,
+                    process=attrib,
                 )
             if " share" in detail_lower:
                 _add_evidence(
                     technique_map, "T1135", "Network Share Discovery", "Discovery",
                     evidence=ev.detail,
                     reference="https://attack.mitre.org/techniques/T1135/",
-                    process=ev.process,
+                    process=attrib,
                 )
 
         # Process launched from suspicious location
@@ -625,7 +827,7 @@ def _classify_process_events(
                 "Command and Scripting Interpreter", "Execution",
                 evidence=ev.detail,
                 reference="https://attack.mitre.org/techniques/T1059/",
-                process=ev.process,
+                process=attrib,
             )
             report.suspicious_processes.append(ev.detail)
 
@@ -696,22 +898,17 @@ def _classify_injection(
             report.suspicious_processes.append(f"Shellcode 주입: {pname}")
             _tag_entity(report.tag_map, pname_lower, "T1055")
 
-        # T1056.001 — Keylogging (API hooks detected in suspicious process)
-        # Only flag real hooks in non-FP processes (FP processes already filtered above)
-        if hooked > 0:
-            _add_evidence(
-                technique_map, "T1056.001", "Keylogging", "Collection",
-                evidence=f"{ev_base}, hooked={hooked}",
-                reference="https://attack.mitre.org/techniques/T1056/001/",
-                process=pname,
-            )
-            _tag_entity(report.tag_map, pname_lower, "T1056.001")
+        # 주의: pe-sieve 의 hooked>0 만으로 T1056.001(Keylogging)을 붙이지 않는다.
+        # inline hook 하나는 언후킹·AMSI/ETW 패치·CRT 패치에서도 생기며 키 입력
+        # 수집의 근거가 아니다. 키로깅은 CAPA(SetWindowsHookEx 등) 병합 경로로만 온다.
+        # hooked-only 결과는 아래 일반 T1055 근거에 hooked=N 으로 남긴다.
 
         # T1055 — generic (anything suspicious not covered above)
         if susp > 0 and replaced == 0 and implanted_pe == 0 and implanted_shc == 0:
             _add_evidence(
                 technique_map, "T1055", "Process Injection", "Defense Evasion",
-                evidence=ev_base,
+                evidence=(f"{ev_base}, hooked={hooked} (API 후킹 — 확인 필요)"
+                          if hooked > 0 else ev_base),
                 reference="https://attack.mitre.org/techniques/T1055/",
                 process=pname,
             )

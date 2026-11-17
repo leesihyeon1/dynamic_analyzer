@@ -73,6 +73,26 @@ OS_BACKGROUND_PROCS: frozenset[str] = frozenset({
     "vmtoolsd.exe", "vmwareresolutionset.exe", "vmwaretray.exe",
     "vmwareuser.exe", "vm3dservice.exe", "vgauthservice.exe",
     "vmacthlp.exe", "internet_detector.exe",
+    # 서비스 제어 관리자 — 기존 서비스 시작 유형 갱신 등 상시 활동.
+    # CreateService 로 만든 신규 서비스는 behavior_classifier 가 프로세스 접두 없이
+    # 근거를 남기고, 레지스트리 스냅샷 diff 로도 잡히므로 여기서 강등해도 놓치지 않는다.
+    "services.exe",
+})
+
+# 이름만으로 배경 강등하면 안 되는 LOLBin·스크립트 호스트.
+# WMI·예약 작업·COM 으로 띄우면 계보 밖에 놓이는데, 베이스라인 실행에서 같은
+# 이름이 한 번 떴다는 이유로 숨기면 정확히 그 우회 경로를 놓친다.
+LOLBIN_PROCS: frozenset[str] = frozenset({
+    "rundll32.exe", "regsvr32.exe", "mshta.exe", "powershell.exe", "pwsh.exe",
+    "cmd.exe", "wscript.exe", "cscript.exe", "msiexec.exe", "certutil.exe",
+    "bitsadmin.exe", "installutil.exe", "regasm.exe", "regsvcs.exe",
+    "msbuild.exe", "schtasks.exe", "wmic.exe", "forfiles.exe", "hh.exe",
+})
+
+# 이 부모가 띄운 프로세스는 부모 이름만으로 배경이라 할 수 없다 (WMI·작업·COM 실행 경로)
+_LAUNCH_BROKER_PROCS: frozenset[str] = frozenset({
+    "svchost.exe", "services.exe", "wmiprvse.exe", "taskhostw.exe", "taskeng.exe",
+    "dllhost.exe", "explorer.exe", "runtimebroker.exe",
 })
 # 주의: telemetrydispatcher.exe 는 여기 넣지 않는다.
 # 이번 샘플(purple.exe)이 정상 Windows 구성요소를 사칭해
@@ -153,6 +173,12 @@ class RelevanceContext:
     # 목적지 IP → 그 연결을 만든 프로세스 이름 집합 (process_network_map 기준).
     # 도메인이 없는 IP 직결은 소유 프로세스로만 배경 여부를 가릴 수 있다.
     ip_owners:        dict = field(default_factory=dict)
+    # 목적지 IP → 관찰된 도메인 목록 (pcap ip_to_domain). 네트워크 근거 등급 판정용.
+    ip_domains:       dict = field(default_factory=dict)
+    # PID → 프로세스 이름 (사후 스냅샷 + 신규 프로세스) — 부모 이름 조회용
+    pid_names:        dict = field(default_factory=dict)
+    # PID → 실행 파일 경로 — 주입 탐지 프로세스의 계보 여부 판정용
+    pid_exes:         dict = field(default_factory=dict)
     sample_name:      str = ""
     baseline: Optional[Baseline] = None
 
@@ -207,20 +233,73 @@ def build_context(result, baseline: Optional[Baseline] = None) -> RelevanceConte
             if port:
                 ctx.lineage_endpoints.add(f"{ip}:{port}")
 
-    # 계보 프로세스가 만든 파일 — filtered_events 의 쓰기/생성 이벤트
+    # 계보 프로세스가 만든 파일 — filtered_events 의 쓰기/생성/이름변경 이벤트.
+    # CreateFile 은 단순 열기(읽기)를 제외하고 실제 생성·덮어쓰기만 인정한다.
+    # (계보가 System32\cmd.exe 를 "열기만" 해도 그 경로가 계보 산출물이 되어
+    #  같은 경로로 실행된 무관한 cmd.exe 까지 Tier 1 이 되던 문제)
     for ev in (getattr(result, "filtered_events", None) or []):
         try:
             if getattr(ev, "pid", None) not in ctx.lineage_pids:
                 continue
-            if getattr(ev, "operation", "") not in ("WriteFile", "CreateFile", "SetRenameInformationFile"):
-                continue
-            path = getattr(ev, "path", "")
-            if path:
+            for path in _created_paths(ev):
                 ctx.lineage_paths.add(normalize_path(path))
         except Exception:
             continue
 
+    # PID → 이름·실행 경로. 사후 스냅샷이 가장 넓고, 신규 프로세스로 보완한다.
+    try:
+        for pid, snap in (getattr(result, "proc_after_snapshot", None) or {}).items():
+            nm = (getattr(snap, "name", "") or "").lower()
+            if nm:
+                ctx.pid_names[pid] = nm
+            exe = getattr(snap, "exe", "") or ""
+            if exe:
+                ctx.pid_exes[pid] = exe
+    except Exception:
+        pass
+    for p in (getattr(result, "process_diff", {}) or {}).get("new_processes", []):
+        try:
+            _pid = getattr(p, "pid", None)
+            nm = (getattr(p, "name", "") or "").lower()
+            if nm:
+                ctx.pid_names.setdefault(_pid, nm)
+            exe = getattr(p, "exe", "") or ""
+            if exe:
+                ctx.pid_exes[_pid] = exe
+        except Exception:
+            continue
+
+    # IP → 도메인 (네트워크 근거 등급용)
+    try:
+        pcap = getattr(result, "pcap_result", None)
+        ip_map = getattr(pcap, "ip_to_domain", None) or {}
+        if isinstance(ip_map, dict):
+            for ip, doms in ip_map.items():
+                if isinstance(doms, str):
+                    doms = [doms]
+                ctx.ip_domains[ip] = [d for d in (doms or []) if d]
+    except Exception:
+        pass
+
     return ctx
+
+
+def _created_paths(ev) -> list:
+    """이벤트가 실제로 만들거나 바꾼 파일 경로 (쓰기 · 생성/덮어쓰기 · 이름변경 목적지)."""
+    from parsers.procmon_csv import is_file_create_event, is_rename_event, rename_target
+    op = getattr(ev, "operation", "") or ""
+    path = getattr(ev, "path", "") or ""
+    if op == "WriteFile":
+        return [path] if path else []
+    if op == "CreateFile":
+        return [path] if (path and is_file_create_event(ev)) else []
+    if is_rename_event(ev):
+        out = [path] if path else []
+        dest = rename_target(ev)
+        if dest:
+            out.append(dest)
+        return out
+    return []
 
 
 # ── 항목별 등급 판정 ─────────────────────────────────────────────────────────
@@ -257,6 +336,24 @@ def tier_process(proc, ctx: RelevanceContext) -> int:
     # 분석 도구 자신은 배경
     if _is_analysis_artifact(name) or _is_analysis_artifact(exe):
         return TIER_BACKGROUND
+
+    # 주입 탐지 PID · 계보 프로세스의 자식은 이름이 무엇이든 배경으로 내리지 않는다.
+    # (오탐 비중이 높아 Tier 1 로 올리지는 않지만 숨기면 안 된다)
+    if pid is not None and pid in ctx.injected_pids:
+        return TIER_CORRELATED
+    ppid = getattr(proc, "ppid", None)
+    if ppid is not None and ppid in ctx.lineage_pids:
+        return TIER_CORRELATED
+
+    # LOLBin·스크립트 호스트는 이름/경로만으로 강등하지 않는다. 부모가 OS 배경
+    # 프로세스(예: VM 도구)이고 그 부모가 WMI·작업·COM 실행 경로가 아닐 때만 배경.
+    if name in LOLBIN_PROCS:
+        parent = ctx.pid_names.get(ppid, "") if ppid is not None else ""
+        if (parent and parent not in _LAUNCH_BROKER_PROCS
+                and parent not in ctx.lineage_names
+                and _is_background_process_name(parent, ctx)):
+            return TIER_BACKGROUND
+        return TIER_CORRELATED
 
     # Tier 3 — 베이스라인 / 알려진 OS 배경
     if ctx.baseline is not None:
@@ -327,22 +424,81 @@ def tier_dns(query, ctx: RelevanceContext) -> int:
     return tier_endpoint("", 0, name, ctx=ctx)
 
 
-def evidence_tier(ev: str, ctx: RelevanceContext) -> int:
-    """근거 문자열 하나의 등급. ``[프로세스명]`` 접두로 판정한다."""
-    m = re.match(r"^\[([^\]]+)\]", str(ev))
-    if not m:
-        # 프로세스 귀속이 없는 근거(CAPA·VT·네트워크) — 판단 보류
-        return TIER_CORRELATED
-    pname = m.group(1).lower()
+# 네트워크 근거 문자열 형식 (behavior_classifier._classify_network 가 만든다)
+_IPV4 = r"(\d{1,3}(?:\.\d{1,3}){3})"
+_NET_EVIDENCE_PATTERNS: tuple = (
+    # (정규식, ip 그룹, port 그룹, 도메인 그룹)
+    (re.compile(r"^SNI=(\S+)\s*(?:→|->)\s*" + _IPV4 + r":(\d+)"), 2, 3, 1),
+    (re.compile(r"^DNS:\s*(\S+)"), None, None, 1),
+    (re.compile(r"^비콘\s+" + _IPV4 + r":(\d+)"), 1, 2, None),
+    (re.compile(r"^고엔트로피 도메인:\s*(\S+)"), None, None, 1),
+    (re.compile(r"^다수 서브도메인 쿼리:\s*(\S+)"), None, None, 1),
+    (re.compile(r"^" + _IPV4 + r":(\d+)(?:\s|$)"), 1, 2, None),
+)
+_BARE_DOMAIN_RE = re.compile(r"^(?=.*[a-z])[a-z0-9_-]+(?:\.[a-z0-9_-]+)+\.?$", re.IGNORECASE)
+
+
+def _network_evidence_tier(ev, ctx: "RelevanceContext") -> Optional[int]:
+    """프로세스 접두 없는 네트워크 근거(ip:port · 도메인 · SNI · DNS)의 등급.
+
+    네트워크 근거는 해당 연결/DNS 의 등급을 따른다. MS 인프라·베이스라인
+    목적지뿐이면 그 기법도 배경이다. 해석할 수 없는 문자열이면 None.
+    """
+    text = str(ev or "").strip()
+    if not text:
+        return None
+    for rx, gi, gp, gd in _NET_EVIDENCE_PATTERNS:
+        m = rx.match(text)
+        if not m:
+            continue
+        ip     = m.group(gi) if gi else ""
+        port   = int(m.group(gp)) if gp and m.group(gp) else 0
+        domain = m.group(gd) if gd else ""
+        return _endpoint_tier_any_domain(ip, port, domain, ctx)
+    if _BARE_DOMAIN_RE.match(text):
+        return tier_endpoint("", 0, text, ctx=ctx)
+    return None
+
+
+def _endpoint_tier_any_domain(ip: str, port: int, domain: str, ctx: "RelevanceContext") -> int:
+    """도메인이 주어지지 않은 IP 는 pcap 의 IP→도메인 매핑을 모두 고려한다."""
+    if domain or not ip:
+        return tier_endpoint(ip, port, domain, ctx=ctx)
+    doms = ctx.ip_domains.get(ip) or []
+    if not doms:
+        return tier_endpoint(ip, port, "", ctx=ctx)
+    return min(tier_endpoint(ip, port, d, ctx=ctx) for d in doms)
+
+
+def _process_name_tier(pname: str, ctx: "RelevanceContext") -> int:
+    """``[프로세스명]`` 접두 하나의 등급."""
     if pname in ctx.lineage_names:
         return TIER_SAMPLE
     if _is_analysis_artifact(pname):
         return TIER_BACKGROUND
+    if pname in LOLBIN_PROCS:
+        # 이름만으로는 강등하지 않는다 (WMI·작업·COM 경유 실행 가능)
+        return TIER_CORRELATED
     if ctx.baseline is not None and ctx.baseline.has_process(pname):
         return TIER_BACKGROUND
     if ctx.baseline is None and pname in OS_BACKGROUND_PROCS:
         return TIER_BACKGROUND
     return TIER_CORRELATED
+
+
+def _evidence_item_tier(ev, ctx: "RelevanceContext") -> Optional[int]:
+    """근거 하나의 등급. 귀속도 네트워크 해석도 안 되는 근거(CAPA·VT 등)는 None."""
+    m = re.match(r"^\[([^\]]+)\]", str(ev))
+    if m:
+        return _process_name_tier(m.group(1).lower(), ctx)
+    return _network_evidence_tier(ev, ctx)
+
+
+def evidence_tier(ev: str, ctx: RelevanceContext) -> int:
+    """근거 문자열 하나의 등급. ``[프로세스명]`` 접두 또는 네트워크 목적지로 판정한다."""
+    t = _evidence_item_tier(ev, ctx)
+    # 프로세스 귀속이 없는 근거(CAPA·VT) — 판단 보류
+    return TIER_CORRELATED if t is None else t
 
 
 def sort_evidence(tech, ctx: RelevanceContext) -> None:
@@ -364,8 +520,9 @@ def sort_evidence(tech, ctx: RelevanceContext) -> None:
 def tier_technique(tech, ctx: RelevanceContext) -> int:
     """MitreTechnique → 등급.
 
-    근거(evidence)에 붙은 ``[프로세스명]`` 접두를 보고 판정한다.
-    계보 프로세스 근거가 하나라도 있으면 Tier 1, 전부 배경이면 Tier 3.
+    근거(evidence)에 붙은 ``[프로세스명]`` 접두, 또는 네트워크 근거의 목적지
+    등급을 보고 판정한다. 계보 근거가 하나라도 있으면 Tier 1, 판정 가능한
+    근거가 전부 배경이면 Tier 3 (MS 인프라 연결만 있는 T1071 등).
     """
     evidence = getattr(tech, "evidence", None)
     if evidence is None and isinstance(tech, dict):
@@ -374,24 +531,14 @@ def tier_technique(tech, ctx: RelevanceContext) -> int:
 
     tiers: list[int] = []
     for ev in evidence:
-        m = re.match(r"^\[([^\]]+)\]", str(ev))
-        if not m:
-            # 프로세스 귀속이 없는 근거(CAPA·VT·네트워크 등)는 판단 보류
+        t = _evidence_item_tier(ev, ctx)
+        if t is None:
+            # 프로세스 귀속이 없는 근거(CAPA·VT 등)는 판단 보류
             continue
-        pname = m.group(1).lower()
-        if pname in ctx.lineage_names:
-            tiers.append(TIER_SAMPLE)
-        elif _is_analysis_artifact(pname):
-            tiers.append(TIER_BACKGROUND)
-        elif ctx.baseline is not None and ctx.baseline.has_process(pname):
-            tiers.append(TIER_BACKGROUND)
-        elif ctx.baseline is None and pname in OS_BACKGROUND_PROCS:
-            tiers.append(TIER_BACKGROUND)
-        else:
-            tiers.append(TIER_CORRELATED)
+        tiers.append(t)
 
     if not tiers:
-        # 귀속 불가 — 정적 분석(CAPA)·VT·네트워크 유래. 버리지 않고 상관 의심으로.
+        # 귀속 불가 — 정적 분석(CAPA)·VT 유래. 버리지 않고 상관 의심으로.
         return TIER_CORRELATED
     return min(tiers)
 
@@ -402,21 +549,10 @@ def filter_evidence_by_tier(tech, ctx: RelevanceContext, max_tier: int = TIER_CO
     kept = []
     for ev in evidence:
         m = re.match(r"^\[([^\]]+)\]", str(ev))
-        if not m:
-            kept.append(ev)
+        if m and _is_analysis_artifact(m.group(1).lower()):
             continue
-        pname = m.group(1).lower()
-        if _is_analysis_artifact(pname):
-            continue
-        if pname in ctx.lineage_names:
-            kept.append(ev)
-        elif ctx.baseline is not None and ctx.baseline.has_process(pname):
-            if max_tier >= TIER_BACKGROUND:
-                kept.append(ev)
-        elif ctx.baseline is None and pname in OS_BACKGROUND_PROCS:
-            if max_tier >= TIER_BACKGROUND:
-                kept.append(ev)
-        elif max_tier >= TIER_CORRELATED:
+        t = _evidence_item_tier(ev, ctx)
+        if t is None or t <= max_tier:
             kept.append(ev)
     return kept
 
@@ -532,6 +668,34 @@ _JIT_FP_PRONE: frozenset[str] = frozenset({
 })
 
 
+# 계보 이름 일치로 주입 대상의 계보 여부를 정하면 안 되는 일반 시스템 이름.
+# 샘플이 conhost/svchost 를 하나 띄웠다고 무관한 같은 이름 프로세스의 탐지까지
+# 계보(HIGH)가 되면 안 된다.
+_GENERIC_PROC_NAMES: frozenset = (
+    OS_BACKGROUND_PROCS | _JIT_FP_PRONE | LOLBIN_PROCS
+    | frozenset({"svchost.exe", "conhost.exe", "explorer.exe", "dllhost.exe",
+                 "werfault.exe", "csrss.exe", "lsass.exe", "winlogon.exe"})
+)
+
+
+def _injection_in_lineage(pid, name: str, ctx: RelevanceContext) -> bool:
+    """주입 탐지 프로세스가 샘플 계보인지 — tier_process 와 같은 기준.
+
+    PID 만 보면 프로세스 생성 이벤트 누락·PID 재귀속 실패로 계보에서 빠진
+    드롭 로더(같은 화면의 다른 근거에서는 Tier 1)가 "계보 밖"으로 표시된다.
+    실행 파일이 계보 산출물이거나, 일반 시스템 이름이 아닌 계보 프로세스
+    이름과 일치하면 계보로 본다.
+    """
+    if pid in ctx.lineage_pids:
+        return True
+    if name and ctx.sample_name and name == ctx.sample_name:
+        return True
+    exe = ctx.pid_exes.get(pid, "") if pid is not None else ""
+    if exe and normalize_path(exe) in ctx.lineage_paths:
+        return True
+    return bool(name) and name in ctx.lineage_names and name not in _GENERIC_PROC_NAMES
+
+
 def classify_injections(result, ctx: RelevanceContext) -> list:
     """hollows-hunter / pe-sieve 탐지에 신뢰도를 매긴다.
 
@@ -559,17 +723,31 @@ def classify_injections(result, ctx: RelevanceContext) -> list:
         replaced = int(getattr(r, "replaced", 0) or 0)
         hooked   = int(getattr(r, "hooked", 0) or 0)
 
-        in_lineage  = pid in ctx.lineage_pids
+        in_lineage  = _injection_in_lineage(pid, name, ctx)
         baseline_fp = bool(ctx.baseline is not None and ctx.baseline.has_injection_fp(name))
         strong_type = (replaced > 0 or pe_inj > 0)   # PE 교체/주입 = 진짜 신호
         jit_prone   = name in _JIT_FP_PRONE
+        if strong_type:
+            kind = "pe"
+        elif shc > 0:
+            kind = "shellcode"
+        elif hooked > 0:
+            kind = "hook"
+        else:
+            kind = "other"
 
         if in_lineage:
             conf, why = "HIGH", "샘플 계보 프로세스"
+        elif strong_type:
+            # PE 교체/주입은 베이스라인 이름 일치만으로 강등하지 않는다.
+            # 베이스라인의 주입 오탐 목록은 이름만 기록하며 대개 JIT·쉘코드 탐지에서
+            # 왔다. 그 이름으로 explorer.exe 할로잉 같은 진짜 신호를 덮으면 안 된다.
+            why = "PE 교체/주입 동반 — 확인 필요"
+            if baseline_fp:
+                why += " (베이스라인에도 같은 이름의 주입 탐지가 있었음)"
+            conf = "MEDIUM"
         elif baseline_fp:
             conf, why = "LOW", "베이스라인에서도 동일 탐지 (환경 상시 오탐)"
-        elif strong_type:
-            conf, why = "MEDIUM", "PE 교체/주입 동반 — 확인 필요"
         elif jit_prone and shc > 0:
             conf, why = "LOW", ".NET JIT·ASLR 재배치 오탐 가능성 높음 (쉘코드만 탐지)"
         elif shc > 0:
@@ -583,6 +761,7 @@ def classify_injections(result, ctx: RelevanceContext) -> list:
             "implanted_shc": shc, "implanted_pe": pe_inj,
             "replaced": replaced, "hooked": hooked,
             "in_lineage": in_lineage, "baseline_fp": baseline_fp,
+            "kind": kind,               # pe / shellcode / hook / other — 지표 제목용
             "confidence": conf, "reason": why,
         })
 

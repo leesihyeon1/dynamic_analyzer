@@ -151,16 +151,17 @@ class ProcMonController:
             if result.returncode != 0:
                 self.last_error = f"ProcMon 종료 명령 실패 (종료 코드 {result.returncode})"
                 return False
+            # /Terminate 는 종료를 "요청" 할 뿐이다. 캡처 중인 원래 인스턴스가
+            # 백킹 파일을 닫을 때까지 기다려야 PML 이 완결된다.
+            self._wait_capture_exit(timeout=60)
             # 캡처 파일 기록이 끝날 때까지 기다린 뒤 변환한다.
-            previous = -1
-            stable = 0
-            for _ in range(40):
-                size = self.pml_path.stat().st_size if self.pml_path.is_file() else 0
-                stable = stable + 1 if size > 0 and size == previous else 0
-                if stable >= 4:
-                    break
-                previous = size
-                time.sleep(0.25)
+            if not self._wait_size_stable(timeout=10):
+                self.last_error = (
+                    "ProcMon 종료 후 캡처 파일 크기가 안정되지 않음 "
+                    f"(10초 내 기록 지속): {self.pml_path}"
+                )
+                return False
+            self._proc = None
             return True
         except Exception as exc:
             self.last_error = f"ProcMon 종료 예외: {exc}"
@@ -171,6 +172,65 @@ class ProcMonController:
                 except Exception:
                     pass
             return False
+
+    @property
+    def capturing(self) -> bool:
+        """이 컨트롤러가 띄운 캡처 인스턴스가 아직 살아 있는지 (stop 중복 호출 판단용)."""
+        proc = self._proc
+        if proc is None:
+            return False
+        try:
+            return proc.poll() is None
+        except Exception:
+            return False
+
+    def _wait_capture_exit(self, timeout: float = 60) -> bool:
+        """캡처 인스턴스가 끝날 때까지 기다린다.
+
+        Popen 핸들이 있으면 그것을 기다리고, 이어서 psutil 로 남은 Procmon*.exe 가
+        없어질 때까지 확인한다 (Procmon.exe 가 Procmon64.exe 를 띄우는 구조 대비).
+        psutil 이 없거나 조회가 실패하면 조용히 넘어간다.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        if self._proc is not None:
+            try:
+                self._proc.wait(timeout=max(0.1, deadline - time.monotonic()))
+            except Exception:
+                pass
+        try:
+            import psutil as _ps
+        except ImportError:
+            return True
+        names = {"procmon.exe", "procmon64.exe", "procmon64a.exe"}
+        while time.monotonic() < deadline:
+            alive = False
+            try:
+                for p in _ps.process_iter(["name"]):
+                    if (p.info.get("name") or "").lower() in names:
+                        alive = True
+                        break
+            except Exception:
+                return True
+            if not alive:
+                return True
+            time.sleep(0.5)
+        return False
+
+    def _wait_size_stable(self, timeout: float = 10, checks: int = 4,
+                          interval: float = 0.25) -> bool:
+        """PML 크기가 연속 checks 회 같으면 True. timeout 안에 안정되지 않으면 False."""
+        previous = -1
+        stable = 0
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            size = self.pml_path.stat().st_size if self.pml_path.is_file() else 0
+            stable = stable + 1 if size > 0 and size == previous else 0
+            if stable >= checks:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            previous = size
+            time.sleep(interval)
 
     def export_timeout_for(self, pml_bytes: int) -> int:
         """PML 크기에 맞춘 CSV 변환 타임아웃(초).

@@ -122,8 +122,18 @@ def take_snapshot() -> dict[str, dict[str, object]]:
     """
     snapshot: dict[str, dict[str, object]] = {}
     for hive_const, hive_name, subkey in WATCHED_KEYS:
-        key_path = f"{hive_name}\\{subkey}"
-        snapshot[key_path] = snapshot_key(hive_const, subkey)
+        pending = [subkey]
+        while pending:
+            current = pending.pop()
+            key_path = f"{hive_name}\\{current}"
+            snapshot[key_path] = snapshot_key(hive_const, current)
+            try:
+                with winreg.OpenKey(hive_const, current, 0, winreg.KEY_READ) as key:
+                    count = winreg.QueryInfoKey(key)[0]
+                    pending.extend(current + "\\" + winreg.EnumKey(key, index)
+                                   for index in range(count))
+            except OSError:
+                continue
     return snapshot
 
 

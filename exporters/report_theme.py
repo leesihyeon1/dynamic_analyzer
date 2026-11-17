@@ -19,8 +19,6 @@ h1{font-size:clamp(1.8rem,3vw,2.6rem);letter-spacing:-.035em;line-height:1.25;co
 .metric{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:20px 22px}
 .metric-label{font-size:.8rem;color:var(--muted)}.metric-value{font-size:2.1rem;font-weight:650;line-height:1.3;margin:8px 0;color:var(--text);font-variant-numeric:tabular-nums;letter-spacing:-.04em}
 .metric-note{font-size:.75rem;color:var(--muted)}
-.health-strip{display:flex;align-items:flex-start;gap:12px;background:#172c2b;border:1px solid #31534b;border-radius:10px;padding:14px 18px;color:#a2e4d5;font-size:.85rem}
-.health-strip.warning{background:#29271e;border-color:#514733;color:#efd9a5}.health-strip strong{white-space:nowrap}
 .tools-disclosure{margin:18px 0 24px;border-bottom:1px solid var(--line);padding-bottom:18px}
 .tools-disclosure summary{cursor:pointer;color:var(--muted);font-size:.85rem}.tools-disclosure .tool-list{display:flex;flex-wrap:wrap;gap:8px;padding-top:14px}
 .tabs{position:fixed;left:0;top:0;bottom:0;width:244px;padding:35px 18px 22px;margin:0;display:flex;flex-direction:column;gap:5px;overflow-y:auto;overflow-x:hidden;background:#101c2e;border:0;border-right:1px solid var(--line);z-index:20}
@@ -52,7 +50,7 @@ tbody tr:nth-child(even)>td{background:rgba(140,170,210,.035)}tr:hover td{backgr
 pre{line-height:1.8!important;font-size:.86rem!important;tab-size:4}details>summary{padding:8px 0}
 @media(min-width:1850px){.container{margin-left:calc(244px + (100vw - 1850px)/2)}}
 @media(max-width:1100px){.container{margin:0;padding:24px}.tabs{position:sticky;top:0;width:auto;bottom:auto;flex-direction:row;padding:10px;gap:4px;margin:0 -24px 22px;border-right:0;border-bottom:1px solid var(--line);overflow-x:auto}.tabs:before,.tabs:after{display:none}.tab-btn{padding:10px 14px}.tab-btn .tbadge{margin-left:4px}}
-@media(max-width:700px){.container{padding:20px}.tabs{margin:0 -20px 18px}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{padding:16px}.grid2{grid-template-columns:1fr}.report-topline{align-items:flex-start;flex-direction:column}.health-strip{flex-direction:column;gap:4px}.report-meta{gap:6px 16px}td,th{padding:10px 8px}.kv td:first-child{width:120px}}
+@media(max-width:700px){.container{padding:20px}.tabs{margin:0 -20px 18px}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.metric{padding:16px}.grid2{grid-template-columns:1fr}.report-topline{align-items:flex-start;flex-direction:column}.report-meta{gap:6px 16px}td,th{padding:10px 8px}.kv td:first-child{width:120px}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 @media print{*{background:transparent!important;color:#111!important;box-shadow:none!important}.tabs,.report-actions,.pg-wrap,.srch-wrap{display:none!important}.container{margin:0;padding:0;max-width:none}.tab-panel:not(.active){display:none!important}.metric,.card{border:1px solid #aaa}h2{break-after:avoid}.metric-grid{grid-template-columns:repeat(4,1fr)}}
 """
@@ -72,6 +70,18 @@ body.menu-hidden .tabs{display:none}body.menu-hidden .container{margin-left:auto
 .report-table-scroll{max-width:100%;overflow:auto;max-height:32rem;scrollbar-color:#547086 #142136}
 .report-table-scroll>table{margin:0}.report-table-scroll td,.report-table-scroll th{padding:6px 10px}
 .report-table-scroll td.mono,.report-table-scroll td code{white-space:nowrap;word-break:normal!important;overflow-wrap:normal!important}
+#tbl-process-all{table-layout:fixed;min-width:990px;width:100%}
+#tbl-process-all th{position:sticky;top:0;z-index:1;background:#172438;text-align:left}
+#tbl-process-all th:nth-child(1){width:36px}
+#tbl-process-all th:nth-child(2){width:78px}
+#tbl-process-all th:nth-child(3){width:205px}
+#tbl-process-all th:nth-child(4){width:90px}
+#tbl-process-all th:nth-child(7){width:120px}
+#tbl-process-all tr[id^='proc-record-']>td{vertical-align:top}
+#tbl-process-all tr[id^='proc-record-']>td:nth-child(2){white-space:nowrap}
+#tbl-process-all tr[id^='proc-record-']>td:nth-child(5),#tbl-process-all tr[id^='proc-record-']>td:nth-child(6){white-space:normal;overflow-wrap:anywhere!important;word-break:normal!important}
+#tbl-process-all tr[id^='proc-record-']>td:nth-child(7){white-space:normal!important}
+.process-record-scroll{max-height:36rem}
 .tab-panel pre{max-height:22rem;overflow:auto;white-space:pre!important}
 @media(max-width:1100px){.tabs{padding-top:8px;top:38px}.report-menu-toggle{top:4px}}
 @media print{.report-menu-toggle{display:none}.report-table-scroll,.tab-panel pre{overflow:visible;max-height:none}}
@@ -88,6 +98,7 @@ document.addEventListener('DOMContentLoaded', function(){
  document.body.prepend(toggle);show(false);
  window.addEventListener('load',function(){
  document.querySelectorAll('.tab-panel table[id]').forEach(table=>{
+ if(table.parentElement.classList.contains('report-table-scroll'))return;
  const box=document.createElement('div');box.className='report-table-scroll';
  box.tabIndex=0;table.before(box);box.append(table);});});
 });
@@ -96,14 +107,13 @@ REPORT_CSS += COMPACT_CSS
 
 
 def report_header(*, sample_name, sample_path, generated, timeout, duration, techniques,
-                  events, connections, ips, tools_html, needs_review=False, indicator=""):
+                  events, connections, ips, indicator=""):
     """사용자 데이터는 이스케이프하고 생성기가 만든 도구 배지만 HTML로 삽입한다."""
     e = lambda value: escape(str(value), quote=True)
     metrics = [("ATT&CK 후보", techniques), ("ProcMon 이벤트", events),
                ("네트워크 연결", connections), ("IOC IP 주소", ips)]
     cards = "".join(f'<div class="metric"><div class="metric-label">{e(label)}</div><div class="metric-value">{int(count):,}</div></div>' for label, count in metrics)
     minutes, seconds = divmod(int(max(0, duration)), 60)
-    health = '<div class="health-strip warning">수집 상태 확인 필요</div>' if needs_review else ""
     return f'''<header class="report-header">
 <div class="report-topline"><span class="eyebrow">DYNAMIC / ANALYSIS REPORT</span><div class="report-actions">
 <button type="button" aria-pressed="false" onclick="const large=document.documentElement.classList.toggle('large-text');this.setAttribute('aria-pressed',String(large));this.textContent=large?'기본 글자':'글자 크게'">글자 크게</button>
@@ -111,6 +121,4 @@ def report_header(*, sample_name, sample_path, generated, timeout, duration, tec
 <h1>{e(sample_name)}</h1><p class="report-path">{e(sample_path)}</p>
 <div class="report-meta"><span>생성<strong>{e(generated)}</strong></span><span>모니터링<strong>{e(timeout)}초</strong></span><span>전체 소요<strong>{minutes}분 {seconds}초</strong></span><span>규칙 기반 지표<strong>{e(indicator)}</strong></span></div>
 <div class="metric-grid">{cards}</div>
-{health}
-<details class="tools-disclosure"><summary>수집 도구 상태 보기</summary><div class="tool-list">{tools_html}</div></details>
 </header>'''

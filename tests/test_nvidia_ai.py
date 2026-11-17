@@ -7,6 +7,14 @@ from unittest.mock import patch
 from core.ai_analyzer import NvidiaAnalyzer, NVIDIA_ENDPOINT, _NoApiRedirect, ai_analysis_to_dict, create_ai_analyzer
 from core.config_loader import get_ai_cfg, save_ai_settings
 
+EOL = bytes([10])
+NL = chr(10)
+
+
+def _data(obj) -> bytes:
+    """SSE 한 줄 (data: {...})."""
+    return b"data: " + json.dumps(obj).encode() + EOL
+
 
 class NvidiaTests(unittest.TestCase):
     def setUp(self):
@@ -20,10 +28,22 @@ class NvidiaTests(unittest.TestCase):
         self.behavior.start()
         self.addCleanup(self.behavior.stop)
 
+    @staticmethod
+    def sse(content="analysis", finish_reason="stop"):
+        """OpenAI 호환 스트리밍 응답 줄 목록 (본문 → 종료 사유 → [DONE] → EOF)."""
+        lines = []
+        if content is not None:
+            lines.append(_data({"choices": [{"delta": {"content": content}, "finish_reason": None}]}))
+        lines.append(_data({"choices": [{"delta": {}, "finish_reason": finish_reason}]}))
+        lines.append(b"data: [DONE]" + EOL)   # [DONE] 에서 수신이 끝난다
+        return lines
+
+    @property
+    def stream(self):
+        return self.opener.open.return_value.__enter__.return_value
+
     def respond(self, content="analysis", finish_reason="stop"):
-        self.opener.open.return_value.__enter__.return_value.read.return_value = json.dumps({
-            "choices": [{"message": {"content": content}, "finish_reason": finish_reason}]
-        }).encode()
+        self.stream.readline.side_effect = self.sse(content, finish_reason)
 
     def test_request_uses_approved_endpoint_and_summary(self):
         self.respond()
@@ -60,10 +80,8 @@ class NvidiaTests(unittest.TestCase):
 
     @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["first", "second"])
     def test_empty_reasoning_response_retries_and_reads_text_parts(self, _candidates):
-        def reply(content, reason):
-            return json.dumps({"choices": [{"message": {"content": content}, "finish_reason": reason}]}).encode()
-        self.opener.open.return_value.__enter__.return_value.read.side_effect = [
-            reply(None, "length"), reply([{"type": "text", "text": "분석 완료"}], "stop")]
+        self.stream.readline.side_effect = (self.sse(None, "length")
+                                            + self.sse([{"type": "text", "text": "분석 완료"}], "stop"))
         result = NvidiaAnalyzer("test-key", "first").analyze(object())
         self.assertFalse(result.error)
         self.assertEqual(result.model, "second")
@@ -90,6 +108,49 @@ class NvidiaTests(unittest.TestCase):
         result = NvidiaAnalyzer("test-key", "primary").analyze(object())
         self.assertIn("세 차례", result.error)
         self.assertEqual(self.opener.open.call_count, 3)
+
+    def test_request_streams_and_reports_progress(self):
+        chunks = [_data({"choices": [{"delta": {"content": part}, "finish_reason": None}]})
+                  for part in ("분석 ", "분류" + NL, "핵심 요약")]
+        self.stream.readline.side_effect = [b": keep-alive" + EOL, *chunks, *self.sse(None, "stop")]
+        ticks = []
+        with patch("core.ai_analyzer._AI_PROGRESS_EVERY", 0):
+            result = NvidiaAnalyzer("test-key").analyze(object(), on_progress=lambda *a: ticks.append(a))
+        self.assertFalse(result.error)
+        self.assertIn("분석 분류", result.response)
+        request = self.opener.open.call_args.args[0]
+        self.assertTrue(json.loads(request.data)["stream"])
+        self.assertEqual(request.get_header("Accept"), "text/event-stream")
+        self.assertTrue(ticks)
+        self.assertEqual(ticks[-1][0], len("분석 분류" + NL + "핵심 요약"))
+
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["only"])
+    def test_cut_after_most_of_body_keeps_partial_result(self, _models):
+        body = "핵심 요약" + NL + "샘플이 Run 키를 등록했다. " * 60
+        self.stream.readline.side_effect = [
+            _data({"choices": [{"delta": {"content": body}, "finish_reason": None}]}), ConnectionResetError()]
+        result = NvidiaAnalyzer("test-key", "only").analyze(object())
+        self.assertFalse(result.error)
+        self.assertIn("Run 키", result.response)
+        self.assertIn("일부만", result.response)
+        self.assertEqual(self.opener.open.call_count, 1)
+
+    @patch("core.ai_analyzer.time.sleep")
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["only"])
+    def test_early_cut_retries_same_model(self, _models, _sleep):
+        early = _data({"choices": [{"delta": {"content": "짧"}, "finish_reason": None}]})
+        self.stream.readline.side_effect = [early, TimeoutError(), *self.sse("다시 받은 분석", "stop")]
+        result = NvidiaAnalyzer("test-key", "only").analyze(object())
+        self.assertFalse(result.error)
+        self.assertIn("다시 받은 분석", result.response)
+        self.assertEqual(self.opener.open.call_count, 2)
+
+    def test_server_ignoring_stream_still_parsed(self):
+        self.stream.readline.side_effect = [json.dumps({
+            "choices": [{"message": {"content": "일반 응답"}, "finish_reason": "stop"}]}).encode(), b""]
+        result = NvidiaAnalyzer("test-key").analyze(object())
+        self.assertFalse(result.error)
+        self.assertIn("일반 응답", result.response)
 
     def test_empty_content_is_reported_as_error(self):
         self.respond(content=None)

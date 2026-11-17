@@ -45,6 +45,9 @@ _ANALYSIS_TOOL_PROC_NAMES: frozenset[str] = frozenset({
     "etwdump.exe",       # Wireshark ETW extcap (child of tshark)
     # Memory / injection scanners
     "hollows_hunter.exe",
+    "hollows_hunter64.exe",
+    "hollows-hunter.exe",
+    "hollows-hunter64.exe",
     "pe-sieve64.exe",
     "pe-sieve32.exe",
     "pe-sieve.exe",
@@ -53,6 +56,13 @@ _ANALYSIS_TOOL_PROC_NAMES: frozenset[str] = frozenset({
     # Fakenet / network simulation
     "fakenet.exe",
     "fakenet-ng.exe",
+    # Memory acquisition (winpmem / DumpIt)
+    "winpmem.exe",
+    "winpmem_mini_x64.exe",
+    "winpmem_mini_x64_rc2.exe",
+    "winpmem_mini_x86.exe",
+    "go-winpmem.exe",
+    "dumpit.exe",
 })
 
 # ---------------------------------------------------------------------------
@@ -244,6 +254,18 @@ def take_process_snapshot() -> dict[int, ProcessSnapshot]:
     return snapshot
 
 
+def _is_reused_pid(before_snap: "ProcessSnapshot", after_snap: "ProcessSnapshot") -> bool:
+    """두 스냅샷의 같은 PID 가 서로 다른 프로세스인지 (생성 시각 비교).
+
+    생성 시각을 모르는(0) 쪽이 있으면 같은 프로세스로 본다.
+    """
+    b = float(getattr(before_snap, "create_time", 0.0) or 0.0)
+    a = float(getattr(after_snap, "create_time", 0.0) or 0.0)
+    if not b or not a:
+        return False
+    return abs(a - b) > 0.01
+
+
 def diff_process_snapshots(
     before: dict[int, ProcessSnapshot],
     after: dict[int, ProcessSnapshot],
@@ -270,13 +292,18 @@ def diff_process_snapshots(
     before_pids = set(before.keys())
     after_pids = set(after.keys())
 
+    # PID 재사용: 같은 PID 라도 생성 시각이 다르면 다른 프로세스다.
+    # (분석 전 프로세스가 끝나고 샘플 자식이 그 PID 를 받으면 신규로 잡아야 한다)
+    reused = {pid for pid in (after_pids & before_pids)
+              if _is_reused_pid(before[pid], after[pid])}
+
     # 분석 도구 프로세스는 new_processes 목록에서 제외
     new_processes = [
         after[pid]
-        for pid in (after_pids - before_pids)
-        if after[pid].name.lower() not in _ANALYSIS_TOOL_PROC_NAMES
+        for pid in sorted((after_pids - before_pids) | reused)
+        if (after[pid].name or "").lower() not in _ANALYSIS_TOOL_PROC_NAMES
     ]
-    terminated_processes = [before[pid] for pid in (before_pids - after_pids)]
+    terminated_processes = [before[pid] for pid in sorted((before_pids - after_pids) | reused)]
 
     return {
         "new_processes": new_processes,

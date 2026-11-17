@@ -10,10 +10,17 @@
   6. 사후 스냅샷 → diff
   7. 파싱 & 분석
   8. 결과 반환
+
+GUI 연동
+  - <output_dir>/STOP 파일: 내용 "monitor" 면 모니터링 대기를 조기 종료하고 정상 마무리,
+    "skip" 이면 선택 단계(CAPA·VirusTotal·메모리 포렌식·AI)도 건너뛴다.
+  - on_report_ready(result): AI 해석 직전에 1차(preliminary) 결과로 호출된다.
+    호출부가 보고서를 먼저 써 두고, AI 가 끝나면 최종(final) 결과로 다시 쓴다.
 """
 from __future__ import annotations
 
 import ctypes
+import os
 import subprocess
 import threading
 import time
@@ -152,54 +159,17 @@ def _scan_procmon_once(
         process_network_map — build_process_network_map 과 동일
     """
     from parsers.procmon_csv import EventCategory
-    from analysis.process_network_map import (
-        ProcNetConnection,
-        _OUTBOUND_OPS, _INBOUND_OPS, _parse_path, _is_private,
-        _ANALYSIS_TOOL_PROCESSES,
-    )
+    from analysis.process_network_map import build_process_network_map
 
-    inject_pids: set[int] = set()
-    net_agg: dict = {}
+    inject_pids = {
+        ev.pid for ev in events
+        if ev.category == EventCategory.PROCESS and ev.operation == "Load Image"
+        and ev.result == "SUCCESS" and ev.pid
+        and ev.pid not in already_scanned and ev.pid not in sample_pids
+        and is_suspicious_module_path(ev.path)
+    }
+    return inject_pids, build_process_network_map(events)
 
-    for ev in events:
-        cat = ev.category
-
-        # ── 인젝션 탐지 (PROCESS / Load Image) ──────────────────────
-        if cat == EventCategory.PROCESS and ev.operation == "Load Image" and ev.pid != 0:
-            if ev.pid not in already_scanned and ev.pid not in sample_pids:
-                if is_suspicious_module_path(ev.path):
-                    inject_pids.add(ev.pid)
-
-        # ── 네트워크 맵 (TCP/UDP outbound/inbound) ───────────────────
-        elif cat == EventCategory.NETWORK:
-            if ev.process.lower() in _ANALYSIS_TOOL_PROCESSES and ev.pid not in sample_pids:
-                continue
-            op = ev.operation
-            if op in _OUTBOUND_OPS:
-                direction = "outbound"
-            elif op in _INBOUND_OPS:
-                direction = "inbound"
-            else:
-                continue
-            proto = "TCP" if op.startswith("TCP") else "UDP"
-            _, _, remote_ip, remote_port = _parse_path(ev.path)
-            if remote_ip is None or remote_port is None or _is_private(remote_ip):
-                continue
-            key = (ev.pid, ev.process, proto, remote_ip, remote_port, direction)
-            if key in net_agg:
-                net_agg[key].event_count += 1
-            else:
-                net_agg[key] = ProcNetConnection(
-                    pid=ev.pid, process=ev.process, proto=proto,
-                    remote_ip=remote_ip, remote_port=remote_port,
-                    direction=direction, event_count=1,
-                )
-
-    net_map = sorted(
-        net_agg.values(),
-        key=lambda c: (-c.event_count, c.process.lower(), c.remote_ip),
-    )
-    return inject_pids, net_map
 
 
 def _find_suspicious_activity_pids(events: list, known_pids: set) -> set:
@@ -409,7 +379,12 @@ def _compute_activity_verdict(result: "AnalysisResult") -> "tuple[bool, list[str
         signals:   비활성 근거 메시지 목록 (활성이면 빈 리스트)
     """
     # ── 각 데이터 소스에서 활동 수치 추출 ─────────────────────────────
-    n_events   = len(result.filtered_events)
+    sample_mode = result.config.sample_path is not None
+    lineage = set(result.lineage_pids)
+    if result.sample_pid:
+        lineage.add(result.sample_pid)
+    n_events = sum(1 for e in result.filtered_events
+                   if not sample_mode or e.pid in lineage)
 
     new_procs  = result.process_diff.get("new_processes", [])
     _sname     = (result.config.sample_path.name.lower()
@@ -417,12 +392,14 @@ def _compute_activity_verdict(result: "AnalysisResult") -> "tuple[bool, list[str
     n_children = sum(
         1 for p in new_procs
         if getattr(p, "category", "") != "BROWSER_INFRA"
+        and (not sample_mode or p.pid in lineage)
         and p.name.lower() != _sname
     )
 
-    n_net_proc = len(result.process_network_map)
+    n_net_proc = sum(1 for c in result.process_network_map
+                     if not sample_mode or c.pid in lineage)
 
-    pcap       = result.pcap_result
+    pcap = result.analysis_pcap if sample_mode else result.pcap_result
     n_dns      = len(pcap.dns_queries)   if pcap else 0
     n_http     = len(pcap.http_requests) if pcap else 0
     n_conns    = len(pcap.connections)   if pcap else 0
@@ -431,22 +408,29 @@ def _compute_activity_verdict(result: "AnalysisResult") -> "tuple[bool, list[str
     n_hh_susp  = sum(
         1 for r in (getattr(hh, "process_results", []) or [])
         if getattr(r, "suspicious", 0) > 0
+        and (not sample_mode or r.pid in lineage)
     ) if hh else 0
     n_pe_susp  = sum(
         1 for r in result.pe_sieve_results
         if getattr(r, "suspicious", 0) > 0
+        and (not sample_mode or r.pid in lineage)
     )
 
     ioc        = result.ioc_report
-    n_dropped  = len(getattr(ioc, "dropped_files",  []) or []) if ioc else 0
+    tiers = getattr(ioc, "dropped_file_tiers", {}) or {}
+    n_dropped = sum(1 for path in (getattr(ioc, "dropped_files", []) or [])
+                    if not sample_mode or tiers.get(path, 3) <= 2)
 
     reg        = result.registry_diff or {}
-    n_reg      = len(reg.get("added_keys",    [])) + len(reg.get("modified_keys", []))
+    n_reg = len(reg.get("added", [])) + len(reg.get("modified", []))
+    if sample_mode:
+        n_reg = sum(1 for e in result.filtered_events if e.pid in lineage
+                    and e.operation == "RegSetValue" and e.result == "SUCCESS")
 
     fn         = result.fakenet_result or {}
-    n_fakenet  = len(fn.get("dns_queries", [])) + len(fn.get("http_requests", []))
+    n_fakenet = 0 if sample_mode else len(fn.get("dns_queries", [])) + len(fn.get("http_requests", []))
 
-    tls_keys   = result.tls_key_count or 0
+    tls_keys = 0 if sample_mode else result.tls_key_count or 0
 
     # ── 활성 판정: 하나라도 해당하면 유의미한 활동으로 판단 ─────────────
     if any([
@@ -490,9 +474,19 @@ def _compute_activity_verdict(result: "AnalysisResult") -> "tuple[bool, list[str
     return False, signals
 
 
+def _stop_requested(output_dir: Path, *, optional: bool = False) -> bool:
+    """GUI의 중지 요청을 관찰 종료와 선택 분석 생략에 반영한다."""
+    try:
+        level = (output_dir / "STOP").read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return level == "skip" if optional else level in ("monitor", "skip")
+
+
 def run_analysis(
     config: AnalysisConfig,
     on_status: Optional[Callable[[str], None]] = None,
+    on_preliminary_report: Optional[Callable[[AnalysisResult], None]] = None,
 ) -> AnalysisResult:
     """
     동적 분석 전체 실행.
@@ -589,373 +583,277 @@ def run_analysis(
     reg_before = take_snapshot() if REG_AVAILABLE else {}
     proc_before = take_process_snapshot()
 
-    # ── 2. 모니터링 시작 ──────────────────────────────────────────────
-    status("[2/6] 모니터링 시작...")
-
-    if result.tools_used["procmon"]:
-        ok = pm.start()
-        if not ok:
-            reason = pm.export_error or pm.last_error or "원인 확인 불가"
-            result.errors.append(f"ProcMon 시작 실패: {reason}")
-            status(f"      [ProcMon] 시작 실패: {reason}")
-            result.tools_used["procmon"] = False
-
-    if result.tools_used["tshark"] and not config.use_fakenet:
-        ok = ts.start(config.timeout + 10)
-        if not ok:
-            result.errors.append("tshark 시작 실패")
-            result.tools_used["tshark"] = False
-
-    # FakeNet-NG 시작 (tshark 대신 사용 — DNS 리다이렉트 + 프로토콜 가로채기)
-    if fakenet and result.tools_used["fakenet"]:
-        ok = fakenet.start()
-        if not ok:
-            result.errors.append("FakeNet-NG 시작 실패")
-            result.tools_used["fakenet"] = False
-        else:
-            status("      FakeNet-NG 실행 중 (DNS 리다이렉션 + 프로토콜 인터셉트)")
-
-    ph_proc = None
-    if result.tools_used["process_hacker"]:
-        ph_proc = launch_process_hacker(ph_path)
-        if ph_proc is None:
-            result.tools_used["process_hacker"] = False
-
-    # ── 3. 샘플 실행 (파일 지정 시에만) ─────────────────────────────
-    # 확장자별 실행 방법 분기:
-    #   Office 문서 / 스크립트 / PDF → os.startfile (ShellExecute, 연관 앱으로 열기)
-    #   실행 파일 (.exe / .dll 등)   → subprocess.Popen (직접 실행, PID 추적 가능)
-    from core.sample_types import SHELL_EXEC_SUFFIXES as _SHELL_EXEC_SUFFIXES
-
-    from core.dns_trace import DnsTrace
-    dns_trace = DnsTrace(config.output_dir)
-    if config.sample_path and not config.external_pcap:
-        try:
-            result.tools_used["dns_etw"] = dns_trace.start()
-        except (OSError, subprocess.SubprocessError):
-            result.tools_used["dns_etw"] = False
-    sample_proc = None
-    if config.sample_path:
-        status(f"[3/6] 샘플 실행: {config.sample_path.name}")
-        ext = config.sample_path.suffix.lower()
-        try:
-            if ext in _SHELL_EXEC_SUFFIXES:
-                # Office/스크립트/PDF 등 — 연관 앱(Word, wscript 등)으로 ShellExecute
-                # 기존 인스턴스가 살아있으면 DDE 핸드오프로 새 PID 가 즉시 종료됨.
-                # → startfile 전에 호스트 앱을 종료해 추적 가능한 새 PID 를 생성.
-                _OFFICE_HOSTS: list[tuple[frozenset, str, list[str]]] = [
-                    (frozenset({".doc", ".docx", ".docm", ".dot", ".dotm", ".rtf"}),
-                     "기존 Word 인스턴스", ["winword.exe"]),
-                    (frozenset({".xls", ".xlsx", ".xlsm", ".xlt", ".xltm"}),
-                     "기존 Excel 인스턴스", ["excel.exe"]),
-                    (frozenset({".ppt", ".pptx", ".pptm", ".pot", ".potm"}),
-                     "기존 PowerPoint 인스턴스", ["powerpnt.exe"]),
-                ]
-                for _exts, _label, _exes in _OFFICE_HOSTS:
-                    if ext in _exts:
-                        _kill_analysis_tool(None, exe_names=_exes, status=status, label=_label)
-                        break
-                import os as _os
-                _os.startfile(str(config.sample_path))
-                result.sample_pid = None   # 호스트 앱 PID는 procmon/process_diff 로 추적
-                status(f"      ShellExecute 실행 ({ext}) — 호스트 앱 PID는 procmon이 추적")
-            else:
-                _sample_env = tls_keylogger.get_env() if tls_keylogger else None
-                sample_proc = subprocess.Popen(
-                    [str(config.sample_path)],
-                    cwd=str(config.sample_path.parent),
-                    env=_sample_env,
-                )
-                result.sample_pid = sample_proc.pid
-                result.all_pids.add(sample_proc.pid)
-                result.lineage_pids.add(sample_proc.pid)
-                _klog_note = f" + SSLKEYLOGFILE 주입" if tls_keylogger else ""
-                status(f"      PID: {sample_proc.pid}{_klog_note}")
-        except Exception as e:
-            result.errors.append(f"샘플 실행 실패: {e}")
-            status(f"[오류] 샘플 실행 실패: {e}")
-    else:
-        status(f"[3/6] 전체 시스템 모니터링 모드 — 직접 프로그램을 실행하세요")
-
-    # ── 4. 모니터링 대기 ──────────────────────────────────────────────
-    status(f"[4/6] 모니터링 중... ({config.timeout}초)  Ctrl+C로 조기 종료 가능")
-    _netstat_snaps: list[list[tuple]] = []  # KeyboardInterrupt 전 참조 방지
-
-    # ── 실시간 프로세스 감시 시작 (신규 PID → 즉시 pe-sieve 스캔)
-    # proc_before에 없는 PID가 생성되면 1초 이내에 자동 스캔하여
-    # 단명 프로세스(loader, injector 등)도 포착할 수 있도록 함
-    _rt_results: list[tuple[int, dict]] = []
-    _rt_lock    = threading.Lock()
-
-    def _rt_callback(pid: int, raw: dict) -> None:
-        with _rt_lock:
-            _rt_results.append((pid, raw))
-
-    from core.process_watcher import ProcessWatcher
-    watcher = ProcessWatcher(
-        initial_pids    = set(proc_before.keys()),
-        scanner         = ps_scanner,
-        on_result       = _rt_callback,
-        dump_mode       = 3,     # raw dump — PE + 쉘코드 모두 추출
-        poll_interval   = 1.0,
-        rescan_interval = 5.0,   # injection 신호 검사 + 신규 프로세스 재스캔 주기
-        max_rescans     = 3,     # 언패킹/지연 인젝션 대응 (clean 프로세스 최대 재스캔)
-    )
-    watcher.start()
-    if watcher.available:
-        _mode_label = (
-            "WMI ETW (즉시 감지)"
-            if watcher.detection_mode == "wmi_etw"
-            else "psutil 폴링 (1초 간격)"
-        )
-        status(f"      [실시간] 신규 프로세스 감시 시작 — {_mode_label}"
-               f" + injection 신호/재스캔 (5초 주기)")
-
-    elapsed = 0
-    interval = 5
-    sample_exited = False
-    _snap_tick = 0
-    from analysis.process_network_map import capture_netstat_snapshot as _ns_snap
     try:
-        while elapsed < config.timeout:
-            time.sleep(interval)
-            elapsed += interval
-            _snap_tick += 1
-            # 10초마다 netstat 스냅샷 수집
-            if _snap_tick % 2 == 0:
-                _snap = _ns_snap()
-                if _snap:
-                    _netstat_snaps.append(_snap)
-            # 샘플 종료 감지 — 자식 프로세스 활동을 위해 타임아웃까지 계속 모니터링
-            if sample_proc and not sample_exited and sample_proc.poll() is not None:
-                sample_exited = True
-                status(f"      샘플 종료 감지 ({elapsed}s) — 자식 프로세스 모니터링 계속...")
-            remaining = config.timeout - elapsed
-            status(f"      {elapsed}s 경과 / 잔여 {remaining}s...")
-    except KeyboardInterrupt:
-        status(f"\n[!] Ctrl+C 감지 — {elapsed}s 시점 데이터로 분석을 마무리합니다...")
-    # 타임아웃 종료 직후 최종 스냅샷 (연결이 살아있는 마지막 순간 포착)
-    try:
-        _final_snap = _ns_snap()
-        if _final_snap:
-            _netstat_snaps.append(_final_snap)
-    except Exception:
-        pass
+        # ── 2. 모니터링 시작 ──────────────────────────────────────────────
+        status("[2/6] 모니터링 시작...")
 
-    # ── 5. 종료 ───────────────────────────────────────────────────────
-    status("[5/6] 모니터링 종료...")
-
-    # ── 실시간 감시 중지 + 결과 병합 ────────────────────────────────────
-    # watcher가 스캔한 PID 집합 확보 (중복 스캔 방지에 사용)
-    rt_scanned_pids: set[int] = watcher.stop()
-    if watcher.available and rt_scanned_pids:
-        status(f"      [실시간] 스캔된 PID {len(rt_scanned_pids)}개 — 결과 취합 중...")
-
-    with _rt_lock:
-        rt_snapshot = list(_rt_results)
-
-    # 같은 PID 가 재스캔으로 여러 결과를 낼 수 있으므로 PID별 "가장 의심스러운"
-    # 결과 하나만 채택한다 (에러<정상, suspicious·인젝션 카운트 큰 것 우선).
-    _rt_best: dict = {}
-    for _pid, _raw in rt_snapshot:
-        _pr = parse_pesieve(_raw)
-        _prev = _rt_best.get(_pr.pid)
-        if _prev is None or _pesieve_rank(_pr) > _pesieve_rank(_prev):
-            _rt_best[_pr.pid] = _pr
-
-    rt_suspicious = 0
-    for pr in _rt_best.values():
-        result.pe_sieve_results.append(pr)
-        if pr.suspicious > 0:
-            rt_suspicious += 1
-            inj_parts = []
-            if pr.implanted_pe:
-                inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
-            if pr.implanted_shc:
-                inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
-            inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
-            status(f"      [실시간] PID {pr.pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
-
-    if watcher.available:
-        status(f"      [실시간] 완료: 의심 {rt_suspicious}개 PID"
-               + (" 🚨" if rt_suspicious else " ✅"))
-
-    # ── 중간 프로세스 스냅샷 → 아직 살아있는 신규 PID 보완 스캔
-    # 실시간 감시에서 놓친 PID(감시 시작 전 생성됐거나 스캔 실패)를 추가 포착
-    proc_mid  = take_process_snapshot()
-    mid_diff  = diff_process_snapshots(proc_before, proc_mid)
-    # 이미 실시간 스캔된 PID는 제외 (중복 방지)
-    already_scanned = rt_scanned_pids | {r.pid for r in result.pe_sieve_results}
-    scan_pids: list = [
-        p.pid for p in mid_diff.get("new_processes", [])
-        if p.pid not in already_scanned
-    ]
-    if result.sample_pid and result.sample_pid not in already_scanned:
-        scan_pids.insert(0, result.sample_pid)
-    if scan_pids:
-        status(f"      [보완] 추가 스캔 대상 PID: {scan_pids}")
-
-    # pe-sieve / hollows-hunter 스캔 (프로세스 종료 전 — 가능한 많은 PID가 살아있을 때)
-    if hh_scanner.available:
-        status("[분석] hollows-hunter 전체 프로세스 스캔...")
-        raw = hh_scanner.scan_all(dump_mode=3, shellcode=1, hooks=True)
-        result.hh_result = parse_hollows_hunter(raw)
-        if result.hh_result.error:
-            status(f"      [hollows-hunter] {result.hh_result.error}")
-            hh_out = (raw.get("stdout") or "").strip()
-            hh_err = (raw.get("stderr") or "").strip()
-            if hh_out:
-                status(f"        [hh stdout] {hh_out[:200]}")
-            elif hh_err:
-                status(f"        [hh stderr] {hh_err[:200]}")
-        else:
-            # total_scanned=0 은 JSON 키 불일치 가능성 — 실제 키 목록을 진단용으로 출력
-            if result.hh_result.total_scanned == 0 and not result.hh_result.error:
-                hh_keys = [k for k in raw if not k.startswith("_") and k != "dump_dir"]
-                status(f"      [hollows-hunter 진단] JSON 최상위 키: {hh_keys}")
-            susp_cnt = len(result.hh_result.suspicious_processes)
-            shc_cnt  = sum(r.implanted_shc for r in result.hh_result.process_results)
-            status(f"      의심 프로세스: {susp_cnt}개  쉘코드 영역: {shc_cnt}개"
-                   + (" 🚨" if shc_cnt else " ✅"))
-
-    if ps_scanner.available and scan_pids:
-        # hollows-hunter 실행 후 일부 PID가 이미 종료됐을 수 있으므로 생존 여부 확인
-        alive_pids = [p for p in scan_pids if _pid_alive(p)]
-        dead_pids  = [p for p in scan_pids if p not in alive_pids]
-        if dead_pids:
-            status(f"      [알림] 이미 종료된 PID (스캔 생략): {dead_pids}")
-        status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(alive_pids)}개 PID)...")
-        _ps_workers = min(3, len(alive_pids)) if alive_pids else 1
-        with ThreadPoolExecutor(max_workers=_ps_workers) as _ps_pool:
-            _ps_futures = {
-                _ps_pool.submit(ps_scanner.scan_pid, pid, dump_mode=3, shellcode=1): pid
-                for pid in alive_pids
-            }
-            for _fut in as_completed(_ps_futures):
-                pid = _ps_futures[_fut]
-                try:
-                    raw = _fut.result()
-                except Exception as _e:
-                    status(f"      PID {pid}: 스캔 오류 {_e}")
-                    continue
-                pr  = parse_pesieve(raw)
-                result.pe_sieve_results.append(pr)
-                if pr.error:
-                    status(f"      PID {pid}: {pr.error[:80]}")
-                    raw_out = (raw.get("stdout") or "").strip()
-                    raw_err = (raw.get("stderr") or "").strip()
-                    if raw_out:
-                        status(f"        [pe-sieve stdout] {raw_out[:200]}")
-                    elif raw_err:
-                        status(f"        [pe-sieve stderr] {raw_err[:200]}")
-                elif pr.suspicious > 0:
-                    inj_parts = []
-                    if pr.implanted_pe:
-                        inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
-                    if pr.implanted_shc:
-                        inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
-                    inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
-                    status(f"      PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
-        susp_sum = sum(1 for r in result.pe_sieve_results if r.suspicious > 0)
-        pe_inj   = sum(r.implanted_pe  for r in result.pe_sieve_results if not r.error)
-        shc_sum  = sum(r.implanted_shc for r in result.pe_sieve_results if not r.error)
-        dead_note = f"  (종료된 PID {len(dead_pids)}개 생략)" if dead_pids else ""
-        status(f"      pe-sieve 완료: 의심 {susp_sum}개 PID"
-               + (f"  PE인젝션 {pe_inj}개" if pe_inj else "")
-               + (f"  쉘코드 {shc_sum}개" if shc_sum else "")
-               + dead_note
-               + (" 🚨" if susp_sum else " ✅"))
-    elif not hh_scanner.available:
-        status("      [알림] pe-sieve / hollows-hunter 없음 — 메모리 스캔 생략")
-
-    # 샘플 강제 종료
-    if sample_proc and sample_proc.poll() is None:
-        try:
-            sample_proc.terminate()
-            sample_proc.wait(timeout=5)
-        except Exception:
-            try:
-                sample_proc.kill()
-            except Exception:
-                pass
-
-    # ProcMon 중지 + CSV 변환
-    if dns_trace.active:
-        try:
-            dns_trace.stop()
-        except (OSError, subprocess.SubprocessError) as exc:
-            result.errors.append(f"DNS-Client ETW 종료 실패: {exc}")
-
-    if result.tools_used["procmon"]:
-        if not pm.stop():
-            reason = pm.export_error or pm.last_error or "원인 확인 불가"
-            result.errors.append(f"ProcMon 종료 실패: {reason}")
-            status(f"      [ProcMon] 종료 실패: {reason}")
-        if pm.pml_path.is_file() and pm.pml_path.stat().st_size > 0:
-            status("      ProcMon 로그 변환 중...")
-            if not pm.export_csv():
+        if result.tools_used["procmon"]:
+            ok = pm.start()
+            if not ok:
                 reason = pm.export_error or pm.last_error or "원인 확인 불가"
-                result.errors.append(f"ProcMon CSV 변환 실패: {reason}")
-                status(f"      [ProcMon] CSV 변환 실패: {reason}")
+                result.errors.append(f"ProcMon 시작 실패: {reason}")
+                status(f"      [ProcMon] 시작 실패: {reason}")
+                result.tools_used["procmon"] = False
+
+        if result.tools_used["tshark"] and not config.use_fakenet:
+            ok = ts.start()
+            if not ok:
+                result.errors.append("tshark 시작 실패")
+                result.tools_used["tshark"] = False
+
+        # FakeNet-NG 시작 (tshark 대신 사용 — DNS 리다이렉트 + 프로토콜 가로채기)
+        if fakenet and result.tools_used["fakenet"]:
+            ok = fakenet.start()
+            if not ok:
+                result.errors.append("FakeNet-NG 시작 실패")
+                result.tools_used["fakenet"] = False
+            else:
+                status("      FakeNet-NG 실행 중 (DNS 리다이렉션 + 프로토콜 인터셉트)")
+
+        if config.use_fakenet and not result.tools_used["fakenet"] and result.tools_used["tshark"]:
+            result.tools_used["tshark"] = ts.start()
+            if not result.tools_used["tshark"]:
+                result.errors.append("FakeNet 대체 tshark 시작 실패")
+
+        ph_proc = None
+        if result.tools_used["process_hacker"]:
+            ph_proc = launch_process_hacker(ph_path)
+            if ph_proc is None:
+                result.tools_used["process_hacker"] = False
+
+        # ── 3. 샘플 실행 (파일 지정 시에만) ─────────────────────────────
+        # 확장자별 실행 방법 분기:
+        #   Office 문서 / 스크립트 / PDF → os.startfile (ShellExecute, 연관 앱으로 열기)
+        #   실행 파일 (.exe / .dll 등)   → subprocess.Popen (직접 실행, PID 추적 가능)
+        from core.sample_types import SHELL_EXEC_SUFFIXES as _SHELL_EXEC_SUFFIXES
+
+        from core.dns_trace import DnsTrace
+        dns_trace = DnsTrace(config.output_dir)
+        if config.sample_path and not config.external_pcap:
+            try:
+                result.tools_used["dns_etw"] = dns_trace.start()
+            except (OSError, subprocess.SubprocessError):
+                result.tools_used["dns_etw"] = False
+        sample_proc = None
+        if config.sample_path:
+            status(f"[3/6] 샘플 실행: {config.sample_path.name}")
+            ext = config.sample_path.suffix.lower()
+            try:
+                if ext in _SHELL_EXEC_SUFFIXES:
+                    # Office/스크립트/PDF 등 — 연관 앱(Word, wscript 등)으로 ShellExecute
+                    # 기존 인스턴스가 살아있으면 DDE 핸드오프로 새 PID 가 즉시 종료됨.
+                    # → startfile 전에 호스트 앱을 종료해 추적 가능한 새 PID 를 생성.
+                    _OFFICE_HOSTS: list[tuple[frozenset, str, list[str]]] = [
+                        (frozenset({".doc", ".docx", ".docm", ".dot", ".dotm", ".rtf"}),
+                         "기존 Word 인스턴스", ["winword.exe"]),
+                        (frozenset({".xls", ".xlsx", ".xlsm", ".xlt", ".xltm"}),
+                         "기존 Excel 인스턴스", ["excel.exe"]),
+                        (frozenset({".ppt", ".pptx", ".pptm", ".pot", ".potm"}),
+                         "기존 PowerPoint 인스턴스", ["powerpnt.exe"]),
+                    ]
+                    for _exts, _label, _exes in _OFFICE_HOSTS:
+                        if ext in _exts:
+                            _kill_analysis_tool(None, exe_names=_exes, status=status, label=_label)
+                            break
+                    import os as _os
+                    _os.startfile(str(config.sample_path))
+                    result.sample_pid = None   # 호스트 앱 PID는 procmon/process_diff 로 추적
+                    status(f"      ShellExecute 실행 ({ext}) — 호스트 앱 PID는 procmon이 추적")
+                else:
+                    _sample_env = tls_keylogger.get_env() if tls_keylogger else None
+                    sample_proc = subprocess.Popen(
+                        [str(config.sample_path)],
+                        cwd=str(config.sample_path.parent),
+                        env=_sample_env,
+                    )
+                    result.sample_pid = sample_proc.pid
+                    result.all_pids.add(sample_proc.pid)
+                    result.lineage_pids.add(sample_proc.pid)
+                    _klog_note = f" + SSLKEYLOGFILE 주입" if tls_keylogger else ""
+                    status(f"      PID: {sample_proc.pid}{_klog_note}")
+            except Exception as e:
+                result.errors.append(f"샘플 실행 실패: {e}")
+                status(f"[오류] 샘플 실행 실패: {e}")
         else:
-            reason = f"캡처 파일이 없거나 비어 있습니다: {pm.pml_path}"
-            result.errors.append(f"ProcMon CSV 변환 생략: {reason}")
-            status(f"      [ProcMon] CSV 변환 생략: {reason}")
+            status(f"[3/6] 전체 시스템 모니터링 모드 — 직접 프로그램을 실행하세요")
 
+        # ── 4. 모니터링 대기 ──────────────────────────────────────────────
+        status(f"[4/6] 모니터링 중... ({config.timeout}초)  Ctrl+C로 조기 종료 가능")
+        _netstat_snaps: list[list[tuple]] = []  # KeyboardInterrupt 전 참조 방지
 
-    # tshark 중지 (duration으로 자동 종료됐을 수 있음)
-    if result.tools_used["tshark"]:
-        ts.stop()
+        # ── 실시간 프로세스 감시 시작 (신규 PID → 즉시 pe-sieve 스캔)
+        # proc_before에 없는 PID가 생성되면 1초 이내에 자동 스캔하여
+        # 단명 프로세스(loader, injector 등)도 포착할 수 있도록 함
+        _rt_results: list[tuple[int, dict]] = []
+        _rt_lock    = threading.Lock()
 
-    # Process Hacker / System Informer 종료
-    # ─ System Informer 는 UAC 자동 상승(self-elevate) 시 원래 Popen 핸들이
-    #   즉시 종료되고 실제 프로세스는 별도 PID 로 뜨므로 핸들만으로는 잡히지 않음.
-    #   1단계: Popen 핸들 시도, 2단계: psutil 이름 검색, 3단계: taskkill /F 폴백
-    _kill_analysis_tool(
-        ph_proc,
-        exe_names=["systeminformer.exe", "processhacker.exe"],
-        status=status,
-        label="System Informer / Process Hacker",
-    )
+        def _rt_callback(pid: int, raw: dict) -> None:
+            with _rt_lock:
+                _rt_results.append((pid, raw))
 
-    # ── 6. 사후 스냅샷 ────────────────────────────────────────────────
-    status("[6/6] 사후 스냅샷 수집 중...")
-    reg_after  = take_snapshot() if REG_AVAILABLE else {}
-    proc_after = take_process_snapshot()
+        from core.process_watcher import ProcessWatcher
+        watcher = ProcessWatcher(
+            initial_pids    = set(proc_before.keys()),
+            scanner         = ps_scanner,
+            on_result       = _rt_callback,
+            dump_mode       = 3,     # raw dump — PE + 쉘코드 모두 추출
+            poll_interval   = 1.0,
+            rescan_interval = 5.0,   # injection 신호 검사 + 신규 프로세스 재스캔 주기
+            max_rescans     = 3,     # 언패킹/지연 인젝션 대응 (clean 프로세스 최대 재스캔)
+        )
+        watcher.start()
+        if watcher.available:
+            _mode_label = (
+                "WMI ETW (즉시 감지)"
+                if watcher.detection_mode == "wmi_etw"
+                else "psutil 폴링 (1초 간격)"
+            )
+            status(f"      [실시간] 신규 프로세스 감시 시작 — {_mode_label}"
+                   f" + injection 신호/재스캔 (5초 주기)")
 
-    result.registry_diff     = diff_snapshots(reg_before, reg_after) if REG_AVAILABLE else {}
-    result.process_diff      = diff_process_snapshots(proc_before, proc_after)
-    result.proc_after_snapshot = proc_after   # 프로세스 트리 시각화용
+        elapsed = 0
+        interval = 5
+        sample_exited = False
+        _snap_tick = 0
+        from analysis.process_network_map import capture_netstat_snapshot as _ns_snap
+        try:
+            while elapsed < config.timeout:
+                if _stop_requested(config.output_dir):
+                    status("[중지 요청] 관찰을 종료하고 수집 결과를 정리합니다.")
+                    break
+                time.sleep(interval)
+                elapsed += interval
+                _snap_tick += 1
+                # 10초마다 netstat 스냅샷 수집
+                if _snap_tick % 2 == 0:
+                    _snap = _ns_snap()
+                    if _snap:
+                        _netstat_snaps.append(_snap)
+                # 샘플 종료 감지 — 자식 프로세스 활동을 위해 타임아웃까지 계속 모니터링
+                if sample_proc and not sample_exited and sample_proc.poll() is not None:
+                    sample_exited = True
+                    status(f"      샘플 종료 감지 ({elapsed}s) — 자식 프로세스 모니터링 계속...")
+                remaining = config.timeout - elapsed
+                status(f"      {elapsed}s 경과 / 잔여 {remaining}s...")
+        except KeyboardInterrupt:
+            status(f"\n[!] Ctrl+C 감지 — {elapsed}s 시점 데이터로 분석을 마무리합니다...")
+        # 타임아웃 종료 직후 최종 스냅샷 (연결이 살아있는 마지막 순간 포착)
+        try:
+            _final_snap = _ns_snap()
+            if _final_snap:
+                _netstat_snaps.append(_final_snap)
+        except Exception:
+            pass
 
-    # ── proc_after 기반 추가 스캔 ─────────────────────────────────────
-    # 샘플 종료 후에도 살아있는 신규 프로세스 = 인젝션된 호스트 프로세스(RegSvcs.exe 등)
-    # 앞선 스캔에서 놓쳤거나 실시간 감지에서 오류가 난 경우를 보완
-    if ps_scanner.available:
-        already = {r.pid for r in result.pe_sieve_results}
-        after_new = [
-            p.pid
-            for p in result.process_diff.get("new_processes", [])
-            if p.pid not in already and _pid_alive(p.pid)
+        # ── 5. 종료 ───────────────────────────────────────────────────────
+        status("[5/6] 모니터링 종료...")
+
+        # ── 실시간 감시 중지 + 결과 병합 ────────────────────────────────────
+        # watcher가 스캔한 PID 집합 확보 (중복 스캔 방지에 사용)
+        rt_scanned_pids: set[int] = watcher.stop()
+        if watcher.available and rt_scanned_pids:
+            status(f"      [실시간] 스캔된 PID {len(rt_scanned_pids)}개 — 결과 취합 중...")
+
+        with _rt_lock:
+            rt_snapshot = list(_rt_results)
+
+        # 같은 PID 가 재스캔으로 여러 결과를 낼 수 있으므로 PID별 "가장 의심스러운"
+        # 결과 하나만 채택한다 (에러<정상, suspicious·인젝션 카운트 큰 것 우선).
+        _rt_best: dict = {}
+        for _pid, _raw in rt_snapshot:
+            _pr = parse_pesieve(_raw)
+            _prev = _rt_best.get(_pr.pid)
+            if _prev is None or _pesieve_rank(_pr) > _pesieve_rank(_prev):
+                _rt_best[_pr.pid] = _pr
+
+        rt_suspicious = 0
+        for pr in _rt_best.values():
+            result.pe_sieve_results.append(pr)
+            if pr.suspicious > 0:
+                rt_suspicious += 1
+                inj_parts = []
+                if pr.implanted_pe:
+                    inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
+                if pr.implanted_shc:
+                    inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
+                inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
+                status(f"      [실시간] PID {pr.pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
+
+        if watcher.available:
+            status(f"      [실시간] 완료: 의심 {rt_suspicious}개 PID"
+                   + (" 🚨" if rt_suspicious else " ✅"))
+
+        # ── 중간 프로세스 스냅샷 → 아직 살아있는 신규 PID 보완 스캔
+        # 실시간 감시에서 놓친 PID(감시 시작 전 생성됐거나 스캔 실패)를 추가 포착
+        proc_mid  = take_process_snapshot()
+        mid_diff  = diff_process_snapshots(proc_before, proc_mid)
+        # 이미 실시간 스캔된 PID는 제외 (중복 방지)
+        already_scanned = rt_scanned_pids | {r.pid for r in result.pe_sieve_results}
+        scan_pids: list = [
+            p.pid for p in mid_diff.get("new_processes", [])
+            if p.pid not in already_scanned
         ]
-        if after_new:
-            status(f"[분석] pe-sieve 잔존 신규 프로세스 스캔 ({len(after_new)}개 PID)...")
-            _ps2_workers = min(3, len(after_new)) if after_new else 1
-            with ThreadPoolExecutor(max_workers=_ps2_workers) as _ps2_pool:
-                _ps2_futures = {
-                    _ps2_pool.submit(ps_scanner.scan_pid, pid, dump_mode=3, shellcode=1): pid
-                    for pid in after_new
+        if result.sample_pid and result.sample_pid not in already_scanned:
+            scan_pids.insert(0, result.sample_pid)
+        if scan_pids:
+            status(f"      [보완] 추가 스캔 대상 PID: {scan_pids}")
+
+        # pe-sieve / hollows-hunter 스캔 (프로세스 종료 전 — 가능한 많은 PID가 살아있을 때)
+        if hh_scanner.available:
+            status("[분석] hollows-hunter 전체 프로세스 스캔...")
+            raw = hh_scanner.scan_all(dump_mode=3, shellcode=1, hooks=True)
+            result.hh_result = parse_hollows_hunter(raw)
+            if result.hh_result.error:
+                result.errors.append(f"hollows-hunter: {result.hh_result.error}")
+                status(f"      [hollows-hunter] {result.hh_result.error}")
+                hh_out = (raw.get("stdout") or "").strip()
+                hh_err = (raw.get("stderr") or "").strip()
+                if hh_out:
+                    status(f"        [hh stdout] {hh_out[:200]}")
+                elif hh_err:
+                    status(f"        [hh stderr] {hh_err[:200]}")
+            else:
+                # total_scanned=0 은 JSON 키 불일치 가능성 — 실제 키 목록을 진단용으로 출력
+                if result.hh_result.total_scanned == 0 and not result.hh_result.error:
+                    hh_keys = [k for k in raw if not k.startswith("_") and k != "dump_dir"]
+                    status(f"      [hollows-hunter 진단] JSON 최상위 키: {hh_keys}")
+                susp_cnt = len(result.hh_result.suspicious_processes)
+                shc_cnt  = sum(r.implanted_shc for r in result.hh_result.process_results)
+                status(f"      의심 프로세스: {susp_cnt}개  쉘코드 영역: {shc_cnt}개"
+                       + (" 🚨" if shc_cnt else " ✅"))
+
+        if ps_scanner.available and scan_pids:
+            # hollows-hunter 실행 후 일부 PID가 이미 종료됐을 수 있으므로 생존 여부 확인
+            alive_pids = [p for p in scan_pids if _pid_alive(p)]
+            dead_pids  = [p for p in scan_pids if p not in alive_pids]
+            if dead_pids:
+                status(f"      [알림] 이미 종료된 PID (스캔 생략): {dead_pids}")
+            status(f"[분석] pe-sieve 신규 프로세스 스캔 ({len(alive_pids)}개 PID)...")
+            _ps_workers = min(3, len(alive_pids)) if alive_pids else 1
+            with ThreadPoolExecutor(max_workers=_ps_workers) as _ps_pool:
+                _ps_futures = {
+                    _ps_pool.submit(ps_scanner.scan_pid, pid, dump_mode=3, shellcode=1): pid
+                    for pid in alive_pids
                 }
-                for _fut2 in as_completed(_ps2_futures):
-                    pid = _ps2_futures[_fut2]
+                for _fut in as_completed(_ps_futures):
+                    pid = _ps_futures[_fut]
                     try:
-                        raw = _fut2.result()
+                        raw = _fut.result()
                     except Exception as _e:
+                        result.errors.append(f"pe-sieve PID {pid}: {_e}")
                         status(f"      PID {pid}: 스캔 오류 {_e}")
                         continue
                     pr  = parse_pesieve(raw)
                     result.pe_sieve_results.append(pr)
                     if pr.error:
+                        result.errors.append(f"pe-sieve PID {pid}: {pr.error}")
                         status(f"      PID {pid}: {pr.error[:80]}")
+                        raw_out = (raw.get("stdout") or "").strip()
+                        raw_err = (raw.get("stderr") or "").strip()
+                        if raw_out:
+                            status(f"        [pe-sieve stdout] {raw_out[:200]}")
+                        elif raw_err:
+                            status(f"        [pe-sieve stderr] {raw_err[:200]}")
                     elif pr.suspicious > 0:
                         inj_parts = []
                         if pr.implanted_pe:
@@ -964,794 +862,963 @@ def run_analysis(
                             inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
                         inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
                         status(f"      PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
-                    else:
-                        status(f"      PID {pid}: 이상 없음 ✅")
+            susp_sum = sum(1 for r in result.pe_sieve_results if r.suspicious > 0)
+            pe_inj   = sum(r.implanted_pe  for r in result.pe_sieve_results if not r.error)
+            shc_sum  = sum(r.implanted_shc for r in result.pe_sieve_results if not r.error)
+            dead_note = f"  (종료된 PID {len(dead_pids)}개 생략)" if dead_pids else ""
+            status(f"      pe-sieve 완료: 의심 {susp_sum}개 PID"
+                   + (f"  PE인젝션 {pe_inj}개" if pe_inj else "")
+                   + (f"  쉘코드 {shc_sum}개" if shc_sum else "")
+                   + dead_note
+                   + (" 🚨" if susp_sum else " ✅"))
+        elif not hh_scanner.available:
+            status("      [알림] pe-sieve / hollows-hunter 없음 — 메모리 스캔 생략")
 
-    # ── 조기 종료 프로세스 보완 ───────────────────────────────────────
-    # pe-sieve 결과는 메모리 탭(result.pe_sieve_results)에서 표시합니다.
-    # 프로세스 트리는 OS 스냅샷(psutil) 기반으로만 구성하므로
-    # pe-sieve 스캔 PID를 new_processes에 보완하지 않습니다.
-
-    # ── 7. 파싱 ─────────────────────────────────────────────────────
-    status("[분석] ProcMon CSV 파싱...")
-    if pm.csv_path.exists():
-        result.procmon_events = parse_csv(pm.csv_path)
-        # 자식 PID 추적 — 샘플 계보(lineage)를 별도로 보존한다.
-        # all_pids 는 아래에서 주입 탐지·실시간 감지 PID 로 확장되며 오탐이
-        # 섞일 수 있지만, lineage_pids 는 "샘플에서 실제로 뻗어나온 프로세스"
-        # 만 담아 관련도 등급(Tier 1) 판정의 기준이 된다.
-        # ShellExecute 모드(.js/.docx/.hta …)는 실행 시점에 PID 를 모른다.
-        # 명령줄에 샘플 경로가 있는 호스트(wscript/WINWORD/mshta …)를 찾아
-        # 샘플 PID 로 확정한다 — 못 찾으면 계보가 비어 등급이 전부 "의심"이 된다.
-        _shell_mode = result.sample_pid is None and bool(config.sample_path)
-        if _shell_mode:
-            try:
-                from parsers.procmon_csv import find_sample_host
-                _host = find_sample_host(result.procmon_events, str(config.sample_path))
-            except Exception:
-                _host = None
-            if _host:
-                result.sample_pid = _host.child_pid
-                result.all_pids.add(_host.child_pid)
-                status(f"      [ShellExecute] 샘플 호스트 확정: {_host.name} "
-                       f"(PID {_host.child_pid}) — 계보 추적 기준으로 사용")
+        early_dump = None
+        early_dump_time = 0.0
+        early_dump_alive = None
+        if config.use_memdump and not config.existing_dump and not _stop_requested(config.output_dir, optional=True):
+            from core.memory_forensics import acquire_memory
+            early_dump_time = time.time()
+            early_dump_alive = _pid_alive(result.sample_pid) if result.sample_pid else None
+            status("[메모리] 샘플 종료 전 덤프 보존 중...")
+            ok, _, error, path = acquire_memory(
+                config.output_dir / "memory.raw",
+                tool_path=Path(config.winpmem_path) if config.winpmem_path else find_winpmem(),
+                timeout=config.dump_timeout, on_status=status)
+            if ok:
+                early_dump = path
             else:
-                status("      [ShellExecute] 샘플 호스트 프로세스를 특정하지 못함 "
-                       "— 계보 등급 없이 신규 프로세스 전체를 추적합니다")
-        if result.sample_pid:
-            result.lineage_pids.add(result.sample_pid)
-            child_pids = pm_child_pids(result.procmon_events, result.sample_pid)
-            result.lineage_pids.update(child_pids)
-            result.all_pids.update(child_pids)
-        # HH / pe-sieve 가 탐지한 인젝션 대상 프로세스 PID 도 포커스에 포함
-        # (악성코드가 기존 프로세스에 쉘코드를 주입하면 그 PID 의 파일·레지스트리
-        #  이벤트가 focus_pids 에서 제외되어 탭에 아무것도 안 보이는 문제 방지)
-        #
-        # 단, 이 PID 들은 오탐 비중이 높다(정상 프로세스의 .NET JIT/ASLR 영역).
-        # all_pids 에는 넣어 이벤트를 수집하되 아래 BFS 시드로는 쓰지 않는다.
-        # 시드로 쓰면 dwm/explorer/svchost 오탐 하나가 그 자손 전체
-        # (Conhost·wevtutil 수십 개)를 신규 프로세스 목록에 끌어들인다.
-        _injected_pids: set[int] = set()
-        if result.hh_result and not result.hh_result.error:
-            for _hpr in result.hh_result.suspicious_processes:
-                if _hpr.implanted_shc > 0 or _hpr.implanted_pe > 0:
-                    if (_hpr.name or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
-                        continue          # 분석 도구 자기 탐지 제외
-                    _injected_pids.add(_hpr.pid)
-        for _psr in result.pe_sieve_results:
-            if not _psr.error and (_psr.implanted_shc > 0 or _psr.implanted_pe > 0):
-                if (getattr(_psr, "name", "") or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
-                    continue
-                _injected_pids.add(_psr.pid)
-        result.injected_pids.update(_injected_pids)
-        result.all_pids.update(_injected_pids)
-        # ProcessWatcher 가 실시간 감지한 PID 를 all_pids 에 추가.
-        # after-snapshot 이전에 종료된 단명 프로세스(PowerShell 로더, 인젝터 등)는
-        # process_diff["new_processes"] 에 포함되지 않으므로 여기서 보완.
-        if rt_scanned_pids:
-            result.all_pids.update(rt_scanned_pids)
-            status(f"      [실시간] 감지 PID {len(rt_scanned_pids)}개 추적 추가")
-        # ShellExecute (doc/xls/js 등) 모드: sample_pid = None 이므로
-        # 분석 중 새로 생성된 모든 프로세스 PID 를 추적 대상에 포함합니다.
-        # → 호스트 앱(WINWORD.EXE, wscript.exe 등)의 네트워크·파일 이벤트 누락 방지
-        # (호스트를 확정했더라도 WMI·서비스·예약작업 경유로 계보 밖에서 뜨는
-        #  프로세스가 있으므로 추적 대상에는 계속 포함한다. 등급은 계보로 가린다.)
-        if result.sample_pid is None or _shell_mode:
-            _new_proc_pids = {
+                result.errors.append(f"종료 전 메모리 덤프 실패: {error}")
+
+        # 샘플 강제 종료
+        if sample_proc and sample_proc.poll() is None:
+            try:
+                sample_proc.terminate()
+                sample_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    sample_proc.kill()
+                except Exception:
+                    pass
+
+        # ProcMon 중지 + CSV 변환
+        if dns_trace.active:
+            try:
+                dns_trace.stop()
+            except (OSError, subprocess.SubprocessError) as exc:
+                result.errors.append(f"DNS-Client ETW 종료 실패: {exc}")
+
+        if result.tools_used["procmon"]:
+            if not pm.stop():
+                reason = pm.export_error or pm.last_error or "원인 확인 불가"
+                result.errors.append(f"ProcMon 종료 실패: {reason}")
+                status(f"      [ProcMon] 종료 실패: {reason}")
+            if pm.pml_path.is_file() and pm.pml_path.stat().st_size > 0:
+                status("      ProcMon 로그 변환 중...")
+                if not pm.export_csv():
+                    reason = pm.export_error or pm.last_error or "원인 확인 불가"
+                    result.errors.append(f"ProcMon CSV 변환 실패: {reason}")
+                    status(f"      [ProcMon] CSV 변환 실패: {reason}")
+            else:
+                reason = f"캡처 파일이 없거나 비어 있습니다: {pm.pml_path}"
+                result.errors.append(f"ProcMon CSV 변환 생략: {reason}")
+                status(f"      [ProcMon] CSV 변환 생략: {reason}")
+
+
+        # tshark 중지 (duration으로 자동 종료됐을 수 있음)
+        if result.tools_used["tshark"]:
+            ts.stop()
+
+        # Process Hacker / System Informer 종료
+        # ─ System Informer 는 UAC 자동 상승(self-elevate) 시 원래 Popen 핸들이
+        #   즉시 종료되고 실제 프로세스는 별도 PID 로 뜨므로 핸들만으로는 잡히지 않음.
+        #   1단계: Popen 핸들 시도, 2단계: psutil 이름 검색, 3단계: taskkill /F 폴백
+        _kill_analysis_tool(
+            ph_proc,
+            exe_names=["systeminformer.exe", "processhacker.exe"],
+            status=status,
+            label="System Informer / Process Hacker",
+        )
+
+        # ── 6. 사후 스냅샷 ────────────────────────────────────────────────
+        status("[6/6] 사후 스냅샷 수집 중...")
+        reg_after  = take_snapshot() if REG_AVAILABLE else {}
+        proc_after = take_process_snapshot()
+
+        result.registry_diff     = diff_snapshots(reg_before, reg_after) if REG_AVAILABLE else {}
+        result.process_diff      = diff_process_snapshots(proc_before, proc_after)
+        result.proc_after_snapshot = proc_after   # 프로세스 트리 시각화용
+
+        # ── proc_after 기반 추가 스캔 ─────────────────────────────────────
+        # 샘플 종료 후에도 살아있는 신규 프로세스 = 인젝션된 호스트 프로세스(RegSvcs.exe 등)
+        # 앞선 스캔에서 놓쳤거나 실시간 감지에서 오류가 난 경우를 보완
+        if ps_scanner.available:
+            already = {r.pid for r in result.pe_sieve_results}
+            after_new = [
+                p.pid
+                for p in result.process_diff.get("new_processes", [])
+                if p.pid not in already and _pid_alive(p.pid)
+            ]
+            if after_new:
+                status(f"[분석] pe-sieve 잔존 신규 프로세스 스캔 ({len(after_new)}개 PID)...")
+                _ps2_workers = min(3, len(after_new)) if after_new else 1
+                with ThreadPoolExecutor(max_workers=_ps2_workers) as _ps2_pool:
+                    _ps2_futures = {
+                        _ps2_pool.submit(ps_scanner.scan_pid, pid, dump_mode=3, shellcode=1): pid
+                        for pid in after_new
+                    }
+                    for _fut2 in as_completed(_ps2_futures):
+                        pid = _ps2_futures[_fut2]
+                        try:
+                            raw = _fut2.result()
+                        except Exception as _e:
+                            status(f"      PID {pid}: 스캔 오류 {_e}")
+                            continue
+                        pr  = parse_pesieve(raw)
+                        result.pe_sieve_results.append(pr)
+                        if pr.error:
+                            status(f"      PID {pid}: {pr.error[:80]}")
+                        elif pr.suspicious > 0:
+                            inj_parts = []
+                            if pr.implanted_pe:
+                                inj_parts.append(f"PE인젝션 {pr.implanted_pe}개")
+                            if pr.implanted_shc:
+                                inj_parts.append(f"쉘코드 {pr.implanted_shc}개")
+                            inj_str = "  ".join(inj_parts) if inj_parts else f"의심모듈 {pr.suspicious}개"
+                            status(f"      PID {pid}: 의심 {pr.suspicious}개  {inj_str} 🚨")
+                        else:
+                            status(f"      PID {pid}: 이상 없음 ✅")
+
+        # ── 조기 종료 프로세스 보완 ───────────────────────────────────────
+        # pe-sieve 결과는 메모리 탭(result.pe_sieve_results)에서 표시합니다.
+        # 프로세스 트리는 OS 스냅샷(psutil) 기반으로만 구성하므로
+        # pe-sieve 스캔 PID를 new_processes에 보완하지 않습니다.
+
+        # ── 7. 파싱 ─────────────────────────────────────────────────────
+        status("[분석] ProcMon CSV 파싱...")
+        if pm.csv_path.exists():
+            result.procmon_events = parse_csv(pm.csv_path)
+            # 자식 PID 추적 — 샘플 계보(lineage)를 별도로 보존한다.
+            # all_pids 는 아래에서 주입 탐지·실시간 감지 PID 로 확장되며 오탐이
+            # 섞일 수 있지만, lineage_pids 는 "샘플에서 실제로 뻗어나온 프로세스"
+            # 만 담아 관련도 등급(Tier 1) 판정의 기준이 된다.
+            # ShellExecute 모드(.js/.docx/.hta …)는 실행 시점에 PID 를 모른다.
+            # 명령줄에 샘플 경로가 있는 호스트(wscript/WINWORD/mshta …)를 찾아
+            # 샘플 PID 로 확정한다 — 못 찾으면 계보가 비어 등급이 전부 "의심"이 된다.
+            _shell_mode = result.sample_pid is None and bool(config.sample_path)
+            if _shell_mode:
+                try:
+                    from parsers.procmon_csv import find_sample_host
+                    _host = find_sample_host(result.procmon_events, str(config.sample_path))
+                except Exception:
+                    _host = None
+                if _host:
+                    result.sample_pid = _host.child_pid
+                    result.all_pids.add(_host.child_pid)
+                    status(f"      [ShellExecute] 샘플 호스트 확정: {_host.name} "
+                           f"(PID {_host.child_pid}) — 계보 추적 기준으로 사용")
+                else:
+                    status("      [ShellExecute] 샘플 호스트 프로세스를 특정하지 못함 "
+                           "— 계보 등급 없이 신규 프로세스 전체를 추적합니다")
+            if result.sample_pid:
+                result.lineage_pids.add(result.sample_pid)
+                child_pids = pm_child_pids(result.procmon_events, result.sample_pid)
+                result.lineage_pids.update(child_pids)
+                result.all_pids.update(child_pids)
+            # HH / pe-sieve 가 탐지한 인젝션 대상 프로세스 PID 도 포커스에 포함
+            # (악성코드가 기존 프로세스에 쉘코드를 주입하면 그 PID 의 파일·레지스트리
+            #  이벤트가 focus_pids 에서 제외되어 탭에 아무것도 안 보이는 문제 방지)
+            #
+            # 단, 이 PID 들은 오탐 비중이 높다(정상 프로세스의 .NET JIT/ASLR 영역).
+            # all_pids 에는 넣어 이벤트를 수집하되 아래 BFS 시드로는 쓰지 않는다.
+            # 시드로 쓰면 dwm/explorer/svchost 오탐 하나가 그 자손 전체
+            # (Conhost·wevtutil 수십 개)를 신규 프로세스 목록에 끌어들인다.
+            _injected_pids: set[int] = set()
+            if result.hh_result and not result.hh_result.error:
+                for _hpr in result.hh_result.suspicious_processes:
+                    if _hpr.implanted_shc > 0 or _hpr.implanted_pe > 0:
+                        if (_hpr.name or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
+                            continue          # 분석 도구 자기 탐지 제외
+                        _injected_pids.add(_hpr.pid)
+            for _psr in result.pe_sieve_results:
+                if not _psr.error and (_psr.implanted_shc > 0 or _psr.implanted_pe > 0):
+                    if (getattr(_psr, "name", "") or "").lower() in _ANALYSIS_TOOL_PROC_NAMES:
+                        continue
+                    _injected_pids.add(_psr.pid)
+            result.injected_pids.update(_injected_pids)
+            result.all_pids.update(_injected_pids)
+            # ProcessWatcher 가 실시간 감지한 PID 를 all_pids 에 추가.
+            # after-snapshot 이전에 종료된 단명 프로세스(PowerShell 로더, 인젝터 등)는
+            # process_diff["new_processes"] 에 포함되지 않으므로 여기서 보완.
+            if watcher.new_pids:
+                result.all_pids.update(watcher.new_pids)
+                status(f"      [실시간] 신규 PID {len(watcher.new_pids)}개 추적 추가")
+            # ShellExecute (doc/xls/js 등) 모드: sample_pid = None 이므로
+            # 분석 중 새로 생성된 모든 프로세스 PID 를 추적 대상에 포함합니다.
+            # → 호스트 앱(WINWORD.EXE, wscript.exe 등)의 네트워크·파일 이벤트 누락 방지
+            # (호스트를 확정했더라도 WMI·서비스·예약작업 경유로 계보 밖에서 뜨는
+            #  프로세스가 있으므로 추적 대상에는 계속 포함한다. 등급은 계보로 가린다.)
+            if result.sample_pid is None or _shell_mode:
+                _new_proc_pids = {
+                    p.pid for p in result.process_diff.get("new_processes", [])
+                }
+                if _new_proc_pids:
+                    result.all_pids.update(_new_proc_pids)
+                    status(f"      [ShellExecute] 신규 프로세스 {len(_new_proc_pids)}개 PID 추적 추가")
+            # ── 단명 프로세스 보완 ────────────────────────────────────────
+            # 두 단계로 구성:
+            #
+            # [Step 1] all_pids 에 있지만 new_processes 에 없는 PID 보완
+            #   ProcessWatcher 또는 pe-sieve 가 탐지했으나 스냅샷 전에 종료된 프로세스
+            #   (DDE handoff 기존 WINWORD, 단발 PowerShell 등)
+            #   → ProcMon Process Create 이벤트에서 child_pid 로 등장하면 신규 프로세스로 확정
+            #
+            # [Step 2] BFS 로 새 자손 발굴
+            #   보완된 프로세스(Step 1 포함)의 자식 중 new_processes 에 없는 것 추가
+            #
+            # filter_events 호출 전에 실행해야 보완된 PID 의 이벤트도 포함됩니다.
+            from parsers.procmon_csv import get_child_proc_infos, ChildProcInfo
+            from core.process_tracker import ProcessSnapshot as _ProcSnap
+
+            _child_infos: list[ChildProcInfo] = get_child_proc_infos(result.procmon_events)
+            # child_pid → ChildProcInfo (Step 1 보완용)
+            _child_by_pid: dict[int, ChildProcInfo] = {
+                _ci.child_pid: _ci for _ci in _child_infos
+            }
+            # 부모 PID → 자식 목록 (Step 2 BFS 용)
+            _parent_idx: dict[int, list[ChildProcInfo]] = {}
+            for _ci in _child_infos:
+                _parent_idx.setdefault(_ci.parent_pid, []).append(_ci)
+
+            _new_proc_pids: set[int] = {
                 p.pid for p in result.process_diff.get("new_processes", [])
             }
-            if _new_proc_pids:
-                result.all_pids.update(_new_proc_pids)
-                status(f"      [ShellExecute] 신규 프로세스 {len(_new_proc_pids)}개 PID 추적 추가")
-        # ── 단명 프로세스 보완 ────────────────────────────────────────
-        # 두 단계로 구성:
-        #
-        # [Step 1] all_pids 에 있지만 new_processes 에 없는 PID 보완
-        #   ProcessWatcher 또는 pe-sieve 가 탐지했으나 스냅샷 전에 종료된 프로세스
-        #   (DDE handoff 기존 WINWORD, 단발 PowerShell 등)
-        #   → ProcMon Process Create 이벤트에서 child_pid 로 등장하면 신규 프로세스로 확정
-        #
-        # [Step 2] BFS 로 새 자손 발굴
-        #   보완된 프로세스(Step 1 포함)의 자식 중 new_processes 에 없는 것 추가
-        #
-        # filter_events 호출 전에 실행해야 보완된 PID 의 이벤트도 포함됩니다.
-        from parsers.procmon_csv import get_child_proc_infos, ChildProcInfo
-        from core.process_tracker import ProcessSnapshot as _ProcSnap
+            _added: int = 0
 
-        _child_infos: list[ChildProcInfo] = get_child_proc_infos(result.procmon_events)
-        # child_pid → ChildProcInfo (Step 1 보완용)
-        _child_by_pid: dict[int, ChildProcInfo] = {
-            _ci.child_pid: _ci for _ci in _child_infos
-        }
-        # 부모 PID → 자식 목록 (Step 2 BFS 용)
-        _parent_idx: dict[int, list[ChildProcInfo]] = {}
-        for _ci in _child_infos:
-            _parent_idx.setdefault(_ci.parent_pid, []).append(_ci)
+            def _add_proc(_ci: ChildProcInfo) -> None:
+                """합성 ProcessSnapshot을 new_processes / all_pids 에 추가."""
+                nonlocal _added
+                if _ci.name.lower() in _ANALYSIS_TOOL_PROC_NAMES:
+                    return  # 분석 도구 자신은 신규 프로세스 목록에서 제외
+                result.process_diff["new_processes"].append(_ProcSnap(
+                    pid         = _ci.child_pid,
+                    ppid        = _ci.parent_pid,
+                    name        = _ci.name,
+                    exe         = _ci.exe,
+                    cmdline     = _ci.cmdline,
+                    create_time = 0.0,
+                    note        = "단명 프로세스 (ProcMon Process Create 보완)",
+                ))
+                result.all_pids.add(_ci.child_pid)
+                _new_proc_pids.add(_ci.child_pid)
+                _added += 1
 
-        _new_proc_pids: set[int] = {
-            p.pid for p in result.process_diff.get("new_processes", [])
-        }
-        _added: int = 0
-
-        def _add_proc(_ci: ChildProcInfo) -> None:
-            """합성 ProcessSnapshot을 new_processes / all_pids 에 추가."""
-            nonlocal _added
-            if _ci.name.lower() in _ANALYSIS_TOOL_PROC_NAMES:
-                return  # 분석 도구 자신은 신규 프로세스 목록에서 제외
-            result.process_diff["new_processes"].append(_ProcSnap(
-                pid         = _ci.child_pid,
-                ppid        = _ci.parent_pid,
-                name        = _ci.name,
-                exe         = _ci.exe,
-                cmdline     = _ci.cmdline,
-                create_time = 0.0,
-                note        = "단명 프로세스 (ProcMon Process Create 보완)",
-            ))
-            result.all_pids.add(_ci.child_pid)
-            _new_proc_pids.add(_ci.child_pid)
-            _added += 1
-
-        # Step 1: all_pids 중 new_processes 에 없는 PID를 직접 보완
-        # ProcessWatcher 가 감지했으나 스냅샷 전에 종료된 단명 프로세스
-        # (ProcMon Process Create 이벤트에 child_pid 로 등장 = 분석 중 신규 생성 확정)
-        for _pid in list(result.all_pids):
-            if _pid in _new_proc_pids:
-                continue
-            if _pid in _child_by_pid:
-                _add_proc(_child_by_pid[_pid])
-
-        # Step 2: 샘플 계보에서 BFS로 추가 자손 발굴
-        # _visited 는 new_proc_pids 기준으로 초기화 (all_pids 를 넣으면 Step 1 이후
-        # 보완된 PID 를 BFS 가 다시 건너뛰는 문제가 생기므로 분리)
-        #
-        # 시드는 lineage_pids(샘플 계보)로 한정한다. all_pids 를 시드로 쓰면
-        # HH/pe-sieve 가 오탐한 정상 프로세스(explorer, svchost, dwm 등)의
-        # 자손 전체가 신규 프로세스 목록에 딸려 들어온다.
-        # 계보를 특정할 수 없는 ShellExecute 모드에서만 all_pids 로 폴백.
-        _visited: set[int] = set(_new_proc_pids)
-        _bfs_seed: set[int] = result.lineage_pids or result.all_pids
-        _queue: list[int]  = list(_bfs_seed)
-
-        while _queue:
-            _pid = _queue.pop()
-            for _ci in _parent_idx.get(_pid, []):
-                if _ci.child_pid in _visited:
+            # Step 1: all_pids 중 new_processes 에 없는 PID를 직접 보완
+            # ProcessWatcher 가 감지했으나 스냅샷 전에 종료된 단명 프로세스
+            # (ProcMon Process Create 이벤트에 child_pid 로 등장 = 분석 중 신규 생성 확정)
+            for _pid in list(result.all_pids):
+                if _pid in _new_proc_pids:
                     continue
-                _visited.add(_ci.child_pid)
-                _queue.append(_ci.child_pid)
-                # 시드가 샘플 계보이므로 BFS 로 발견한 자손도 계보에 속한다
-                if result.lineage_pids and _pid in result.lineage_pids:
-                    result.lineage_pids.add(_ci.child_pid)
-                    result.all_pids.add(_ci.child_pid)
-                if _ci.child_pid not in _new_proc_pids:
-                    _add_proc(_ci)
+                if _pid in _child_by_pid:
+                    _add_proc(_child_by_pid[_pid])
 
-        if _added:
-            status(f"      [ProcMon] 단명 프로세스 {_added}개 보완 (스냅샷 누락)")
+            # Step 2: 샘플 계보에서 BFS로 추가 자손 발굴
+            # _visited 는 new_proc_pids 기준으로 초기화 (all_pids 를 넣으면 Step 1 이후
+            # 보완된 PID 를 BFS 가 다시 건너뛰는 문제가 생기므로 분리)
+            #
+            # 시드는 lineage_pids(샘플 계보)로 한정한다. all_pids 를 시드로 쓰면
+            # HH/pe-sieve 가 오탐한 정상 프로세스(explorer, svchost, dwm 등)의
+            # 자손 전체가 신규 프로세스 목록에 딸려 들어온다.
+            # 계보를 특정할 수 없는 ShellExecute 모드에서만 all_pids 로 폴백.
+            _visited: set[int] = set(_new_proc_pids)
+            _bfs_seed: set[int] = result.lineage_pids or result.all_pids
+            _queue: list[int]  = list(_bfs_seed)
 
-        # ── 브라우저 서브프로세스 분류 ────────────────────────────────────
-        # proc_after 스냅샷으로 pid→name 역색인을 만들어 부모 이름을 조회한다.
-        # new_processes 자신도 포함해야 단명 프로세스의 부모 관계가 올바르게 반영된다.
-        _pid_to_name: dict[int, str] = {
-            pid: s.name for pid, s in proc_after.items()
-        }
-        for _p in result.process_diff.get("new_processes", []):
-            _pid_to_name[_p.pid] = _p.name
-        _infra_cnt = 0
-        for _p in result.process_diff.get("new_processes", []):
-            _p.category = classify_browser_subproc(_p, _pid_to_name)
-            if _p.category == "BROWSER_INFRA":
-                _infra_cnt += 1
-        if _infra_cnt:
-            status(f"      브라우저 인프라 서브프로세스 {_infra_cnt}개 분류 (리포트 기본 접힘)")
-
-        # ── focus 밖 악성 신호 프로세스 편입 ──────────────────────────────
-        # all_pids(샘플·자식·인젝션·실시간·단명 보완) 밖이라도 실제 악성 행위를
-        # 보인 프로세스를 focus 에 추가 — 미탐지 인젝션 대상·서비스 생성 프로세스
-        # 등의 파일·레지스트리 이벤트가 focus 필터에서 통째로 누락되는 것을 방지.
-        if result.all_pids:
-            _susp_pids = _find_suspicious_activity_pids(
-                result.procmon_events, result.all_pids
-            )
-            if _susp_pids:
-                result.all_pids.update(_susp_pids)
-                status(f"      [보완] 악성 신호 프로세스 {len(_susp_pids)}개 focus 편입 "
-                       f"(PID {sorted(_susp_pids)})")
-
-        # 포커스 PID 기반 필터 (단명 프로세스 보완 후 실행)
-        result.filtered_events = filter_events(
-            result.procmon_events,
-            focus_pids=result.all_pids if result.all_pids else None,
-        )
-        status(f"      이벤트 {len(result.procmon_events):,}개 → 필터 후 {len(result.filtered_events):,}개")
-
-    status("[분석] PCAP 파싱...")
-    from parsers.pcap_parser import SCAPY_AVAILABLE
-    if not SCAPY_AVAILABLE:
-        if ts.tshark_path:
-            status("      scapy 없음 → tshark 파서로 대체 분석")
-        else:
-            status("      [경고] scapy·tshark 모두 없음 — 네트워크 분석 불가 (pip install scapy)")
-
-    # 우선순위: 외부 PCAP(--pcap) > tshark 캡처 파일
-    pcap_target = None
-    if config.external_pcap and config.external_pcap.exists():
-        pcap_target = config.external_pcap
-        status(f"      외부 PCAP 사용: {config.external_pcap.name}  "
-               f"({config.external_pcap.stat().st_size:,} bytes)")
-    elif ts.pcap_path.exists():
-        pcap_target = ts.pcap_path
-        status(f"      캡처 파일: {ts.pcap_path.name}  "
-               f"({ts.pcap_path.stat().st_size:,} bytes)")
-
-    tshark_bin = str(ts.tshark_path) if ts.tshark_path else None
-    if pcap_target:
-        result.pcap_result = parse_pcap(pcap_target, tshark_path=tshark_bin)
-        pr = result.pcap_result
-        if pr.parse_error:
-            status(f"      [오류] {pr.parse_error}")
-            result.errors.append(f"PCAP 파싱 오류: {pr.parse_error}")
-        else:
-            ip_only = pr.packets_loaded - pr.packets_skipped
-            status(f"      패킷 {pr.packets_loaded:,}개 로드  "
-                   f"(IP/TCP/UDP {ip_only:,}개, 건너뜀 {pr.packets_skipped:,}개)")
-            status(f"      연결 {len(pr.connections)}개  "
-                   f"DNS {len(pr.dns_queries)}건  "
-                   f"TLS SNI {len(pr.tls_info)}건  "
-                   f"HTTP {len(pr.http_requests)}건")
-            if pr.beacon_candidates:
-                status(f"      [!] 비콘 의심 {len(pr.beacon_candidates)}개 탐지")
-            if pr.suspicious_domains:
-                status(f"      [!] 의심 도메인 {len(pr.suspicious_domains)}개 (DGA/터널링)")
-            # ── DNS ↔ 프로세스 귀속 ──────────────────────────────────
-            if pr.raw_dns_queries:
-                try:
-                    from parsers.dns_correlator import correlate_dns
-                    result.dns_attributed = correlate_dns(
-                        pr.raw_dns_queries, result.procmon_events,
-                    )
-                    _attr_n = sum(1 for q in result.dns_attributed if q.attributed)
-                    status(f"      DNS 귀속: {_attr_n}/{len(result.dns_attributed)}건 "
-                           f"프로세스 매핑 성공")
-                except Exception as _de:
-                    result.errors.append(f"DNS 귀속 실패: {_de}")
-    else:
-        from parsers.pcap_parser import PcapResult as _PR
-        result.pcap_result = _PR()
-        if not config.no_tshark:
-            status("      PCAP 파일 없음 (tshark 미실행 또는 캡처 실패)")
-
-    # ── TLS keylog 복호화 ─────────────────────────────────────────────
-    if tls_keylogger and tshark_bin and pcap_target:
-        result.tls_key_count = tls_keylogger.key_count()
-        if tls_keylogger.has_keys():
-            status(f"[TLS] SSLKEYLOGFILE 키 {result.tls_key_count}개 — PCAP 복호화 중...")
-            try:
-                result.decrypted_requests = tls_keylogger.decrypt_pcap(
-                    pcap_target, Path(tshark_bin)
-                )
-                if result.decrypted_requests:
-                    status(f"      복호화 성공: HTTP(S) 요청 {len(result.decrypted_requests)}개")
-                else:
-                    status("      복호화된 HTTP 요청 없음 (Schannel 기반 또는 커스텀 TLS 가능성)")
-            except Exception as _ke:
-                result.errors.append(f"TLS 복호화 실패: {_ke}")
-        else:
-            status(f"[TLS] {tls_keylogger.summary()}")
-
-    # ── FakeNet-NG 결과 수집 ──────────────────────────────────────────
-    if fakenet and result.tools_used.get("fakenet"):
-        status("[FakeNet] 결과 수집 중...")
-        _fn_result = fakenet.stop()
-        result.fakenet_result = fakenet_result_to_dict(_fn_result)
-        dns_cnt  = len(_fn_result.dns_queries)
-        http_cnt = len(_fn_result.http_requests)
-        tcp_cnt  = len(_fn_result.tcp_sessions)
-        status(f"      DNS {dns_cnt}건  HTTP(S) {http_cnt}건  TCP {tcp_cnt}건")
-        # FakeNet PCAP도 파싱 대상에 추가 (tshark 없이 캡처된 경우)
-        if _fn_result.pcap_path and not pcap_target:
-            try:
-                result.pcap_result = parse_pcap(_fn_result.pcap_path, tshark_path=tshark_bin)
-                status(f"      FakeNet PCAP 파싱 완료: {_fn_result.pcap_path.name}")
-            except Exception as _fe:
-                result.errors.append(f"FakeNet PCAP 파싱 실패: {_fe}")
-
-    # ── 7.5 의심 DLL 로드 기존 프로세스 pe-sieve 추가 스캔 ──────────────
-    # procmon_events 를 단일 패스로 순회해 인젝션 PID와 네트워크 맵을 동시 수집.
-    _precomp_inject_pids: set[int] = set()
-    _precomp_net_map: list = []
-    if result.procmon_events:
-        _already_pre = {r.pid for r in result.pe_sieve_results}
-        _precomp_inject_pids, _precomp_net_map = _scan_procmon_once(
-            result.procmon_events,
-            already_scanned=_already_pre,
-            sample_pids=result.all_pids,
-        )
-
-    if ps_scanner.available and _precomp_inject_pids:
-        _inject_pids = _precomp_inject_pids
-        _alive_inject  = [p for p in _inject_pids if _pid_alive(p)]
-        _dead_inject   = _inject_pids - set(_alive_inject)
-        if _inject_pids:
-            status(
-                f"[분석] 의심 DLL 로드 감지 — 기존 프로세스 {len(_inject_pids)}개 "
-                f"(생존 {len(_alive_inject)}개, 종료 {len(_dead_inject)}개) pe-sieve 추가 스캔..."
-            )
-            _ps3_workers = min(3, len(_alive_inject)) if _alive_inject else 1
-            with ThreadPoolExecutor(max_workers=_ps3_workers) as _ps3_pool:
-                _ps3_futures = {
-                    _ps3_pool.submit(
-                        ps_scanner.scan_pid, _pid, dump_mode=3, shellcode=1
-                    ): _pid
-                    for _pid in _alive_inject
-                }
-                for _fut3 in as_completed(_ps3_futures):
-                    _pid = _ps3_futures[_fut3]
-                    try:
-                        _raw = _fut3.result()
-                    except Exception as _e:
-                        status(f"      PID {_pid}: 스캔 오류 {_e}")
+            while _queue:
+                _pid = _queue.pop()
+                for _ci in _parent_idx.get(_pid, []):
+                    if _ci.child_pid in _visited:
                         continue
-                    _pr = parse_pesieve(_raw)
-                    result.pe_sieve_results.append(_pr)
-                    if _pr.error:
-                        status(f"      PID {_pid}: {_pr.error[:80]}")
-                    elif _pr.suspicious > 0:
-                        _inj_parts = []
-                        if _pr.implanted_pe:
-                            _inj_parts.append(f"PE인젝션 {_pr.implanted_pe}개")
-                        if _pr.implanted_shc:
-                            _inj_parts.append(f"쉘코드 {_pr.implanted_shc}개")
-                        _inj_str = "  ".join(_inj_parts) if _inj_parts else f"의심모듈 {_pr.suspicious}개"
-                        status(f"      PID {_pid}: 의심 {_pr.suspicious}개  {_inj_str} 🚨")
-                    else:
-                        status(f"      PID {_pid}: 이상 없음 ✅")
-            if _dead_inject:
-                status(f"      [알림] 종료된 PID (스캔 불가): {sorted(_dead_inject)}")
-        # else: 의심 DLL 로드 없음 — 상태 로그 불필요
+                    _visited.add(_ci.child_pid)
+                    _queue.append(_ci.child_pid)
+                    # 시드가 샘플 계보이므로 BFS 로 발견한 자손도 계보에 속한다
+                    if result.lineage_pids and _pid in result.lineage_pids:
+                        result.lineage_pids.add(_ci.child_pid)
+                        result.all_pids.add(_ci.child_pid)
+                    if _ci.child_pid not in _new_proc_pids:
+                        _add_proc(_ci)
 
-    # step 7.5 에서 새로 추가된 pe-sieve 결과(DLL 인젝션 대상 기존 프로세스)를
-    # all_pids 에 반영. filter_events 이후에 발견된 PID 이므로 filtered_events 에는
-    # 최신 PID 목록으로 아래에서 이벤트 필터를 재적용한다.
-    _injection_pids: set[int] = set()
-    for _psr2 in result.pe_sieve_results:
-        if not _psr2.error and (_psr2.implanted_shc > 0 or _psr2.implanted_pe > 0):
-            result.all_pids.add(_psr2.pid)
-            _injection_pids.add(_psr2.pid)
+            if _added:
+                status(f"      [ProcMon] 단명 프로세스 {_added}개 보완 (스냅샷 누락)")
 
-    # injection 대상 프로세스가 드롭한 파일 추출을 위해
-    # procmon_events 에서 해당 PID 이벤트만 별도 수집 (filter_events 미적용)
-    _injection_events: list = []
-    if _injection_pids and result.procmon_events:
-        _injection_events = [
-            ev for ev in result.procmon_events
-            if ev.pid in _injection_pids
-        ]
+            # ── 브라우저 서브프로세스 분류 ────────────────────────────────────
+            # proc_after 스냅샷으로 pid→name 역색인을 만들어 부모 이름을 조회한다.
+            # new_processes 자신도 포함해야 단명 프로세스의 부모 관계가 올바르게 반영된다.
+            _pid_to_name: dict[int, str] = {
+                pid: s.name for pid, s in proc_after.items()
+            }
+            for _p in result.process_diff.get("new_processes", []):
+                _pid_to_name[_p.pid] = _p.name
+            _infra_cnt = 0
+            for _p in result.process_diff.get("new_processes", []):
+                _p.category = classify_browser_subproc(_p, _pid_to_name)
+                if _p.category == "BROWSER_INFRA":
+                    _infra_cnt += 1
+            if _infra_cnt:
+                status(f"      브라우저 인프라 서브프로세스 {_infra_cnt}개 분류 (리포트 기본 접힘)")
 
-    from analysis.network_scope import sample_network_view, refresh_tracked_events
-    refresh_tracked_events(result)
-    result.analysis_pcap = result.pcap_result
-    if config.sample_path is not None:
-        result.analysis_pcap = sample_network_view(
-            result.pcap_result, result.procmon_events, result.all_pids,
-        )
-        status("      샘플 네트워크 분류: 프로세스 귀속이 확인된 연결만 사용 (전체 관찰은 네트워크 탭)")
+            # ── focus 밖 악성 신호 프로세스 편입 ──────────────────────────────
+            # all_pids(샘플·자식·인젝션·실시간·단명 보완) 밖이라도 실제 악성 행위를
+            # 보인 프로세스를 focus 에 추가 — 미탐지 인젝션 대상·서비스 생성 프로세스
+            # 등의 파일·레지스트리 이벤트가 focus 필터에서 통째로 누락되는 것을 방지.
+            if result.all_pids:
+                _susp_pids = _find_suspicious_activity_pids(
+                    result.procmon_events, result.all_pids
+                )
+                if _susp_pids:
+                    result.all_pids.update(_susp_pids)
+                    status(f"      [보완] 악성 신호 프로세스 {len(_susp_pids)}개 focus 편입 "
+                           f"(PID {sorted(_susp_pids)})")
 
-    if result.tools_used.get("dns_etw") and not dns_trace.active:
-        try:
-            names = {p.pid: p.name for p in result.process_diff.get("new_processes", [])}
-            result.dns_attributed.extend(dns_trace.queries(names))
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            result.errors.append(f"DNS-Client ETW 읽기 실패: {exc}")
-
-    # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
-    status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
-    result.behavior_report = classify_behaviors(
-        result.filtered_events,
-        result.analysis_pcap,
-        result.registry_diff,
-        result.process_diff,
-        hh_result=result.hh_result,
-        pe_sieve_results=result.pe_sieve_results,
-        lineage_pids=result.lineage_pids,
-    )
-    # 분류기 예외(카테고리 통째 누락)를 조용히 넘기지 않고 표면화
-    for _cerr in getattr(result.behavior_report, "classify_errors", []):
-        result.errors.append(_cerr)
-        status(f"      [경고] {_cerr}")
-
-    result.ioc_report = extract_iocs(
-        result.filtered_events,
-        result.analysis_pcap,
-        result.registry_diff,
-        result.process_diff,
-        injection_events=_injection_events or None,
-    )
-
-    # ── CAPA 정적 분석 (선택적) ──────────────────────────────────────
-    from core.config_loader import load_config as _load_cfg
-    _cfg = _load_cfg()
-
-    _capa_cfg = _cfg.get("capa", {})
-    _PE_EXTS  = frozenset({".exe", ".dll", ".sys", ".scr", ".drv", ".ocx", ".cpl"})
-    if not _capa_cfg.get("enabled", True):
-        result.tools_used["capa"] = "비활성 (config.json > capa.enabled: false)"
-    elif not config.sample_path:
-        result.tools_used["capa"] = "샘플 없음"
-    elif config.sample_path.suffix.lower() not in _PE_EXTS:
-        _ext = config.sample_path.suffix or "(확장자 없음)"
-        result.tools_used["capa"] = f"비PE 샘플 건너뜀 ({_ext})"
-        status(f"[분석] CAPA: 비PE 샘플({_ext}) — 정적 분석 건너뜀")
-    else:
-        _capa_exe     = _capa_cfg.get("path", "capa.exe")
-        _capa_timeout = int(_capa_cfg.get("timeout", 120))
-        status(f"[분석] CAPA 정적 분석 중... (최대 {_capa_timeout}초, Ctrl+C로 건너뜀)")
-        try:
-            from analysis.capa_analyzer import run_capa, find_capa as _find_capa
-            if not (_find_capa() or __import__("shutil").which(_capa_exe)):
-                result.tools_used["capa"] = f"미설치 (경로: {_capa_exe})"
-                status(f"      CAPA: 실행 파일 미발견 ({_capa_exe}) — config.json > capa.path 확인")
-            else:
-                _capa_techs = run_capa(config.sample_path, _capa_exe, _capa_timeout)
-                if _capa_techs:
-                    _merge_external_techniques(result.behavior_report, _capa_techs)
-                    _capa_new = sum(1 for t in result.behavior_report.techniques
-                                    if "CAPA" in (t.sources or []))
-                    result.tools_used["capa"] = f"{len(_capa_techs)}건 기여"
-                    status(f"      CAPA 완료: 기법 {len(_capa_techs)}개 탐지  "
-                           f"(누적 {_capa_new}개)")
-                else:
-                    result.tools_used["capa"] = "결과 없음"
-                    status("      CAPA: 탐지 없음 / 실행 불가 (config.json > capa.path 확인)")
-        except KeyboardInterrupt:
-            result.tools_used["capa"] = "건너뜀 (Ctrl+C)"
-            status("      CAPA 건너뜀 (Ctrl+C)")
-        except Exception as _e:
-            result.tools_used["capa"] = f"오류: {_e}"
-            status(f"      CAPA 오류: {_e}")
-
-    # ── VirusTotal API 쿼리 (선택적) ─────────────────────────────────
-    _vt_cfg = _cfg.get("virustotal", {})
-    if not _vt_cfg.get("enabled"):
-        result.tools_used["virustotal"] = "비활성 (config.json > virustotal.enabled: true 필요)"
-    elif not _vt_cfg.get("api_key", ""):
-        result.tools_used["virustotal"] = "API 키 없음 (config.json > virustotal.api_key 설정 필요)"
-    else:
-        _vt_key     = _vt_cfg["api_key"]
-        _vt_timeout = int(_vt_cfg.get("timeout", 20))
-        _sha256 = ""
-        if config.sample_path:
-            try:
-                import hashlib as _hl
-                _h = _hl.sha256()
-                with open(config.sample_path, "rb") as _f:
-                    for _chunk in iter(lambda: _f.read(65536), b""):
-                        _h.update(_chunk)
-                _sha256 = _h.hexdigest()
-            except Exception:
-                pass
-
-        if _sha256:
-            status(f"[분석] VirusTotal 쿼리 중... ({_sha256[:16]}…)")
-            try:
-                from analysis.vt_analyzer import query_vt
-                _vt_techs = query_vt(_sha256, _vt_key, _vt_timeout)
-                if _vt_techs:
-                    _merge_external_techniques(result.behavior_report, _vt_techs)
-                    _vt_new = sum(1 for t in result.behavior_report.techniques
-                                  if "VirusTotal" in (t.sources or []))
-                    result.tools_used["virustotal"] = f"{len(_vt_techs)}건 기여"
-                    status(f"      VT 완료: 기법 {len(_vt_techs)}개 탐지  "
-                           f"(누적 {_vt_new}개)")
-                else:
-                    result.tools_used["virustotal"] = "결과 없음 (미등록 샘플)"
-                    status("      VT: 탐지 없음 (미등록 샘플이거나 API 오류)")
-            except Exception as _e:
-                result.tools_used["virustotal"] = f"오류: {_e}"
-                status(f"      VT 오류: {_e}")
-        else:
-            result.tools_used["virustotal"] = "SHA256 계산 실패"
-            status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
-
-    status("[분석] 프로세스↔네트워크 연결 매핑...")
-    # _scan_procmon_once 에서 이미 단일 패스로 수집한 결과를 재사용합니다.
-    result.process_network_map = _precomp_net_map
-
-    # ── netstat 스냅샷으로 보완 (ProcMon Network 이벤트가 없을 때 fallback) ──
-    # ProcMon 필터 설정으로 인해 TCP/UDP 이벤트가 CSV에 없는 경우
-    # 분석 중 수집한 netstat 스냅샷으로 프로세스↔IP 매핑을 보완합니다.
-    if _netstat_snaps:
-        try:
-            from analysis.process_network_map import build_netstat_proc_map
-            _ns_map = build_netstat_proc_map(
-                _netstat_snaps,
-                proc_snapshots=result.proc_after_snapshot,
+            # 포커스 PID 기반 필터 (단명 프로세스 보완 후 실행)
+            result.filtered_events = filter_events(
+                result.procmon_events,
                 focus_pids=result.all_pids if result.all_pids else None,
             )
-            if _ns_map:
-                # 중복 제거: ProcMon에 이미 있는 (pid, remote_ip, remote_port) 제외
-                _existing = {
-                    (_pn.pid, _pn.remote_ip, _pn.remote_port)
-                    for _pn in result.process_network_map
-                }
-                _added = [
-                    c for c in _ns_map
-                    if (c.pid, c.remote_ip, c.remote_port) not in _existing
-                ]
-                result.process_network_map = list(result.process_network_map) + _added
-                if _added:
-                    status(f"      netstat 보완: {len(_added)}개 추가 "
-                           f"(ProcMon {len(_precomp_net_map)}개 + netstat {len(_added)}개)")
-        except Exception as _ns_err:
-            status(f"      netstat 보완 실패: {_ns_err}")
+            status(f"      이벤트 {len(result.procmon_events):,}개 → 필터 후 {len(result.filtered_events):,}개")
 
-    # 모든 수집 경로에 동일한 제외/추적 범위를 적용.
-    from analysis.process_network_map import filter_process_connections
-    result.process_network_map = filter_process_connections(
-        result.process_network_map, result.all_pids if result.all_pids else None,
-    )
+        status("[분석] PCAP 파싱...")
+        from parsers.pcap_parser import SCAPY_AVAILABLE
+        if not SCAPY_AVAILABLE:
+            if ts.tshark_path:
+                status("      scapy 없음 → tshark 파서로 대체 분석")
+            else:
+                status("      [경고] scapy·tshark 모두 없음 — 네트워크 분석 불가 (pip install scapy)")
 
-    if result.process_network_map:
-        status(f"      총 {len(result.process_network_map)}개 연결 집계")
+        # 우선순위: 외부 PCAP(--pcap) > tshark 캡처 파일
+        pcap_target = None
+        if config.external_pcap and config.external_pcap.exists():
+            pcap_target = config.external_pcap
+            status(f"      외부 PCAP 사용: {config.external_pcap.name}  "
+                   f"({config.external_pcap.stat().st_size:,} bytes)")
+        elif ts.pcap_path.exists():
+            pcap_target = ts.pcap_path
+            status(f"      캡처 파일: {ts.pcap_path.name}  "
+                   f"({ts.pcap_path.stat().st_size:,} bytes)")
 
-    # ── 프로세스 행위 역색인 (HTML expand 패널용) ────────────────────
-    # process_network_map 완성 후 호출해야 tcp_conns가 채워집니다.
-    try:
-        from analysis.process_behavior_map import build_process_behavior_map as _bpm
-        result.process_behaviors = _bpm(
-            result.filtered_events,
-            result.dns_attributed,
-            result.process_network_map,
-            result.process_diff.get("new_processes", []),
-        )
-    except Exception as _bpe:
-        result.errors.append(f"프로세스 행위 맵 실패: {_bpe}")
-
-    # ── YARA 스캔 ────────────────────────────────────────────────────
-    # 지금까지 run_yara_scan() 이 호출되지 않아 리포트에 항상
-    # "실행되지 않음" 이 찍혔다. 샘플 + 드롭 파일을 대상으로 스캔한다.
-    try:
-        from analysis.yara_scanner import run_yara_scan
-        _drops_for_yara = list(getattr(result.ioc_report, "dropped_files", []) or [])
-        result.yara_result = run_yara_scan(
-            config.sample_path, _drops_for_yara[:300]
-        )
-        _yr = result.yara_result
-        if not _yr.available:
-            result.tools_used["yara"] = f"미실행 ({_yr.error})"
-            status(f"[YARA] 건너뜀 — {_yr.error}")
-        elif _yr.error:
-            result.tools_used["yara"] = f"오류: {_yr.error}"
-            status(f"[YARA] 오류 — {_yr.error}")
+        tshark_bin = str(ts.tshark_path) if ts.tshark_path else None
+        if pcap_target:
+            result.pcap_result = parse_pcap(pcap_target, tshark_path=tshark_bin)
+            pr = result.pcap_result
+            if pr.parse_error:
+                status(f"      [오류] {pr.parse_error}")
+                result.errors.append(f"PCAP 파싱 오류: {pr.parse_error}")
+            else:
+                ip_only = pr.packets_loaded - pr.packets_skipped
+                status(f"      패킷 {pr.packets_loaded:,}개 로드  "
+                       f"(IP/TCP/UDP {ip_only:,}개, 건너뜀 {pr.packets_skipped:,}개)")
+                status(f"      연결 {len(pr.connections)}개  "
+                       f"DNS {len(pr.dns_queries)}건  "
+                       f"TLS SNI {len(pr.tls_info)}건  "
+                       f"HTTP {len(pr.http_requests)}건")
+                if pr.beacon_candidates:
+                    status(f"      [!] 비콘 의심 {len(pr.beacon_candidates)}개 탐지")
+                if pr.suspicious_domains:
+                    status(f"      [!] 의심 도메인 {len(pr.suspicious_domains)}개 (DGA/터널링)")
+                # ── DNS ↔ 프로세스 귀속 ──────────────────────────────────
+                if pr.raw_dns_queries:
+                    try:
+                        from parsers.dns_correlator import correlate_dns
+                        result.dns_attributed = correlate_dns(
+                            pr.raw_dns_queries, result.procmon_events,
+                        )
+                        _attr_n = sum(1 for q in result.dns_attributed if q.attributed)
+                        status(f"      DNS 귀속: {_attr_n}/{len(result.dns_attributed)}건 "
+                               f"프로세스 매핑 성공")
+                    except Exception as _de:
+                        result.errors.append(f"DNS 귀속 실패: {_de}")
         else:
-            result.tools_used["yara"] = (
-                f"{len(_yr.matches)}건 매치 (룰 {_yr.rules_loaded}개)"
-            )
-            status(f"[YARA] 룰 {_yr.rules_loaded}개 로드, "
-                   f"{len(_yr.files_scanned)}개 파일 스캔 → {len(_yr.matches)}건 매치")
-            for _m in _yr.matches[:5]:
-                status(f"      {_m.rule_name} ← {Path(_m.file_scanned).name}")
-    except Exception as _ye:
-        result.errors.append(f"YARA 스캔 실패: {_ye}")
-        result.tools_used["yara"] = f"오류: {_ye}"
-        status(f"      [오류] YARA 스캔 실패: {_ye}")
+            from parsers.pcap_parser import PcapResult as _PR
+            result.pcap_result = _PR()
+            if not config.no_tshark:
+                status("      PCAP 파일 없음 (tshark 미실행 또는 캡처 실패)")
 
-    # ── 드로퍼 프로파일링 (패커·사칭 이름) ───────────────────────────
-    try:
-        from analysis.artifact_intel import (
-            detect_packers, detect_masquerading, add_masquerade_techniques,
-        )
-        result.packer_findings = detect_packers(
-            result.ioc_report, result.process_diff.get("new_processes", []),
-        )
-        result.masquerade_findings = detect_masquerading(
-            result.ioc_report, result.process_diff.get("new_processes", []),
+        # ── TLS keylog 복호화 ─────────────────────────────────────────────
+        if tls_keylogger and tshark_bin and pcap_target:
+            result.tls_key_count = tls_keylogger.key_count()
+            if tls_keylogger.has_keys():
+                status(f"[TLS] SSLKEYLOGFILE 키 {result.tls_key_count}개 — PCAP 복호화 중...")
+                try:
+                    result.decrypted_requests = tls_keylogger.decrypt_pcap(
+                        pcap_target, Path(tshark_bin)
+                    )
+                    if result.decrypted_requests:
+                        status(f"      복호화 성공: HTTP(S) 요청 {len(result.decrypted_requests)}개")
+                    else:
+                        status("      복호화된 HTTP 요청 없음 (Schannel 기반 또는 커스텀 TLS 가능성)")
+                except Exception as _ke:
+                    result.errors.append(f"TLS 복호화 실패: {_ke}")
+            else:
+                status(f"[TLS] {tls_keylogger.summary()}")
+
+        # ── FakeNet-NG 결과 수집 ──────────────────────────────────────────
+        if fakenet and result.tools_used.get("fakenet"):
+            status("[FakeNet] 결과 수집 중...")
+            _fn_result = fakenet.stop()
+            result.fakenet_result = fakenet_result_to_dict(_fn_result)
+            dns_cnt  = len(_fn_result.dns_queries)
+            http_cnt = len(_fn_result.http_requests)
+            tcp_cnt  = len(_fn_result.tcp_sessions)
+            status(f"      DNS {dns_cnt}건  HTTP(S) {http_cnt}건  TCP {tcp_cnt}건")
+            # FakeNet PCAP도 파싱 대상에 추가 (tshark 없이 캡처된 경우)
+            if _fn_result.pcap_path and not pcap_target:
+                try:
+                    result.pcap_result = parse_pcap(_fn_result.pcap_path, tshark_path=tshark_bin)
+                    status(f"      FakeNet PCAP 파싱 완료: {_fn_result.pcap_path.name}")
+                except Exception as _fe:
+                    result.errors.append(f"FakeNet PCAP 파싱 실패: {_fe}")
+
+        # ── 7.5 의심 DLL 로드 기존 프로세스 pe-sieve 추가 스캔 ──────────────
+        # procmon_events 를 단일 패스로 순회해 인젝션 PID와 네트워크 맵을 동시 수집.
+        _precomp_inject_pids: set[int] = set()
+        _precomp_net_map: list = []
+        if result.procmon_events:
+            _already_pre = {r.pid for r in result.pe_sieve_results}
+            _precomp_inject_pids, _precomp_net_map = _scan_procmon_once(
+                result.procmon_events,
+                already_scanned=_already_pre,
+                sample_pids=result.all_pids,
+            )
+
+        if ps_scanner.available and _precomp_inject_pids:
+            _inject_pids = _precomp_inject_pids
+            _alive_inject  = [p for p in _inject_pids if _pid_alive(p)]
+            _dead_inject   = _inject_pids - set(_alive_inject)
+            if _inject_pids:
+                status(
+                    f"[분석] 의심 DLL 로드 감지 — 기존 프로세스 {len(_inject_pids)}개 "
+                    f"(생존 {len(_alive_inject)}개, 종료 {len(_dead_inject)}개) pe-sieve 추가 스캔..."
+                )
+                _ps3_workers = min(3, len(_alive_inject)) if _alive_inject else 1
+                with ThreadPoolExecutor(max_workers=_ps3_workers) as _ps3_pool:
+                    _ps3_futures = {
+                        _ps3_pool.submit(
+                            ps_scanner.scan_pid, _pid, dump_mode=3, shellcode=1
+                        ): _pid
+                        for _pid in _alive_inject
+                    }
+                    for _fut3 in as_completed(_ps3_futures):
+                        _pid = _ps3_futures[_fut3]
+                        try:
+                            _raw = _fut3.result()
+                        except Exception as _e:
+                            status(f"      PID {_pid}: 스캔 오류 {_e}")
+                            continue
+                        _pr = parse_pesieve(_raw)
+                        result.pe_sieve_results.append(_pr)
+                        if _pr.error:
+                            status(f"      PID {_pid}: {_pr.error[:80]}")
+                        elif _pr.suspicious > 0:
+                            _inj_parts = []
+                            if _pr.implanted_pe:
+                                _inj_parts.append(f"PE인젝션 {_pr.implanted_pe}개")
+                            if _pr.implanted_shc:
+                                _inj_parts.append(f"쉘코드 {_pr.implanted_shc}개")
+                            _inj_str = "  ".join(_inj_parts) if _inj_parts else f"의심모듈 {_pr.suspicious}개"
+                            status(f"      PID {_pid}: 의심 {_pr.suspicious}개  {_inj_str} 🚨")
+                        else:
+                            status(f"      PID {_pid}: 이상 없음 ✅")
+                if _dead_inject:
+                    status(f"      [알림] 종료된 PID (스캔 불가): {sorted(_dead_inject)}")
+            # else: 의심 DLL 로드 없음 — 상태 로그 불필요
+
+        # step 7.5 에서 새로 추가된 pe-sieve 결과(DLL 인젝션 대상 기존 프로세스)를
+        # all_pids 에 반영. filter_events 이후에 발견된 PID 이므로 filtered_events 에는
+        # 최신 PID 목록으로 아래에서 이벤트 필터를 재적용한다.
+        _injection_pids: set[int] = set()
+        for _psr2 in result.pe_sieve_results:
+            if not _psr2.error and (_psr2.implanted_shc > 0 or _psr2.implanted_pe > 0):
+                result.all_pids.add(_psr2.pid)
+                _injection_pids.add(_psr2.pid)
+
+        # injection 대상 프로세스가 드롭한 파일 추출을 위해
+        # procmon_events 에서 해당 PID 이벤트만 별도 수집 (filter_events 미적용)
+        _injection_events: list = []
+        if _injection_pids and result.procmon_events:
+            _injection_events = [
+                ev for ev in result.procmon_events
+                if ev.pid in _injection_pids
+            ]
+
+        from analysis.network_scope import sample_network_view, refresh_tracked_events
+        refresh_tracked_events(result)
+        result.analysis_pcap = result.pcap_result
+        if result.tools_used.get("dns_etw") and not dns_trace.active:
+            try:
+                names = {pid: p.name for pid, p in result.proc_after_snapshot.items()}
+                names.update({p.pid: p.name for p in result.process_diff.get("new_processes", [])})
+                result.dns_attributed = dns_trace.queries(names, existing=result.dns_attributed)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                result.errors.append(f"DNS-Client ETW 읽기 실패: {exc}")
+
+        if config.sample_path is not None:
+            result.analysis_pcap = sample_network_view(
+                result.pcap_result, result.procmon_events, result.all_pids,
+                dns_attributed=result.dns_attributed,
+            )
+            status("      샘플 네트워크 분류: 프로세스 귀속이 확인된 연결만 사용 (전체 관찰은 네트워크 탭)")
+
+        # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
+        status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
+        result.behavior_report = classify_behaviors(
+            result.filtered_events,
+            result.analysis_pcap,
+            result.registry_diff,
+            result.process_diff,
+            hh_result=result.hh_result,
+            pe_sieve_results=result.pe_sieve_results,
             lineage_pids=result.lineage_pids,
         )
-        if result.packer_findings:
-            _pk = ", ".join(f"{p['name']}({p['confidence']})" for p in result.packer_findings[:3])
-            status(f"[아티팩트] 패커/인스톨러 식별: {_pk}")
-        if result.masquerade_findings:
-            _mq = add_masquerade_techniques(
-                result.behavior_report, result.masquerade_findings
-            )
-            status(f"[아티팩트] 사칭 의심 파일 {len(result.masquerade_findings)}건 "
-                   f"→ T1036 매핑 {_mq}건")
-            for _m in result.masquerade_findings[:3]:
-                status(f"      {_m['confidence']} {_m['path']} — {_m['reason']}")
-    except Exception as _ae:
-        result.errors.append(f"아티팩트 프로파일링 실패: {_ae}")
-        status(f"      [오류] 아티팩트 프로파일링 실패: {_ae}")
+        # 분류기 예외(카테고리 통째 누락)를 조용히 넘기지 않고 표면화
+        for _cerr in getattr(result.behavior_report, "classify_errors", []):
+            result.errors.append(_cerr)
+            status(f"      [경고] {_cerr}")
 
-    # ── DLL 사이드로딩 탐지 ──────────────────────────────────────────
-    # ProcMon 의 Load Image 이벤트에 "어느 프로세스가 어느 경로의 DLL 을
-    # 로드했는가" 가 남는다. 드롭된 DLL 을 실행 파일과 같은 비시스템
-    # 디렉터리에서 로드하면 사이드로딩으로 판정한다.
-    try:
-        from analysis.sideload_detector import (
-            detect_sideloading, sideload_to_dict, add_sideload_techniques,
+        result.ioc_report = extract_iocs(
+            result.filtered_events,
+            result.analysis_pcap,
+            result.registry_diff,
+            result.process_diff,
+            injection_events=_injection_events or None,
         )
-        _sl = detect_sideloading(
-            result.filtered_events or result.procmon_events,
-            lineage_pids  = result.lineage_pids,
-            new_processes = result.process_diff.get("new_processes", []),
-        )
-        result.sideload_findings = [sideload_to_dict(f) for f in _sl]
-        if _sl:
-            _added = add_sideload_techniques(result.behavior_report, _sl)
-            _hi = sum(1 for f in _sl if f.confidence == "HIGH")
-            status(f"[사이드로딩] {len(_sl)}건 탐지 (HIGH {_hi}건) → T1574.002 매핑 {_added}건")
-            for _f in _sl[:3]:
-                status(f"      {_f.confidence} {_f.summary()}")
-    except Exception as _sle:
-        result.errors.append(f"사이드로딩 탐지 실패: {_sle}")
-        status(f"      [오류] 사이드로딩 탐지 실패: {_sle}")
 
-    # ── 샘플 프로세스 항목 보장 ──────────────────────────────────────
-    # 샘플이 스냅샷 수집 전에 종료되면 process_diff 에 안 잡히고,
-    # ProcMon CSV 변환까지 실패하면 Process Create 보완도 동작하지 않아
-    # 정작 분석 대상인 샘플이 리포트에서 통째로 사라진다.
-    # 실행 시점에 PID·경로를 이미 알고 있으므로 여기서 반드시 채워 넣는다.
-    if result.sample_pid and config.sample_path:
-        _np_list = result.process_diff.setdefault("new_processes", [])
-        if not any(getattr(p, "pid", None) == result.sample_pid for p in _np_list):
-            from core.process_tracker import ProcessSnapshot as _PS
-            _np_list.insert(0, _PS(
-                pid         = result.sample_pid,
-                ppid        = 0,
-                name        = config.sample_path.name,
-                exe         = str(config.sample_path),
-                cmdline     = [config.sample_path.name],
-                create_time = 0.0,
-                note        = "분석 대상 샘플 (스냅샷 미포착 — 조기 종료 추정)",
-            ))
-            result.lineage_pids.add(result.sample_pid)
-            status(f"      [보완] 샘플 프로세스 {config.sample_path.name} "
-                   f"(PID {result.sample_pid}) 를 프로세스 목록에 추가 "
-                   f"— 스냅샷에 없어 조기 종료로 추정됩니다")
+        # ── CAPA 정적 분석 (선택적) ──────────────────────────────────────
+        from core.config_loader import load_config as _load_cfg
+        _cfg = _load_cfg()
 
-    # ── 관련도 등급 부여 (Tier 1/2/3) ────────────────────────────────
-    # 항목을 제거하지 않고 등급만 매긴다. 리포트가 등급에 따라 접는다.
-    # 베이스라인이 있으면 환경 배경(Windows Update·Defender 등)을 정확히
-    # Tier 3 으로 강등할 수 있고, 없으면 내장 OS 배경 프로파일로 폴백한다.
-    if config.baseline_capture:
-        # 베이스라인 수집 모드 — 등급 판정 없이 프로파일만 저장
-        try:
-            from core.baseline import capture_baseline, save_baseline
-            _bl   = capture_baseline(result, note="baseline-capture 모드 수집")
-            _path = save_baseline(_bl, config.baseline_path or None)
-            result.baseline_info = {
-                "mode": "capture", "path": str(_path),
-                "items": _bl.item_count(), "summary": _bl.summary(),
-            }
-            status(f"[베이스라인] 저장 완료 → {_path}")
-            status(f"      {_bl.summary()}")
-        except Exception as _ble:
-            result.errors.append(f"베이스라인 저장 실패: {_ble}")
-            status(f"      [오류] 베이스라인 저장 실패: {_ble}")
-    else:
-        try:
-            from core.baseline    import load_baseline
-            from analysis.relevance import build_context, annotate, summarize_counts
+        _capa_cfg = _cfg.get("capa", {})
+        _PE_EXTS  = frozenset({".exe", ".dll", ".sys", ".scr", ".drv", ".ocx", ".cpl"})
+        if _stop_requested(config.output_dir, optional=True):
+            result.tools_used["capa"] = "사용자 요청으로 생략"
+        elif not _capa_cfg.get("enabled", True):
+            result.tools_used["capa"] = "비활성 (config.json > capa.enabled: false)"
+        elif not config.sample_path:
+            result.tools_used["capa"] = "샘플 없음"
+        elif config.sample_path.suffix.lower() not in _PE_EXTS:
+            _ext = config.sample_path.suffix or "(확장자 없음)"
+            result.tools_used["capa"] = f"비PE 샘플 건너뜀 ({_ext})"
+            status(f"[분석] CAPA: 비PE 샘플({_ext}) — 정적 분석 건너뜀")
+        else:
+            _capa_exe     = _capa_cfg.get("path", "capa.exe")
+            _capa_timeout = int(_capa_cfg.get("timeout", 120))
+            status(f"[분석] CAPA 정적 분석 중... (최대 {_capa_timeout}초, Ctrl+C로 건너뜀)")
+            try:
+                from analysis.capa_analyzer import run_capa, find_capa as _find_capa
+                if not (_find_capa() or __import__("shutil").which(_capa_exe)):
+                    result.tools_used["capa"] = f"미설치 (경로: {_capa_exe})"
+                    status(f"      CAPA: 실행 파일 미발견 ({_capa_exe}) — config.json > capa.path 확인")
+                else:
+                    _capa_techs = run_capa(config.sample_path, _capa_exe, _capa_timeout)
+                    if _capa_techs:
+                        _merge_external_techniques(result.behavior_report, _capa_techs)
+                        _capa_new = sum(1 for t in result.behavior_report.techniques
+                                        if "CAPA" in (t.sources or []))
+                        result.tools_used["capa"] = f"{len(_capa_techs)}건 기여"
+                        status(f"      CAPA 완료: 기법 {len(_capa_techs)}개 탐지  "
+                               f"(누적 {_capa_new}개)")
+                    else:
+                        result.tools_used["capa"] = "결과 없음"
+                        status("      CAPA: 탐지 없음 / 실행 불가 (config.json > capa.path 확인)")
+            except KeyboardInterrupt:
+                result.tools_used["capa"] = "건너뜀 (Ctrl+C)"
+                status("      CAPA 건너뜀 (Ctrl+C)")
+            except Exception as _e:
+                result.tools_used["capa"] = f"오류: {_e}"
+                status(f"      CAPA 오류: {_e}")
 
-            _bl = None
-            if config.use_baseline:
-                _bl = load_baseline(config.baseline_path or None)
-            if _bl is None:
-                if config.use_baseline:
-                    status("[관련도] 베이스라인 없음 — 내장 OS 배경 프로파일로 판정 "
-                           "(--baseline-capture 로 수집하면 정확도가 올라갑니다)")
-                result.baseline_info = {"mode": "builtin"}
+        # ── VirusTotal API 쿼리 (선택적) ─────────────────────────────────
+        _vt_cfg = _cfg.get("virustotal", {})
+        if _stop_requested(config.output_dir, optional=True):
+            result.tools_used["virustotal"] = "사용자 요청으로 생략"
+        elif not _vt_cfg.get("enabled"):
+            result.tools_used["virustotal"] = "비활성 (config.json > virustotal.enabled: true 필요)"
+        elif not _vt_cfg.get("api_key", ""):
+            result.tools_used["virustotal"] = "API 키 없음 (config.json > virustotal.api_key 설정 필요)"
+        else:
+            _vt_key     = _vt_cfg["api_key"]
+            _vt_timeout = int(_vt_cfg.get("timeout", 20))
+            _sha256 = ""
+            if config.sample_path:
+                try:
+                    import hashlib as _hl
+                    _h = _hl.sha256()
+                    with open(config.sample_path, "rb") as _f:
+                        for _chunk in iter(lambda: _f.read(65536), b""):
+                            _h.update(_chunk)
+                    _sha256 = _h.hexdigest()
+                except Exception:
+                    pass
+
+            if _sha256:
+                status(f"[분석] VirusTotal 쿼리 중... ({_sha256[:16]}…)")
+                try:
+                    from analysis.vt_analyzer import query_vt
+                    _vt_techs = query_vt(_sha256, _vt_key, _vt_timeout)
+                    if _vt_techs:
+                        _merge_external_techniques(result.behavior_report, _vt_techs)
+                        _vt_new = sum(1 for t in result.behavior_report.techniques
+                                      if "VirusTotal" in (t.sources or []))
+                        result.tools_used["virustotal"] = f"{len(_vt_techs)}건 기여"
+                        status(f"      VT 완료: 기법 {len(_vt_techs)}개 탐지  "
+                               f"(누적 {_vt_new}개)")
+                    else:
+                        result.tools_used["virustotal"] = "결과 없음 (미등록 샘플)"
+                        status("      VT: 탐지 없음 (미등록 샘플이거나 API 오류)")
+                except Exception as _e:
+                    result.tools_used["virustotal"] = f"오류: {_e}"
+                    status(f"      VT 오류: {_e}")
             else:
-                _stale = _bl.is_stale()
+                result.tools_used["virustotal"] = "SHA256 계산 실패"
+                status("      VT: SHA256 계산 실패 또는 샘플 경로 없음")
+
+        status("[분석] 프로세스↔네트워크 연결 매핑...")
+        # _scan_procmon_once 에서 이미 단일 패스로 수집한 결과를 재사용합니다.
+        result.process_network_map = _precomp_net_map
+
+        # ── netstat 스냅샷으로 보완 (ProcMon Network 이벤트가 없을 때 fallback) ──
+        # ProcMon 필터 설정으로 인해 TCP/UDP 이벤트가 CSV에 없는 경우
+        # 분석 중 수집한 netstat 스냅샷으로 프로세스↔IP 매핑을 보완합니다.
+        if _netstat_snaps:
+            try:
+                from analysis.process_network_map import build_netstat_proc_map
+                _ns_map = build_netstat_proc_map(
+                    _netstat_snaps,
+                    proc_snapshots=result.proc_after_snapshot,
+                    focus_pids=result.all_pids if result.all_pids else None,
+                )
+                if _ns_map:
+                    # 중복 제거: ProcMon에 이미 있는 (pid, remote_ip, remote_port) 제외
+                    _existing = {
+                        (_pn.pid, _pn.remote_ip, _pn.remote_port)
+                        for _pn in result.process_network_map
+                    }
+                    _added = [
+                        c for c in _ns_map
+                        if (c.pid, c.remote_ip, c.remote_port) not in _existing
+                    ]
+                    result.process_network_map = list(result.process_network_map) + _added
+                    if _added:
+                        status(f"      netstat 보완: {len(_added)}개 추가 "
+                               f"(ProcMon {len(_precomp_net_map)}개 + netstat {len(_added)}개)")
+            except Exception as _ns_err:
+                status(f"      netstat 보완 실패: {_ns_err}")
+
+        # 모든 수집 경로에 동일한 제외/추적 범위를 적용.
+        from analysis.process_network_map import filter_process_connections
+        result.process_network_map = filter_process_connections(
+            result.process_network_map, result.all_pids if result.all_pids else None,
+        )
+
+        if result.process_network_map:
+            status(f"      총 {len(result.process_network_map)}개 연결 집계")
+
+        # ── 프로세스 행위 역색인 (HTML expand 패널용) ────────────────────
+        # process_network_map 완성 후 호출해야 tcp_conns가 채워집니다.
+        try:
+            from analysis.process_behavior_map import build_process_behavior_map as _bpm
+            result.process_behaviors = _bpm(
+                result.filtered_events,
+                result.dns_attributed,
+                result.process_network_map,
+                result.process_diff.get("new_processes", []),
+            )
+        except Exception as _bpe:
+            result.errors.append(f"프로세스 행위 맵 실패: {_bpe}")
+
+        # ── YARA 스캔 ────────────────────────────────────────────────────
+        # 지금까지 run_yara_scan() 이 호출되지 않아 리포트에 항상
+        # "실행되지 않음" 이 찍혔다. 샘플 + 드롭 파일을 대상으로 스캔한다.
+        try:
+            from analysis.yara_scanner import run_yara_scan
+            _drops_for_yara = list(getattr(result.ioc_report, "dropped_files", []) or [])
+            result.yara_result = run_yara_scan(
+                config.sample_path, _drops_for_yara[:300]
+            )
+            _yr = result.yara_result
+            if not _yr.available:
+                result.tools_used["yara"] = f"미실행 ({_yr.error})"
+                status(f"[YARA] 건너뜀 — {_yr.error}")
+            elif _yr.error:
+                result.tools_used["yara"] = f"오류: {_yr.error}"
+                status(f"[YARA] 오류 — {_yr.error}")
+            else:
+                result.tools_used["yara"] = (
+                    f"{len(_yr.matches)}건 매치 (룰 {_yr.rules_loaded}개)"
+                )
+                status(f"[YARA] 룰 {_yr.rules_loaded}개 로드, "
+                       f"{len(_yr.files_scanned)}개 파일 스캔 → {len(_yr.matches)}건 매치")
+                for _m in _yr.matches[:5]:
+                    status(f"      {_m.rule_name} ← {Path(_m.file_scanned).name}")
+        except Exception as _ye:
+            result.errors.append(f"YARA 스캔 실패: {_ye}")
+            result.tools_used["yara"] = f"오류: {_ye}"
+            status(f"      [오류] YARA 스캔 실패: {_ye}")
+
+        # ── 드로퍼 프로파일링 (패커·사칭 이름) ───────────────────────────
+        try:
+            from analysis.artifact_intel import (
+                detect_packers, detect_masquerading, add_masquerade_techniques,
+            )
+            result.packer_findings = detect_packers(
+                result.ioc_report, result.process_diff.get("new_processes", []),
+            )
+            result.masquerade_findings = detect_masquerading(
+                result.ioc_report, result.process_diff.get("new_processes", []),
+                lineage_pids=result.lineage_pids,
+            )
+            if result.packer_findings:
+                _pk = ", ".join(f"{p['name']}({p['confidence']})" for p in result.packer_findings[:3])
+                status(f"[아티팩트] 패커/인스톨러 식별: {_pk}")
+            if result.masquerade_findings:
+                _mq = add_masquerade_techniques(
+                    result.behavior_report, result.masquerade_findings
+                )
+                status(f"[아티팩트] 사칭 의심 파일 {len(result.masquerade_findings)}건 "
+                       f"→ T1036 매핑 {_mq}건")
+                for _m in result.masquerade_findings[:3]:
+                    status(f"      {_m['confidence']} {_m['path']} — {_m['reason']}")
+        except Exception as _ae:
+            result.errors.append(f"아티팩트 프로파일링 실패: {_ae}")
+            status(f"      [오류] 아티팩트 프로파일링 실패: {_ae}")
+
+        # ── DLL 사이드로딩 탐지 ──────────────────────────────────────────
+        # ProcMon 의 Load Image 이벤트에 "어느 프로세스가 어느 경로의 DLL 을
+        # 로드했는가" 가 남는다. 드롭된 DLL 을 실행 파일과 같은 비시스템
+        # 디렉터리에서 로드하면 사이드로딩으로 판정한다.
+        try:
+            from analysis.sideload_detector import (
+                detect_sideloading, sideload_to_dict, add_sideload_techniques,
+            )
+            _sl = detect_sideloading(
+                result.filtered_events or result.procmon_events,
+                lineage_pids  = result.lineage_pids,
+                new_processes = result.process_diff.get("new_processes", []),
+            )
+            result.sideload_findings = [sideload_to_dict(f) for f in _sl]
+            if _sl:
+                _added = add_sideload_techniques(result.behavior_report, _sl)
+                _hi = sum(1 for f in _sl if f.confidence == "HIGH")
+                status(f"[사이드로딩] {len(_sl)}건 탐지 (HIGH {_hi}건) → T1574.002 매핑 {_added}건")
+                for _f in _sl[:3]:
+                    status(f"      {_f.confidence} {_f.summary()}")
+        except Exception as _sle:
+            result.errors.append(f"사이드로딩 탐지 실패: {_sle}")
+            status(f"      [오류] 사이드로딩 탐지 실패: {_sle}")
+
+        # ── 샘플 프로세스 항목 보장 ──────────────────────────────────────
+        # 샘플이 스냅샷 수집 전에 종료되면 process_diff 에 안 잡히고,
+        # ProcMon CSV 변환까지 실패하면 Process Create 보완도 동작하지 않아
+        # 정작 분석 대상인 샘플이 리포트에서 통째로 사라진다.
+        # 실행 시점에 PID·경로를 이미 알고 있으므로 여기서 반드시 채워 넣는다.
+        if result.sample_pid and config.sample_path:
+            _np_list = result.process_diff.setdefault("new_processes", [])
+            if not any(getattr(p, "pid", None) == result.sample_pid for p in _np_list):
+                from core.process_tracker import ProcessSnapshot as _PS
+                _np_list.insert(0, _PS(
+                    pid         = result.sample_pid,
+                    ppid        = 0,
+                    name        = config.sample_path.name,
+                    exe         = str(config.sample_path),
+                    cmdline     = [config.sample_path.name],
+                    create_time = 0.0,
+                    note        = "분석 대상 샘플 (스냅샷 미포착 — 조기 종료 추정)",
+                ))
+                result.lineage_pids.add(result.sample_pid)
+                status(f"      [보완] 샘플 프로세스 {config.sample_path.name} "
+                       f"(PID {result.sample_pid}) 를 프로세스 목록에 추가 "
+                       f"— 스냅샷에 없어 조기 종료로 추정됩니다")
+
+        # ── 관련도 등급 부여 (Tier 1/2/3) ────────────────────────────────
+        # 항목을 제거하지 않고 등급만 매긴다. 리포트가 등급에 따라 접는다.
+        # 베이스라인이 있으면 환경 배경(Windows Update·Defender 등)을 정확히
+        # Tier 3 으로 강등할 수 있고, 없으면 내장 OS 배경 프로파일로 폴백한다.
+        if config.baseline_capture:
+            # 베이스라인 수집 모드 — 등급 판정 없이 프로파일만 저장
+            try:
+                from core.baseline import capture_baseline, save_baseline
+                _bl   = capture_baseline(result, note="baseline-capture 모드 수집")
+                _path = save_baseline(_bl, config.baseline_path or None)
                 result.baseline_info = {
-                    "mode": "baseline", "host": _bl.host,
-                    "age_days": round(_bl.age_days, 1), "stale": _stale,
+                    "mode": "capture", "path": str(_path),
                     "items": _bl.item_count(), "summary": _bl.summary(),
                 }
-                status(f"[관련도] 베이스라인 적용 ({_bl.host}, {_bl.age_days:.1f}일 전, "
-                       f"{_bl.item_count()}개 항목)")
-                if _stale:
-                    status("      [주의] 베이스라인이 오래되었습니다 — 재수집 권장")
+                status(f"[베이스라인] 저장 완료 → {_path}")
+                status(f"      {_bl.summary()}")
+            except Exception as _ble:
+                result.errors.append(f"베이스라인 저장 실패: {_ble}")
+                status(f"      [오류] 베이스라인 저장 실패: {_ble}")
+        else:
+            try:
+                from core.baseline    import load_baseline
+                from analysis.relevance import build_context, annotate, summarize_counts
 
-            _ctx = build_context(result, _bl)
-            result.relevance_counts = annotate(result, _ctx)
-            _summary = summarize_counts(result.relevance_counts)
-            if _summary:
-                status(f"      등급 (계보/의심/배경): {_summary}")
+                _bl = None
+                if config.use_baseline:
+                    _bl = load_baseline(config.baseline_path or None)
+                if _bl is None:
+                    if config.use_baseline:
+                        status("[관련도] 베이스라인 없음 — 내장 OS 배경 프로파일로 판정 "
+                               "(--baseline-capture 로 수집하면 정확도가 올라갑니다)")
+                    result.baseline_info = {"mode": "builtin"}
+                else:
+                    _stale = _bl.is_stale()
+                    result.baseline_info = {
+                        "mode": "baseline", "host": _bl.host,
+                        "age_days": round(_bl.age_days, 1), "stale": _stale,
+                        "items": _bl.item_count(), "summary": _bl.summary(),
+                    }
+                    status(f"[관련도] 베이스라인 적용 ({_bl.host}, {_bl.age_days:.1f}일 전, "
+                           f"{_bl.item_count()}개 항목)")
+                    if _stale:
+                        status("      [주의] 베이스라인이 오래되었습니다 — 재수집 권장")
 
-            # 주입 탐지 신뢰도 판정 — 오탐을 지우지 않고 등급만 매긴다
-            from analysis.relevance import classify_injections
-            result.injection_findings = classify_injections(result, _ctx)
-            if result.injection_findings:
-                _ic = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
-                for _f in result.injection_findings:
-                    _ic[_f["confidence"]] = _ic.get(_f["confidence"], 0) + 1
-                status(f"      주입 탐지 신뢰도: HIGH {_ic['HIGH']} / "
-                       f"MEDIUM {_ic['MEDIUM']} / LOW(오탐추정) {_ic['LOW']}")
-        except Exception as _rle:
-            result.errors.append(f"관련도 등급 부여 실패: {_rle}")
-            status(f"      [오류] 관련도 등급 부여 실패: {_rle}")
+                _ctx = build_context(result, _bl)
+                result.relevance_counts = annotate(result, _ctx)
+                _summary = summarize_counts(result.relevance_counts)
+                if _summary:
+                    status(f"      등급 (계보/의심/배경): {_summary}")
 
-    # ── 증거 보존 ───────────────────────────────────────────────────
-    # 샘플 계보가 드롭한 파일을 결과 폴더로 복사하고 해시를 남긴다.
-    # 리포트 "증거" 탭이 이 결과를 원본 수집물과 함께 보여준다.
-    try:
-        from core.evidence_collector import collect_evidence
-        result.evidence = collect_evidence(result, config.output_dir, status=status)
-    except Exception as _eve:
-        result.evidence = {}
-        result.errors.append(f"증거 보존 실패: {_eve}")
+                # 주입 탐지 신뢰도 판정 — 오탐을 지우지 않고 등급만 매긴다
+                from analysis.relevance import classify_injections
+                result.injection_findings = classify_injections(result, _ctx)
+                if result.injection_findings:
+                    _ic = {"HIGH": 0, "MEDIUM": 0, "LOW": 0}
+                    for _f in result.injection_findings:
+                        _ic[_f["confidence"]] = _ic.get(_f["confidence"], 0) + 1
+                    status(f"      주입 탐지 신뢰도: HIGH {_ic['HIGH']} / "
+                           f"MEDIUM {_ic['MEDIUM']} / LOW(오탐추정) {_ic['LOW']}")
+            except Exception as _rle:
+                result.errors.append(f"관련도 등급 부여 실패: {_rle}")
+                status(f"      [오류] 관련도 등급 부여 실패: {_rle}")
 
-    # ── 메모리 포렌식 (Volatility3) ──────────────────────────────────
-    if config.use_memdump:
-        status("[메모리 포렌식] 시작 (winpmem + Volatility3)...")
-        _mem_winpmem = Path(config.winpmem_path) if config.winpmem_path else None
-        _mem_vol     = Path(config.volatility_path) if config.volatility_path else None
-        _mem_dump    = Path(config.existing_dump) if config.existing_dump else None
+        # ── 증거 보존 ───────────────────────────────────────────────────
+        # 샘플 계보가 드롭한 파일을 결과 폴더로 복사하고 해시를 남긴다.
+        # 리포트 "증거" 탭이 이 결과를 원본 수집물과 함께 보여준다.
         try:
-            mem_result = run_memory_forensics(
-                output_dir=config.output_dir,
-                sample_pids=result.all_pids or None,
-                winpmem_path=_mem_winpmem,
-                vol_path=_mem_vol,
-                dump_timeout=config.dump_timeout,
-                plugin_timeout=config.vol_plugin_timeout,
-                on_status=status,
-                skip_dump=bool(_mem_dump),
-                existing_dump=_mem_dump,
-                symbols_path=getattr(config, "vol_symbols_path", None),
-            )
-            result.mem_forensics = memforensics_to_dict(mem_result)
-            if mem_result.error:
-                status(f"      [오류] {mem_result.error}")
-                result.errors.append(f"메모리 포렌식: {mem_result.error}")
-            else:
-                mf_cnt = len(mem_result.malfind)
-                ns_cnt = len(mem_result.netscan)
-                hd_cnt = len(mem_result.handles)
-                status(f"      malfind {mf_cnt}건  netscan {ns_cnt}건  "
-                       f"handles(Mutant) {hd_cnt}건")
-                if mf_cnt:
-                    status(f"      [!] 주입 코드 탐지 — malfind {mf_cnt}건 (메모리 탭 확인)")
-        except Exception as _me:
-            result.errors.append(f"메모리 포렌식 예외: {_me}")
-            status(f"      [오류] {_me}")
-            result.mem_forensics = {"error": f"실행 예외: {_me}"}
+            from core.evidence_collector import collect_evidence
+            result.evidence = collect_evidence(result, config.output_dir, status=status)
+        except Exception as _eve:
+            result.evidence = {}
+            result.errors.append(f"증거 보존 실패: {_eve}")
 
-    # ── AI 분석 (기본 NVIDIA NIM) ──────────────────────────────────
-    if config.use_ai:
-        try:
-            _az = create_ai_analyzer(config.ai_provider, config.ai_model, config.ollama_url)
-            status(f"[AI 분석] {config.ai_provider.upper()} {_az.model} 분석 준비…")
-            _ai = _az.analyze(result, timeout=config.ai_timeout or 600)
-            result.ai_analysis = ai_analysis_to_dict(_ai)
-            if getattr(_az, "model_note", ""):
-                status(f"      [모델 대체] {_az.model_note}")
-            result.tools_used["ai"] = f"{config.ai_provider}: {'실패' if _ai.error else '완료'}"
-            if _ai.error:
-                status(f"      [오류] {_ai.error}")
-                result.errors.append(f"AI 분석: {_ai.error}")
-            else:
-                status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
-                if _ai.mitre_techniques and result.behavior_report:
-                    merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
-                    status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
-        except Exception:
-            result.errors.append("AI 분석 처리 중 예외가 발생했습니다.")
-            status("      [오류] AI 분석 처리 중 예외가 발생했습니다.")
+        # ── 메모리 포렌식 (Volatility3) ──────────────────────────────────
+        if config.use_memdump and (config.existing_dump or early_dump) and not _stop_requested(config.output_dir, optional=True):
+            status("[메모리 포렌식] 시작 (winpmem + Volatility3)...")
+            _mem_winpmem = Path(config.winpmem_path) if config.winpmem_path else None
+            _mem_vol     = Path(config.volatility_path) if config.volatility_path else None
+            _mem_dump    = Path(config.existing_dump) if config.existing_dump else early_dump
+            try:
+                mem_result = run_memory_forensics(
+                    output_dir=config.output_dir,
+                    sample_pids=result.all_pids or None,
+                    winpmem_path=_mem_winpmem,
+                    vol_path=_mem_vol,
+                    dump_timeout=config.dump_timeout,
+                    plugin_timeout=config.vol_plugin_timeout,
+                    on_status=status,
+                    skip_dump=bool(_mem_dump),
+                    existing_dump=_mem_dump,
+                    dump_time=early_dump_time, sample_alive=early_dump_alive,
+                    symbols_path=getattr(config, "vol_symbols_path", None),
+                )
+                result.mem_forensics = memforensics_to_dict(mem_result)
+                if mem_result.error:
+                    status(f"      [오류] {mem_result.error}")
+                    result.errors.append(f"메모리 포렌식: {mem_result.error}")
+                else:
+                    mf_cnt = len(mem_result.malfind)
+                    ns_cnt = len(mem_result.netscan)
+                    hd_cnt = len(mem_result.handles)
+                    status(f"      malfind {mf_cnt}건  netscan {ns_cnt}건  "
+                           f"handles(Mutant) {hd_cnt}건")
+                    if mf_cnt:
+                        status(f"      [!] 주입 코드 탐지 — malfind {mf_cnt}건 (메모리 탭 확인)")
+            except Exception as _me:
+                result.errors.append(f"메모리 포렌식 예외: {_me}")
+                status(f"      [오류] {_me}")
+                result.mem_forensics = {"error": f"실행 예외: {_me}"}
+
+        # ── AI 분석 (기본 NVIDIA NIM) ──────────────────────────────────
+        if config.use_ai and not _stop_requested(config.output_dir, optional=True):
+            if on_preliminary_report:
+                result.sample_active, result.inactivity_signals = _compute_activity_verdict(result)
+                result.end_time = time.time()
+                result.report_stage = "preliminary"
+                result.ai_analysis = {"pending": True, "provider": config.ai_provider,
+                                      "model": config.ai_model}
+                try:
+                    on_preliminary_report(result)
+                except Exception as exc:
+                    status(f"[보고서 저장 오류] {type(exc).__name__}: {exc}")
+                finally:
+                    result.ai_analysis = None
+                    result.report_stage = "final"
+            try:
+                _az = create_ai_analyzer(config.ai_provider, config.ai_model, config.ollama_url)
+                status(f"[AI 분석] {config.ai_provider.upper()} {_az.model} 분석 준비…")
+                _ai = _az.analyze(result, timeout=config.ai_timeout or 600)
+                result.ai_analysis = ai_analysis_to_dict(_ai)
+                if getattr(_az, "model_note", ""):
+                    status(f"      [모델 대체] {_az.model_note}")
+                result.tools_used["ai"] = f"{config.ai_provider}: {'실패' if _ai.error else '완료'}"
+                if _ai.error:
+                    status(f"      [오류] {_ai.error}")
+                    result.errors.append(f"AI 분석: {_ai.error}")
+                else:
+                    status(f"      AI 분석 완료 ({_ai.elapsed_sec}s, {_ai.prompt_chars}자 입력)")
+                    if _ai.mitre_techniques and result.behavior_report:
+                        merge_ai_mitre(result.behavior_report, _ai.mitre_techniques)
+                        status(f"      AI MITRE 병합: {len(_ai.mitre_techniques)}건")
+            except Exception:
+                result.errors.append("AI 분석 처리 중 예외가 발생했습니다.")
+                status("      [오류] AI 분석 처리 중 예외가 발생했습니다.")
 
 
-    # ── 샘플 활성 여부 최종 판정 ────────────────────────────────────────
-    result.sample_active, result.inactivity_signals = _compute_activity_verdict(result)
-    if not result.sample_active:
-        _sig_str = " / ".join(result.inactivity_signals[:4])
-        status(f"[!] 샘플 비활성 추정 — 유의미한 행위 미관찰 ({_sig_str})")
-    else:
-        status("[활성 확인] 유의미한 행위 관찰됨")
+        # ── 샘플 활성 여부 최종 판정 ────────────────────────────────────────
+        result.sample_active, result.inactivity_signals = _compute_activity_verdict(result)
+        if not result.sample_active:
+            _sig_str = " / ".join(result.inactivity_signals[:4])
+            status(f"[!] 샘플 비활성 추정 — 유의미한 행위 미관찰 ({_sig_str})")
+        else:
+            status("[활성 확인] 유의미한 행위 관찰됨")
 
-    result.end_time = time.time()
-    elapsed_total = result.end_time - result.start_time
-    status(f"[완료] 총 소요 {elapsed_total:.1f}초")
+        result.end_time = time.time()
+        elapsed_total = result.end_time - result.start_time
+        status(f"[완료] 총 소요 {elapsed_total:.1f}초")
 
-    return result
+        return result
+
+    except (Exception, KeyboardInterrupt) as exc:
+        result.errors.append(f"분석 중단: {type(exc).__name__}: {exc}")
+        result.end_time = time.time()
+        result.report_stage = "interrupted"
+        if on_preliminary_report:
+            try:
+                on_preliminary_report(result)
+            except Exception as save_error:
+                result.errors.append(f"중단 보고서 저장 실패: {save_error}")
+        raise
+    finally:
+        # 시작한 수집기는 예외·Ctrl+C에서도 역순으로 정리한다.
+        for name in ("watcher", "dns_trace", "fakenet", "ts", "pm"):
+            collector = locals().get(name)
+            if collector is None:
+                continue
+            active = (name == "watcher" or getattr(collector, "active", False)
+                      or getattr(collector, "_proc", None) is not None)
+            if active:
+                try:
+                    collector.stop()
+                except Exception as cleanup_error:
+                    result.errors.append(f"{name} 정리 실패: {cleanup_error}")

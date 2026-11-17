@@ -106,8 +106,8 @@ class PeSieveScanner:
         pid:
             Target process ID.
         dump_mode:
-            pe-sieve /dmode flag.
-            0 = no dump, 1 = PE dump (default), 3 = shellcode + PE.
+            pe-sieve /dmode flag (0=자동, 1=virtual, 2=unmapped, 3=realigned).
+            덤프 방식만 정한다. 쉘코드 영역 덤프 여부는 /shellc 와 탐지 결과가 정한다.
         shellcode:
             Shellcode detection mode (/shellc <mode>).
             0=disabled, 1=patterns, 2=stats, 3=patterns+stats.
@@ -199,12 +199,15 @@ class PeSieveScanner:
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
-        # 파일 이름에 PID 가 없는 경우: dump 서브디렉터리 내 *.json
+        # 파일 이름에 PID 가 없는 경우: dump 서브디렉터리(process_<pid>) 의 scan_report.json.
+        # 같은 폴더의 dump_report.json 이나 이전 실행 결과를 읽지 않도록
+        # 스캔 보고서 이름만 허용한다 (output_dir 자체는 다른 PID 결과가 섞여 있어 제외).
         if not candidates:
             dump_dir = Path(self._find_dump_dir(pid))
-            if dump_dir.exists():
+            if dump_dir.exists() and dump_dir != self.output_dir:
                 candidates = sorted(
-                    dump_dir.glob("*.json"),
+                    (p for p in dump_dir.glob("*.json")
+                     if p.name.lower() == "scan_report.json"),
                     key=lambda p: p.stat().st_mtime,
                     reverse=True,
                 )

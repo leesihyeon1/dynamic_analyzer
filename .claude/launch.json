@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "report-preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "http.server", "18090", "--bind", "127.0.0.1", "--directory", "results/ui-preview"],
+      "port": 18090
+    }
+  ]
+}

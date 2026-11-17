@@ -98,14 +98,16 @@ class HollowsHunter:
         shellcode: int = 1,   # 0=비활성, 1=패턴, 2=통계, 3=패턴+통계
         hooks: bool = True,   # hollows-hunter /hooks 는 값 없는 토글 플래그
         pname_filter: str | None = None,
+        timeout: int = 300,
     ) -> dict:
         """Scan all running processes with hollows-hunter.
 
         Parameters
         ----------
         dump_mode:
-            /dmode flag passed through to pe-sieve.
-            1 = PE dump (default), 3 = shellcode + PE.
+            /dmode flag passed through to pe-sieve
+            (0=자동, 1=virtual, 2=unmapped, 3=realigned). 쉘코드 영역 덤프 여부는
+            /shellc 와 탐지 결과가 정하며 dmode 와는 무관하다.
         shellcode:
             Shellcode detection mode (/shellc <mode>).
             0=disabled, 1=patterns, 2=stats, 3=patterns+stats.
@@ -115,6 +117,9 @@ class HollowsHunter:
         pname_filter:
             If set, only scan processes whose name contains this string
             (hollows-hunter /pname flag). Useful to focus on a known target.
+            여러 이름은 ';' 로 구분한다.
+        timeout:
+            실행 타임아웃(초). 시스템 전체 /hooks 스캔은 오래 걸릴 수 있다.
 
         Returns
         -------
@@ -151,10 +156,11 @@ class HollowsHunter:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=max(10, int(timeout or 300)),
             )
         except subprocess.TimeoutExpired:
-            return {"error": "hollows-hunter 타임아웃 (300s)"}
+            return {"error": f"hollows-hunter 타임아웃 ({max(10, int(timeout or 300))}s)",
+                    "timeout": True}
         except Exception as exc:
             return {"error": f"hollows-hunter 실행 오류: {exc}"}
 

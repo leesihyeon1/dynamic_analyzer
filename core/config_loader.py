@@ -55,6 +55,12 @@ _DEFAULTS: dict = {
     },
     "hunt": {
         "serve_port": 18080,
+        # abuse.ch Auth-Key — 릴레이가 서버 쪽에서 헤더로 붙인다 (HTML 에는 절대 넣지 않음).
+        # 권장: 환경변수 ABUSECH_AUTH_KEY 사용
+        "auth_key": "",
+        # IP 국가/ASN 조회 — 기본 꺼짐. 켜도 리포트의 버튼을 눌러야만 IP 목록이 전송된다.
+        "geo_lookup": False,
+        "geo_url": "http://ip-api.com/batch?fields=status,country,countryCode,org,as,query",
         "services": {
             "mb": {
                 "enabled": True,
@@ -125,6 +131,17 @@ def load_config(path: str | Path | None = None) -> dict:
 def get_hunt_cfg(path: str | Path | None = None) -> dict:
     """Hunt 탭 설정(hunt 섹션)만 반환합니다."""
     return load_config(path)["hunt"]
+
+
+def get_hunt_auth_key(path: str | Path | None = None) -> str:
+    """abuse.ch 인증 키 — config.json 의 hunt.auth_key, 비어 있으면 환경변수 ABUSECH_AUTH_KEY."""
+    try:
+        key = str(get_hunt_cfg(path).get("auth_key") or "").strip()
+    except Exception:
+        key = ""
+    if not key:
+        key = (os.environ.get("ABUSECH_AUTH_KEY") or os.environ.get("ABUSE_CH_AUTH_KEY") or "").strip()
+    return key
 
 
 def get_ai_cfg() -> dict:

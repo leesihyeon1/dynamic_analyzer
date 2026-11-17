@@ -48,6 +48,11 @@
   "hunt": {
     "_comment_serve": "serve_port > 0 이면 리포트를 http://127.0.0.1:PORT 로 서빙합니다 (CORS 문제 해소). 0 이면 file:// 직접 열기.",
     "serve_port": 18080,
+    "_comment_auth": "abuse.ch API(MalwareBazaar·ThreatFox·URLhaus)는 Auth-Key 가 필요합니다 (https://auth.abuse.ch 에서 무료 발급). 릴레이가 서버 쪽에서 헤더로 붙이며 리포트 HTML 에는 들어가지 않습니다. 비워두면 환경변수 ABUSECH_AUTH_KEY 를 사용합니다.",
+    "auth_key": "",
+    "_comment_geo": "geo_lookup=true 이면 IOC 외부 IP 표에 '국가/ASN 조회' 버튼이 생깁니다. 버튼을 눌러야만 IP 목록이 geo_url 로 전송됩니다 (기본 ip-api.com, 평문 HTTP). HTTPS 엔드포인트로 바꿔도 됩니다.",
+    "geo_lookup": false,
+    "geo_url": "http://ip-api.com/batch?fields=status,country,countryCode,org,as,query",
     "services": {
       "_comment": "enabled: false 로 설정하면 해당 서비스를 Hunt 탭에서 숨깁니다. url 을 프록시/미러로 교체 가능.",
       "mb": {

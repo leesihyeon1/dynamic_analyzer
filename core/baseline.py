@@ -178,6 +178,26 @@ class Baseline:
 
 # ── 수집 ─────────────────────────────────────────────────────────────────────
 
+def _registry_entry_key(entry) -> str:
+    """레지스트리 diff 항목 → "키\\값이름" 문자열.
+
+    diff_snapshots 는 (key_path, value_name, ...) 튜플을 돌려준다. 예전 코드는
+    getattr(entry, "key") 로 읽어 항상 빈 문자열이 되어 베이스라인 레지스트리가 비었다.
+    문자열·dict·속성 객체도 방어적으로 받는다.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, (tuple, list)) and entry:
+        key = str(entry[0] or "")
+        name = str(entry[1]) if len(entry) > 1 and entry[1] is not None else ""
+        return f"{key}\\{name}" if key and name else key
+    if isinstance(entry, dict):
+        key = str(entry.get("key") or entry.get("key_path") or "")
+        name = str(entry.get("name") or entry.get("value") or "")
+        return f"{key}\\{name}" if key and name else key
+    return str(getattr(entry, "key", "") or "")
+
+
 def capture_baseline(result, note: str = "") -> Baseline:
     """AnalysisResult(샘플 없이 실행한 결과) → Baseline.
 
@@ -254,7 +274,7 @@ def capture_baseline(result, note: str = "") -> Baseline:
     reg = getattr(result, "registry_diff", {}) or {}
     for bucket in ("added", "modified", "deleted"):
         for entry in (reg.get(bucket) or []):
-            key = entry if isinstance(entry, str) else getattr(entry, "key", "")
+            key = _registry_entry_key(entry)
             if key:
                 bl.registry_keys.add(key.lower())
 

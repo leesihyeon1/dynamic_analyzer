@@ -86,6 +86,26 @@ def _link(rel: str, text: str) -> str:
     return f"<a href=\"{_e(rel, quote=True)}\" target='_blank' rel='noopener'>{_e(text)}</a>"
 
 
+# 원래 확장자로 저장되면 더블클릭으로 실행되는 형식 — 내려받을 때 .bin 을 붙인다
+_EXEC_EXT = (".exe", ".dll", ".sys", ".scr", ".com", ".bat", ".cmd", ".ps1", ".vbs", ".vbe",
+             ".js", ".jse", ".wsf", ".hta", ".lnk", ".msi", ".jar", ".cpl", ".shc", ".pif")
+
+
+def _bin_link(rel: str, name: str) -> str:
+    """덤프 등 실행 가능 파일 링크 — download 속성으로 중립 확장자(.bin) 저장을 유도한다.
+
+    릴레이(hunt_relay)로 서빙될 때는 서버도 attachment + .bin 으로 내보낸다.
+    """
+    dl = name + ".bin" if name.lower().endswith(_EXEC_EXT) else name
+    return (f"<a href=\"{_e(rel, quote=True)}\" download=\"{_e(dl, quote=True)}\" rel='noopener'>"
+            f"{_e(name)}</a>")
+
+
+def _wireshark_str(value: str) -> str:
+    """Wireshark 표시 필터 문자열 리터럴 — 역슬래시와 큰따옴표를 이스케이프한다."""
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 # ── ① 행위별 증적 ────────────────────────────────────────────────────────────
 
 def _dropped_section(result, out_dir: Path) -> str:
@@ -193,7 +213,7 @@ def _dump_section(result, out_dir: Path) -> str:
         rel = d.relative_to(out_dir).as_posix()
         tag = _tier_tag(1) if pid in lineage else _tier_tag(2)
         listing = "".join(
-            f"<div class='ev-path'>{_link(f.relative_to(out_dir).as_posix(), f.name)} "
+            f"<div class='ev-path'>{_bin_link(f.relative_to(out_dir).as_posix(), f.name)} "
             f"<span class='ev-sub'>{_size(f.stat().st_size)}</span></div>"
             for f in sorted(bins, key=lambda x: -x.stat().st_size)[:6]
         )
@@ -210,6 +230,8 @@ def _dump_section(result, out_dir: Path) -> str:
         "<h3 class='ev-h3'>메모리 덤프 — pe-sieve / hollows-hunter</h3>"
         "<p class='ev-sub'>덤프된 PE(<code>.exe/.dll</code>)는 언패킹된 페이로드일 수 있습니다 — "
         "PE-bear·Ghidra·dnSpy 로 열어보세요. <code>.shc</code> 는 쉘코드 조각입니다.</p>"
+        "<p class='ev-sub' style='color:#f0b429'>⚠ 실제 악성 코드입니다. 링크는 <code>.bin</code> 을 덧붙여 "
+        "내려받도록 되어 있으니 실행하지 말고 분석 VM 안에서만 다루세요.</p>"
         "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련도</th><th>프로세스</th>"
         "<th>덤프 파일</th><th>위치</th></tr></thead><tbody>"
         + "".join(r[2] for r in rows) + "</tbody></table></div>"
@@ -232,7 +254,7 @@ def _network_section(result, out_dir: Path) -> str:
             continue
         seen.add(name)
         ips = getattr(q, "response_ips", None) or []
-        flt = f'dns.qry.name == "{name}"'
+        flt = f"dns.qry.name == {_wireshark_str(name)}"
         rows.append((tier, f"<tr><td>{_tier_tag(tier)}</td><td>DNS 질의</td>"
                      f"<td><div class='ev-path'>{_e(name)}</div><div class='ev-sub'>"
                      f"{'응답 ' + _e(', '.join(ips[:4])) if ips else '<span class=ev-miss>응답 없음</span>'}</div></td>"

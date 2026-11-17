@@ -180,6 +180,70 @@ def list_nvidia_models(base_url: str, api_key: str, timeout: int = 8) -> list:
         return []
 
 
+def probe_nvidia(api_key: str, model: str = "", timeout: int = 30) -> dict:
+    """AI 설정 창의 "연결 확인" — 카탈로그 조회 + 짧은 스트리밍 응답 1회로 키·모델·속도를 확인한다.
+
+    분석 데이터는 보내지 않는다 (고정 문장 한 줄). 결과:
+    {"ok": bool, "message": 한국어 안내, "models": 대화형 모델 목록, "ttft": 첫 응답 초 | None}
+    """
+    out = {"ok": False, "message": "", "models": [], "ttft": None}
+    api_key = (api_key or "").strip()
+    if not api_key:
+        out["message"] = "API 키가 없습니다. 키를 입력하거나 NVIDIA_API_KEY 환경변수를 설정하세요."
+        return out
+    started = time.monotonic()
+    catalog = list_nvidia_models(NVIDIA_BASE_URL, api_key, timeout=10)
+    out["models"] = sorted(m for m in catalog if is_chat_model(m))
+    if not catalog:
+        out["message"] = ("모델 목록을 받지 못했습니다 — 키가 틀렸거나 integrate.api.nvidia.com 에 연결할 수 없습니다 "
+                          "(분석 VM 의 외부 통신·프록시·FakeNet 확인).")
+        return out
+    model = (model or "").strip()
+    if model and model not in catalog:
+        out["message"] = (f"키는 유효하지만 '{model}' 은 현재 카탈로그에 없습니다. 목록에서 다른 모델을 고르세요 "
+                          f"(대화형 {len(out['models'])}개).")
+        return out
+    if not model:
+        out["ok"] = True
+        out["message"] = f"키 확인 — 대화형 모델 {len(out['models'])}개. 모델을 고르세요."
+        return out
+    payload = json.dumps({"model": model, "messages": [{"role": "user", "content": "연결 확인입니다. '확인' 한 단어로만 답하세요."}],
+                          "temperature": 0, "max_tokens": 16, "stream": True}).encode("utf-8")
+    request = urllib.request.Request(NVIDIA_ENDPOINT, data=payload, method="POST", headers={
+        "Authorization": "Bearer " + api_key, "Content-Type": "application/json", "Accept": "text/event-stream"})
+    opener = urllib.request.build_opener(_NoApiRedirect())
+    t0 = time.monotonic()
+    first = None
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            while time.monotonic() - t0 < timeout:
+                raw = response.readline()
+                if not raw:
+                    break
+                line = raw.decode("utf-8", "replace").strip()
+                if line.startswith("data:") and line[5:].strip() not in ("", "[DONE]"):
+                    first = time.monotonic() - t0
+                    break
+    except urllib.error.HTTPError as exc:
+        reasons = {401: "API 키 인증 실패", 403: "모델 접근 권한 없음", 404: "모델을 찾을 수 없음",
+                   410: "모델 제공 종료", 429: "호출 한도 초과", 402: "크레딧 확인 필요"}
+        out["message"] = f"모델 호출 실패 ({exc.code}): {reasons.get(exc.code, '서버 오류')}"
+        exc.close()
+        return out
+    except (TimeoutError, urllib.error.URLError, ConnectionError, IncompleteRead) as exc:
+        out["message"] = f"모델 응답 없음 ({timeout}초) — 서버 혼잡일 수 있습니다 ({type(exc).__name__})."
+        return out
+    if first is None:
+        out["message"] = f"{timeout}초 안에 첫 응답이 오지 않았습니다 — 대기열이 길거나 매우 느린 모델입니다."
+        return out
+    out["ok"] = True
+    out["ttft"] = round(first, 1)
+    speed = ("빠름" if first < 5 else "보통" if first < 20 else "느림 — 분석 한 번에 수 분 이상 걸릴 수 있음")
+    out["message"] = (f"연결 정상 — {model} 첫 응답 {first:.1f}초 ({speed}). "
+                      f"전체 확인 {time.monotonic() - started:.1f}초.")
+    return out
+
+
 def _is_nvidia_model_available(
     base_url: str, api_key: str, model: str, timeout: int = 8
 ) -> bool:
@@ -195,8 +259,14 @@ def _is_nvidia_model_available(
 # (한국어 위협 서술 + 파이프 구분 형식 준수)에 적합하다.
 # 정확히 일치하지 않으면 부분 일치로도 찾으므로 버전이 올라가도 잡힌다.
 NVIDIA_MODEL_PREFERENCES: tuple[str, ...] = (
-    # Qwen 계열 — CJK 비중이 높아 한국어 서술이 가장 자연스럽다
-    "mistralai/mistral-large-4-1t-a52b",   # 2026-11 실호출 확인
+    # 2026-11 실측 (합성 프롬프트 9.3천 자 / 3.8만 자, 무료 엔드포인트):
+    #   gemma-4-31b-it      첫 토큰 12초 · 초당 8.3토큰 · 한국어 템플릿 준수 — 빠른 대체 1순위
+    #   mistral-large-4     첫 토큰 79초 · 초당 3.2토큰 — 품질은 좋지만 4천 토큰에 20분 이상
+    #   nemotron-3.5-lightning · glm-5.3-flash — 추론 모델, 7천 토큰을 생각 과정에 다 써서 본문 0자
+    # 설정 모델이 끊기거나 멈추면 이 순서로 대체한다.
+    "google/gemma-4-31b-it",
+    "mistralai/mistral-large-4-1t-a52b",
+    # Qwen 계열 — CJK 비중이 높아 한국어 서술이 자연스럽다 (카탈로그에 있을 때)
     "qwen/qwen2.5-72b-instruct",
     "qwen/qwen3-235b-a22b",
     "qwen/qwen2.5-32b-instruct",
@@ -2481,6 +2551,100 @@ class _NoApiRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+# ── NVIDIA 스트리밍 수신 ──────────────────────────────────────────────────────
+# 비스트리밍 요청은 답변 전체가 완성될 때까지 서버가 1바이트도 보내지 않는다.
+# 대형 모델이 수 분간 생성하는 동안 중간 게이트웨이가 유휴 연결을 끊으면
+# 같은 요청을 처음부터 다시 보내도 같은 이유로 또 끊긴다("세 차례 끊김").
+# 스트리밍은 토큰이 생성되는 대로 흘러와 연결이 유휴 상태가 되지 않고,
+# 소켓 타임아웃이 "토큰 사이 무응답 시간" 이 되며, 끊겨도 받은 만큼은 남는다.
+_AI_IDLE_TIMEOUT      = 180   # 토큰 사이 최대 무응답(초) — 첫 토큰 대기(대기열·입력 처리) 포함
+_AI_PROGRESS_EVERY    = 10    # 수신 진행 알림 간격(초)
+_AI_PARTIAL_MIN_CHARS = 600   # 끊긴 응답을 부분 결과로 채택할 최소 본문 길이
+_DISCONNECT_ERRORS    = (RemoteDisconnected, ConnectionResetError, ConnectionAbortedError,
+                         BrokenPipeError, IncompleteRead)
+
+
+class _StreamCut(Exception):
+    """응답 수신 도중 연결이 끊기거나 무응답 제한을 넘김 — 받은 부분을 함께 전달한다."""
+
+    def __init__(self, partial: str, cause: BaseException) -> None:
+        super().__init__(type(cause).__name__)
+        self.partial = partial
+        self.cause = cause
+
+
+def _text_of(content) -> str:
+    """content 가 문자열이든 [{type: text, text}] 목록이든 본문 문자열로 바꾼다."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(part["text"] for part in content
+                       if isinstance(part, dict) and isinstance(part.get("text"), str)
+                       and part.get("type", "text") in ("text", "output_text"))
+    return ""
+
+
+def _read_chat_stream(response, deadline: float, on_progress=None) -> tuple:
+    """OpenAI 호환 SSE 응답을 끝까지 읽어 (본문, finish_reason, 거부 여부) 를 돌려준다.
+
+    서버가 stream 을 무시하고 JSON 한 덩어리로 답해도 해석한다.
+    수신 도중 끊기거나 제한 시간을 넘기면 받은 부분을 담아 _StreamCut 을 던진다.
+    """
+    parts: list = []
+    plain: list = []
+    finish, refusal, thinking = "", False, 0
+    last = time.monotonic()
+    try:
+        while True:
+            if time.monotonic() > deadline:
+                raise TimeoutError("AI 응답 전체 제한 시간 초과")
+            raw = response.readline()
+            if not raw or not isinstance(raw, (bytes, bytearray)):
+                break
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or line.startswith(":"):
+                continue                      # 빈 줄 · SSE keep-alive 주석
+            if not line.startswith("data:"):
+                plain.append(line)            # stream 을 무시한 서버의 일반 JSON
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                break
+            try:
+                chunk = json.loads(body)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                raise ValueError("스트림 오류 응답")
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                piece = _text_of(delta.get("content"))
+                if piece:
+                    parts.append(piece)
+                think = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(think, str):
+                    thinking += len(think)
+                if delta.get("refusal"):
+                    refusal = True
+                finish = choice.get("finish_reason") or finish
+            now = time.monotonic()
+            if on_progress and now - last >= _AI_PROGRESS_EVERY:
+                last = now
+                on_progress(sum(len(p) for p in parts), thinking)
+    except (TimeoutError, ConnectionError, IncompleteRead) as exc:
+        raise _StreamCut("".join(parts), exc) from None
+    if not parts and plain:
+        data = json.loads("\n".join(plain))
+        choice = data["choices"][0]
+        message = choice["message"]
+        finish = choice.get("finish_reason") or ""
+        return (_text_of(message.get("content")), finish,
+                bool(message.get("refusal")) or finish == "content_filter")
+    return "".join(parts), finish, refusal or finish == "content_filter"
+
+
 class NvidiaAnalyzer:
     """NVIDIA NIM으로 기존 행위 요약 프롬프트를 분석한다."""
 
@@ -2492,7 +2656,12 @@ class NvidiaAnalyzer:
     def is_available(self) -> bool:
         return bool(self.api_key and self.model)
 
-    def analyze(self, result, timeout: int = 600) -> AiAnalysisResult:
+    def analyze(self, result, timeout: int = 600, on_progress=None) -> AiAnalysisResult:
+        """분석 요약을 NVIDIA NIM 에 보내 서술 분석을 받는다.
+
+        on_progress(본문 글자 수, 추론 글자 수, 경과 초) — 수신 중 10초마다 호출된다.
+        timeout 은 AI 단계 전체 제한(초)이고, 토큰 사이 무응답 제한은 그보다 짧다.
+        """
         ai = AiAnalysisResult(model=self.model, provider="nvidia")
         if not self.is_available():
             ai.error = "NVIDIA API 키 또는 모델이 없습니다. GUI의 AI 설정 또는 NVIDIA_API_KEY를 확인하세요."
@@ -2501,6 +2670,8 @@ class NvidiaAnalyzer:
         tried: list = []
         stage = "분석 자료 구성"
         reduced = False
+        partial_note = ""
+        timeout = int(timeout or 600)
         try:
             # NVIDIA 는 128k 컨텍스트 — Ollama 용 10,000자 상한으로 증거를 잘라내지 않는다
             try:
@@ -2524,68 +2695,93 @@ class NvidiaAnalyzer:
             # 설정 모델이 카탈로그에서 빠졌거나 제공 종료(404/410)된 경우
             # 다음 후보로 자동 대체한다 — 모델 ID 하나 때문에 AI 분석이 통째로 죽지 않게.
             candidates = nvidia_model_candidates(NVIDIA_BASE_URL, self.api_key, self.model)
-            stage = "NVIDIA 요청"
+            deadline = start + max(60, timeout)
+            idle = max(5, min(timeout, _AI_IDLE_TIMEOUT))
+
+            def _tick(chars: int, thinking: int) -> None:
+                if on_progress:
+                    try:
+                        on_progress(chars, thinking, int(time.monotonic() - start))
+                    except Exception:
+                        pass
+
             disconnects = 0
-            data = None
+            last_failure: BaseException | None = None
+            content = None
+            cand = candidates[0]
             for idx, cand in enumerate(candidates):
-                stage = "NVIDIA 요청"
                 tried.append(cand)
                 payload = json.dumps({"model": cand, "messages": [{"role": "user", "content": prompt}],
                                       "temperature": 0.2, "max_tokens": default_max_tokens(cand),
-                                      "stream": False}).encode("utf-8")
+                                      "stream": True}).encode("utf-8")
                 request = urllib.request.Request(NVIDIA_ENDPOINT, data=payload,
                                                  headers={"Authorization": "Bearer " + self.api_key,
-                                                          "Content-Type": "application/json", "Accept": "application/json"}, method="POST")
-                try:
-                    raw = None
-                    while raw is None:
-                        try:
-                            with opener.open(request, timeout=timeout) as response:
-                                raw = response.read()
-                        except (ConnectionError, IncompleteRead, urllib.error.URLError) as exc:
-                            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-                            if not isinstance(cause, (RemoteDisconnected, ConnectionResetError,
-                                                      ConnectionAbortedError, BrokenPipeError, IncompleteRead)):
-                                raise
-                            disconnects += 1
-                            if disconnects >= 3:
-                                ai.error = f"NVIDIA 응답 연결이 세 차례 끊겨 AI 분석을 완료하지 못했습니다 (모델 {cand})."
-                                return ai
-                            time.sleep(disconnects)
-                            if disconnects == 2 and idx + 1 < len(candidates):
-                                break
-                    if raw is None:
-                        continue
+                                                          "Content-Type": "application/json",
+                                                          "Accept": "text/event-stream"}, method="POST")
+                next_candidate = False
+                text, finish, refusal = "", "", False
+                while True:
+                    stage = "NVIDIA 요청"
                     try:
-                        stage = "응답 해석"
-                        data = json.loads(raw)
-                        choice = data["choices"][0]
-                        message = choice["message"]
-                        content = message.get("content")
-                        if isinstance(content, list):
-                            content = "\n".join(part["text"] for part in content
-                                if isinstance(part, dict) and isinstance(part.get("text"), str)
-                                and part.get("type") in ("text", "output_text"))
-                        if choice.get("finish_reason") == "content_filter" or message.get("refusal"):
-                            ai.error = "NVIDIA 모델이 분석 응답을 제한했습니다."
-                            return ai
-                        if not isinstance(content, str) or not _strip_think(content).strip():
-                            reason = ("응답 토큰 한도 내 최종 본문 없음" if choice.get("finish_reason") == "length"
-                                      else "최종 분석 본문 없음")
-                            raise ValueError(reason)
-                    except (ValueError, KeyError, TypeError, IndexError, AttributeError) as parse_error:
-                        if idx + 1 < len(candidates) and idx < 2:
-                            continue
-                        reason = str(parse_error) if str(parse_error) in (
-                            "응답 토큰 한도 내 최종 본문 없음", "최종 분석 본문 없음") else "응답 형식 오류"
-                        ai.error = f"NVIDIA {reason} (모델 {cand}, 시도 {len(tried)}회)"
+                        with opener.open(request, timeout=idle) as response:
+                            stage = "응답 수신"
+                            text, finish, refusal = _read_chat_stream(response, deadline, _tick)
+                        break
+                    except urllib.error.HTTPError as exc:
+                        if exc.code in (404, 410) and idx + 1 < len(candidates):
+                            exc.close()
+                            next_candidate = True
+                            break
+                        raise
+                    except _StreamCut as cut:
+                        if len(_strip_think(cut.partial).strip()) >= _AI_PARTIAL_MIN_CHARS:
+                            # 본문 대부분을 받은 뒤 끊김 — 다시 처음부터 생성하느니 받은 만큼 쓴다
+                            text, finish, refusal = cut.partial, "cut", False
+                            partial_note = "응답 수신 중 연결이 끊겨 일부만 받았습니다 — 받은 부분까지만 표시합니다"
+                            break
+                        last_failure = cut.cause
+                    except (ConnectionError, IncompleteRead, TimeoutError, urllib.error.URLError) as exc:
+                        cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                        if not isinstance(cause, _DISCONNECT_ERRORS + (TimeoutError,)):
+                            raise
+                        last_failure = cause
+                    # 여기까지 왔으면 끊김 또는 무응답 — 같은 모델 1회 재시도 후 다음 후보
+                    disconnects += 1
+                    if disconnects >= 3 or time.monotonic() > deadline:
+                        if isinstance(last_failure, TimeoutError):
+                            ai.error = (f"NVIDIA 응답이 세 차례 {idle}초 이상 멈추거나 전체 제한 {timeout}초를 넘겨 "
+                                        f"AI 분석을 완료하지 못했습니다 (모델 {cand}). 서버 혼잡일 수 있으니 "
+                                        "잠시 후 다시 시도하거나 AI 설정에서 더 작은 모델을 지정하세요.")
+                        else:
+                            ai.error = (f"NVIDIA 응답 연결이 세 차례 끊겨 AI 분석을 완료하지 못했습니다 (모델 {cand}). "
+                                        "분석 VM 의 외부 통신(프록시·FakeNet·방화벽)을 확인하거나 더 작은 모델을 지정하세요.")
+                        ai.elapsed_sec = round(time.monotonic() - start, 1)
                         return ai
-                    break
-                except urllib.error.HTTPError as exc:
-                    if exc.code in (404, 410) and idx + 1 < len(candidates):
-                        exc.close()
+                    time.sleep(disconnects)
+                    if disconnects == 2 and idx + 1 < len(candidates):
+                        next_candidate = True
+                        break
+                if next_candidate:
+                    continue
+                stage = "응답 해석"
+                if refusal:
+                    ai.error = "NVIDIA 모델이 분석 응답을 제한했습니다."
+                    ai.elapsed_sec = round(time.monotonic() - start, 1)
+                    return ai
+                if not _strip_think(text or "").strip():
+                    if idx + 1 < len(candidates) and idx < 2:
                         continue
-                    raise
+                    reason = ("응답 토큰 한도 내 최종 본문 없음" if finish == "length"
+                              else "최종 분석 본문 없음")
+                    ai.error = f"NVIDIA {reason} (모델 {cand}, 시도 {len(tried)}회)"
+                    ai.elapsed_sec = round(time.monotonic() - start, 1)
+                    return ai
+                content = text
+                break
+            if content is None:
+                ai.error = f"NVIDIA 응답을 받지 못했습니다 (시도한 모델: {', '.join(tried)})"
+                ai.elapsed_sec = round(time.monotonic() - start, 1)
+                return ai
             if cand != self.model:
                 self.model_note = f"설정 모델 '{self.model}' 사용 불가 → '{cand}' 자동 대체"
                 self.model = ai.model = cand
@@ -2593,8 +2789,10 @@ class NvidiaAnalyzer:
             ai.response = _strip_think(content).replace(self.api_key, "[API KEY REDACTED]")
             if not ai.response.strip():
                 raise ValueError("empty response")
-            if choice.get("finish_reason") == "length":
+            if finish == "length":
                 ai.response += "\n\n*(응답 토큰 한도에 도달해 분석이 중단되었습니다)*"
+            elif partial_note:
+                ai.response += f"\n\n*({partial_note})*"
             # 데이터로 확정 가능한 섹션은 계산값으로 교체 (할루시네이션 방지)
             try:
                 ai.response = _inject_behavioral_section(ai.response, _build_behavioral_text(result))

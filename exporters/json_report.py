@@ -1,10 +1,52 @@
-"""JSON 보고서 저장"""
+"""JSON 보고서 저장
+
+보고서는 분석 중(1차, AI 진행 중)과 끝난 뒤(최종) 두 번 같은 파일로 쓰일 수 있다.
+GUI·브라우저가 읽는 도중에 반쯤 쓰인 파일을 보지 않도록 같은 폴더의 임시 파일에
+쓴 뒤 os.replace 로 바꿔 끼운다 (atomic_write_text).
+"""
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+import time
 from dataclasses import asdict, fields, is_dataclass
 from pathlib import Path
 from typing import Any
+
+_LIST_CAP = 200     # process_behaviors 항목별 목록 상한
+
+
+def atomic_write_text(path, text: str, encoding: str = "utf-8", retries: int = 6, delay: float = 0.25) -> None:
+    """같은 폴더의 임시 파일에 쓴 뒤 os.replace 로 교체한다.
+
+    Windows 에서는 GUI·브라우저가 파일을 읽는 순간 교체가 PermissionError 로 실패할 수
+    있어 잠깐씩 기다리며 몇 번 다시 시도한다. 끝내 실패하면 직접 덮어쓰기로 물러선다.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as f:
+            f.write(text)
+        last_exc = None
+        for attempt in range(max(1, retries)):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError as exc:
+                last_exc = exc
+                time.sleep(delay * (attempt + 1))
+        try:
+            path.write_text(text, encoding=encoding)
+        except OSError:
+            raise last_exc
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _to_serializable(obj: Any) -> Any:
@@ -37,10 +79,94 @@ def _iocs_json(ioc) -> dict:
     if not ioc:
         return {}
     out = _to_serializable(ioc)
-    tiers = getattr(ioc, "dropped_file_tiers", None)
+    tiers = getattr(ioc, "dropped_file_tiers", None) or {}
     if tiers:
         out["dropped_file_tiers"] = {str(k): v for k, v in tiers.items()}
+    # 차단 목록에는 샘플 계보·상관 의심(tier ≤2)만, 환경 배경(tier 3)은 참고용으로 분리
+    drops = [str(f) for f in (getattr(ioc, "dropped_files", None) or [])]
+    out["dropped_files_sample"] = [f for f in drops if (tiers.get(f, 2) or 2) <= 2]
+    out["dropped_files_background"] = [f for f in drops if (tiers.get(f, 2) or 2) >= 3]
     return out
+
+
+def _cap(items) -> list:
+    return [str(i) for i in list(items or [])[:_LIST_CAP]]
+
+
+def _process_behaviors_json(behaviors) -> dict:
+    """{pid: ProcessBehavior} → {"<pid>": {name, files_written, …, <key>_count}}."""
+    out: dict = {}
+    if not isinstance(behaviors, dict):
+        return out
+    for pid, b in behaviors.items():
+        if b is None:
+            continue
+        try:
+            row: dict = {"name": str(getattr(b, "name", "") or "")}
+            lists = {
+                "files_written": list(getattr(b, "files_written", None) or []),
+                "files_deleted": list(getattr(b, "files_deleted", None) or []),
+                "reg_written":   list(getattr(b, "reg_written", None) or []),
+                "reg_deleted":   list(getattr(b, "reg_deleted", None) or []),
+                "children":      [f"{c[1]} ({c[0]})" if isinstance(c, (list, tuple)) and len(c) >= 2 else str(c)
+                                  for c in (getattr(b, "children", None) or [])],
+                "tcp_conns":     [f"{c[0]}:{c[1]}" if isinstance(c, (list, tuple)) and len(c) >= 2 else str(c)
+                                  for c in (getattr(b, "tcp_conns", None) or [])],
+                "dns_queries":   list(getattr(b, "dns_queries", None) or []),
+            }
+            for key, items in lists.items():
+                row[key] = _cap(items)
+                row[f"{key}_count"] = len(items)
+            out[str(pid)] = row
+        except Exception:
+            continue
+    return out
+
+
+def _verdict_json(result) -> dict:
+    """판정 요약과 같은 규칙 기반 지표·점수 (exporters.report_visuals)."""
+    try:
+        from exporters.report_visuals import build_indicators, score_indicators
+        inds = build_indicators(result)
+        score, level, label, _color = score_indicators(inds)
+    except Exception as exc:
+        return {"level": "", "label": "", "score": None, "indicators": [],
+                "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "level": level, "label": label, "score": score,
+        "indicators": [{k: i.get(k, "") for k in ("level", "cat", "title", "ev", "tid")} for i in inds],
+    }
+
+
+def _collection_status_json(result) -> list:
+    try:
+        from core.collection_health import collection_status
+        return collection_status(result) or []
+    except Exception:
+        return []
+
+
+def _sample_display_name(result) -> str:
+    sp = getattr(getattr(result, "config", None), "sample_path", None)
+    if not sp:
+        return "전체 시스템 모니터링"
+    try:
+        return Path(sp).name or str(sp)
+    except TypeError:
+        return str(sp)
+
+
+def write_index_json(result, output_dir, verdict: dict | None = None) -> None:
+    """<output_dir>/index.json — GUI 최근 결과 목록용 요약."""
+    v = verdict or _verdict_json(result)
+    data = {
+        "sample":       _sample_display_name(result),
+        "level":        v.get("level", ""),
+        "score":        v.get("score"),
+        "label":        v.get("label", ""),
+        "report_stage": str(getattr(result, "report_stage", "final") or "final"),
+    }
+    atomic_write_text(Path(output_dir) / "index.json", json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _build_yara_json(yr) -> dict:
@@ -71,11 +197,16 @@ def _build_yara_json(yr) -> dict:
 
 
 def save_json_report(result, output_path: str) -> None:
-    """AnalysisResult → JSON 파일 저장"""
-    from core.orchestrator import AnalysisResult
-
+    """AnalysisResult → JSON 파일 저장 (원자적 교체) + 같은 폴더에 index.json"""
+    verdict = _verdict_json(result)
     data = {
         "sample":    str(result.config.sample_path),
+        "sample_sha256": str(getattr(result, "sample_sha256", "") or ""),
+        "report_stage":  str(getattr(result, "report_stage", "final") or "final"),
+        "verdict":       verdict,
+        "sample_active": bool(getattr(result, "sample_active", True)),
+        "inactivity_signals": [str(x) for x in (getattr(result, "inactivity_signals", None) or [])],
+        "collection_status":  _collection_status_json(result),
         "timeout":   result.config.timeout,
         "duration":  round(result.end_time - result.start_time, 1),
         "tools_used": result.tools_used,
@@ -152,6 +283,8 @@ def save_json_report(result, output_path: str) -> None:
             for c in getattr(result, "process_network_map", [])
         ],
 
+        "process_behaviors": _process_behaviors_json(getattr(result, "process_behaviors", None)),
+
         "events_summary": {
             "total":    len(result.procmon_events),
             "filtered": len(result.filtered_events),
@@ -161,7 +294,8 @@ def save_json_report(result, output_path: str) -> None:
         "ai_analysis": _to_serializable(getattr(result, "ai_analysis", None)),
     }
 
-    Path(output_path).write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    atomic_write_text(output_path, json.dumps(data, ensure_ascii=False, indent=2, default=str))
+    try:
+        write_index_json(result, Path(output_path).parent, verdict)
+    except Exception:
+        pass    # 목록용 요약 실패는 보고서 저장을 막지 않는다

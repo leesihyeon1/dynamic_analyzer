@@ -266,15 +266,14 @@ class FakeNetIntegrator:
         cmd = [str(self.fakenet_path)]
         if self.config_path and self.config_path.is_file():
             cmd += ["-c", str(self.config_path)]
-        # 출력 디렉터리 지정 (FakeNet-NG 1.4+)
-        cmd += ["-o", str(self.output_dir)]
+        cmd += ["-l", str(log_file.resolve())]
 
         try:
             self._proc = subprocess.Popen(
                 cmd,
-                stdout=open(log_file, "w", encoding="utf-8"),
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.STDOUT,
-                cwd=str(self.fakenet_path.parent),
+                cwd=str(self.output_dir.resolve()),
             )
             self._start_time = time.monotonic()
             time.sleep(2.0)   # 바인딩 대기
