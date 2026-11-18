@@ -20,7 +20,9 @@ from pathlib import Path
 
 _e = html.escape
 
-_TIER_BADGE = {1: ("샘플", "#ff7b72"), 2: ("의심", "#e3b341"), 3: ("평상시", "#6e7681")}
+from exporters.report_ui import section_title  # noqa: E402
+
+_TIER_BADGE = {1: ("샘플", "var(--danger)"), 2: ("의심", "var(--warn)"), 3: ("평상시", "var(--fg-4)")}
 
 # 결과 폴더의 원본 수집물 — (판별 함수, 종류, 여는 도구/용도)
 _ARTIFACT_KINDS = (
@@ -38,18 +40,18 @@ _ARTIFACT_KINDS = (
 
 _CSS = """
 <style>
-.ev-copy{background:#21262d;border:1px solid #30363d;color:#8b949e;
+.ev-copy{background:var(--line);border:1px solid var(--line-2);color:var(--fg-3);
   font-size:.68rem;padding:1px 7px;cursor:pointer;white-space:nowrap}
-.ev-copy:hover{color:#c9d1d9;border-color:#58a6ff}
-.ev-copy.ok{color:#3fb950;border-color:#3fb950}
+.ev-copy:hover{color:var(--fg-2);border-color:var(--info)}
+.ev-copy.ok{color:var(--ok);border-color:var(--ok)}
 .ev-tbl td{vertical-align:top}
 .ev-path{font-family:monospace;font-size:.76rem;word-break:break-all}
-.ev-sub{color:#8b949e;font-size:.72rem;margin-top:2px}
-.ev-hash{font-family:monospace;font-size:.68rem;color:#8b949e;word-break:break-all}
+.ev-sub{color:var(--fg-3);font-size:.72rem;margin-top:2px}
+.ev-hash{font-family:monospace;font-size:.68rem;color:var(--fg-3);word-break:break-all}
 .ev-tag{display:inline-block;padding:0 6px;font-size:.66rem;font-weight:700;
   border:1px solid currentColor;margin-right:4px}
-.ev-miss{color:#f85149}.ev-ok{color:#3fb950}
-.ev-h3{margin:1.4rem 0 .5rem;font-size:.95rem;color:#c9d1d9}
+.ev-miss{color:var(--danger)}.ev-ok{color:var(--ok)}
+.ev-h3{margin:1.4rem 0 .5rem;font-size:.95rem;color:var(--fg-2)}
 </style>
 <script>
 function evCopy(b){
@@ -78,7 +80,7 @@ def _size(n: int) -> str:
 
 
 def _tier_tag(t: int) -> str:
-    label, color = _TIER_BADGE.get(t, ("미판정", "#6e7681"))
+    label, color = _TIER_BADGE.get(t, ("미판정", "var(--fg-4)"))
     return f"<span class='ev-tag' style='color:{color}'>{label}</span>"
 
 
@@ -114,7 +116,7 @@ def _dropped_section(result, out_dir: Path) -> str:
     smp = ev.get("sample") or {}
     if smp:
         rows.append(
-            "<tr><td><span class='ev-tag' style='color:#58a6ff'>샘플</span></td>"
+            "<tr><td><span class='ev-tag' style='color:var(--info)'>샘플</span></td>"
             f"<td><div class='ev-path'>{_e(smp.get('path', ''))}</div>"
             f"<div class='ev-hash'>SHA-256 {_e(smp.get('sha256', ''))}</div></td>"
             f"<td>{_size(smp.get('size', 0))}</td><td>-</td>"
@@ -230,7 +232,7 @@ def _dump_section(result, out_dir: Path) -> str:
         "<h3 class='ev-h3'>메모리 덤프 — pe-sieve / hollows-hunter</h3>"
         "<p class='ev-sub'>덤프된 PE(<code>.exe/.dll</code>)는 언패킹된 페이로드일 수 있습니다 — "
         "PE-bear·Ghidra·dnSpy 로 열어보세요. <code>.shc</code> 는 쉘코드 조각입니다.</p>"
-        "<p class='ev-sub' style='color:#f0b429'>⚠ 실제 악성 코드입니다. 링크는 <code>.bin</code> 을 덧붙여 "
+        "<p class='ev-sub' style='color:var(--warn)'>실제 악성 코드입니다. 링크는 <code>.bin</code> 을 덧붙여 "
         "내려받도록 되어 있으니 실행하지 말고 분석 VM 안에서만 다루세요.</p>"
         "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련성</th><th>프로세스</th>"
         "<th>덤프 파일</th><th>위치</th></tr></thead><tbody>"
@@ -373,7 +375,7 @@ def evidence_html(result, output_path: str) -> str:
     """증거 탭 본문. 어떤 섹션이 실패해도 나머지는 그대로 나온다."""
     out_dir = Path(output_path).resolve().parent
     parts = [_CSS,
-             "<h2>증거 — 판정 근거 직접 확인</h2>",
+             section_title("evidence", "증거", "판정을 뒷받침하는 원본과 직접 확인하는 방법"),
              "<p class='ev-sub' style='margin-bottom:.6rem'>리포트의 각 판정을 뒷받침하는 원본 파일과 "
              "확인 방법입니다. 이 VM 안에서 링크를 열거나 경로를 복사해 분석 도구에 붙여 넣으세요.</p>"]
     for fn, args in ((_dropped_section, (result, out_dir)), (_registry_section, (result,)),

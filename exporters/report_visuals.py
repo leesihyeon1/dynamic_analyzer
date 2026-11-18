@@ -27,36 +27,12 @@ import os
 _e = html.escape
 
 # 의미 색 — 리포트 전체에서 같은 뜻으로만 쓴다
-C_MAL, C_SUS, C_INFO, C_OK, C_MUTE = "#ff6b6b", "#f0b429", "#4fb3d9", "#3fb98f", "#2a3b54"
+# report_ui 토큰(--danger·--warn·--info·--ok·--line-2)과 같은 값
+C_MAL, C_SUS, C_INFO, C_OK, C_MUTE = "#f87171", "#fbbf24", "#60a5fa", "#34d399", "#2a3a56"
 
 VISUALS_CSS = """
 <style>
-/* ══ 화면 원칙: 상자 대신 선 ═══════════════════════════════════════════════
-   둥근 카드·채운 배경을 걷어내고 구분선과 표로만 구획한다.
-   리포트는 탭이 아니라 위에서 아래로 읽는 한 장의 문서다. */
-.card,.metric,.hunt-box,.hunt-card,.health-strip,.alert,.badge,.tab-btn,.srch-input,.hunt-input,
-.pg-btn,code,.act-badge,.attk-chip,.ptree,.beh-panel,.report-actions button,.tbadge,
-.tab-panel [style*='border-radius']{border-radius:0!important}
-.card{background:transparent;border:0;border-top:1px solid var(--line);padding:4px 0}
-.grid2{gap:0 48px}
-.health-strip,.health-strip.warning{background:transparent;border:0;border-left:3px solid currentColor;padding:6px 14px}
-.tools-disclosure{border-bottom:0;margin:10px 0 0;padding-bottom:0}
-th{background:transparent;border-bottom:2px solid #4a5f7d;padding:9px 12px}
-td{padding:8px 12px;border-bottom:1px solid #1f2e45}
-tbody tr:nth-child(even)>td{background:transparent}
-h2{font-size:1.2rem;margin:18px 0 14px;display:flex;align-items:baseline}
-h3{border-bottom:1px solid var(--line);padding-bottom:6px;color:var(--text);font-size:.95rem}
-.tab-btn{border-left:3px solid transparent!important;padding:9px 14px}
-.tab-btn.active{background:transparent;border-left-color:var(--accent)!important;color:var(--text)}
-.tab-btn:hover{background:transparent;color:var(--text)}
-
-/* ── 세로 단일 페이지: 모든 구간을 순서대로 펼친다 ── */
-.container{counter-reset:sec}
-.tab-panel{display:block!important;animation:none!important;border-top:2px solid #4a5f7d;margin-top:64px;
-  padding-top:2px;scroll-margin-top:14px;counter-increment:sec}
-#tab-basic{border-top:0;margin-top:0;counter-increment:none}
-.tab-panel:not(#tab-basic)>h2:first-of-type:before{content:counter(sec,decimal-leading-zero);
-  font-family:'Cascadia Code',Consolas,monospace;font-size:.82rem;color:var(--accent);margin-right:14px;letter-spacing:.06em}
+/* 섹션 카드·여백·모서리는 exporters/report_ui.py 가 정한다 */
 
 /* ── 판정 요약 ── */
 .va{border-top:3px solid var(--vc);padding:16px 0 0;margin:0 0 30px}
@@ -149,13 +125,18 @@ document.addEventListener('DOMContentLoaded',function(){
   btns.forEach(function(b){b.addEventListener('click',function(e){
     e.stopImmediatePropagation();
     var p=document.getElementById(b.dataset.tab); if(!p) return;
-    window.scrollTo({top:p.getBoundingClientRect().top+window.scrollY-10,behavior:'auto'}); mark(b.dataset.tab);
+    var bar=document.querySelector('.topbar'), off=(bar?bar.offsetHeight:0)+14;
+    window.scrollTo({top:p.getBoundingClientRect().top+window.scrollY-off,behavior:'auto'}); mark(b.dataset.tab);
   },true);});
   var tick=false;
   window.addEventListener('scroll',function(){ if(tick) return; tick=true;
     requestAnimationFrame(function(){ tick=false; var cur=null;
       btns.forEach(function(b){var p=document.getElementById(b.dataset.tab);
-        if(p&&p.getBoundingClientRect().top<=140) cur=b.dataset.tab;});
+        if(p&&p.getBoundingClientRect().top<=Math.max(160,window.innerHeight*0.33)) cur=b.dataset.tab;});
+      // 페이지 끝에 닿으면 마지막 섹션 — 그 머리는 기준선까지 올라오지 못한다
+      if(window.innerHeight+window.scrollY>=document.documentElement.scrollHeight-4){
+        var last=btns.filter(function(b){return document.getElementById(b.dataset.tab);}).pop();
+        if(last) cur=last.dataset.tab; }
       if(cur) mark(cur); });
   },{passive:true});
 });
@@ -480,11 +461,15 @@ def _technique_split(result) -> tuple:
     return c[1], c[2], c[3], c["ext"]
 
 
-def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", verdict: dict = None) -> str:
-    """개요 탭 최상단 — 판정, 점수 링, 지표 목록.
+def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", verdict: dict = None,
+                          *, sample_path: str = "", facts: list = None) -> str:
+    """개요 맨 위 히어로 카드 — 점수 도넛 · 판정 · 패밀리 · 파일 정보 · 핵심 수치 · 근거 목록.
 
-    verdict: report_verdict(result) 결과를 넘기면 다시 계산하지 않는다 (헤더와 같은 값 보장).
+    verdict: report_verdict(result) 결과를 넘기면 다시 계산하지 않는다 (상단 바와 같은 값 보장).
+    facts:   [(이름, 값)] — 분석 시각·관찰 시간 등 오른쪽 정보 칸.
     """
+    from exporters.report_ui import icon
+
     v = verdict or report_verdict(result)
     inds = v["indicators"]
     score, verdict, vcolor = v["score"], v["label"], v["color"]
@@ -501,8 +486,7 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", ver
     p1, p2, p3 = _tc("processes")
     t1, t2, t3, tx = _technique_split(result)
     _BG = "#5b6f8c"
-    rings = [
-        _stat("위협 점수", str(score), "/ 100", [(score, "", vcolor), (100 - score, "", C_MUTE)]),
+    tiles = [
         _stat("탐지 근거", str(len(inds)), "건",
               [(len(mal), "악성", C_MAL), (len(sus), "의심", C_SUS), (len(info), "정보", C_INFO)]),
         _stat("새 프로세스", str(p1 + p2 + p3), "개", [(p1, "샘플", C_MAL), (p2, "의심", C_SUS), (p3, "평상시", _BG)]),
@@ -517,7 +501,7 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", ver
                                          else ["실행 파일"] if ext in ("exe", "dll", "scr") else []))
     fams = [f["name"] for f in ((getattr(result, "malware_traits", None) or {}).get("families") or [])
             if f.get("confidence") == "HIGH"]
-    tags += "".join(f"<span class='va-tag va-family'>{_e(f)}</span>" for f in fams)
+    tags = "".join(f"<span class='va-tag va-family'>{_e(f)}</span>" for f in fams) + tags
     sample_pid = getattr(result, "sample_pid", None)
     host = ""
     for p in ((getattr(result, "process_diff", None) or {}).get("new_processes", []) or []):
@@ -525,14 +509,29 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", ver
             host = f"<span class='va-tag'>호스트 {_e(getattr(p, 'name', ''))} · PID {sample_pid}</span>"
             break
 
+    circ = 2 * math.pi * 50
+    donut = (f"<div class='hero-score' role='img' aria-label='위협 점수 {score}점 / 100'>"
+             "<svg viewBox='0 0 116 116' aria-hidden='true'><circle class='track' cx='58' cy='58' r='50'/>"
+             f"<circle class='val' cx='58' cy='58' r='50' stroke-dasharray='{circ * score / 100:.1f} {circ:.1f}'/></svg>"
+             f"<div class='num'><b>{score}</b><small>위협 점수</small></div></div>")
+    hash_html = (f"<div class='hero-hash'><span>SHA-256</span><code>{_e(sample_sha256)}</code>"
+                 f"<button type='button' class='btn' data-copy='{_e(sample_sha256)}'>{icon('copy')}"
+                 "<span class='lbl'>복사</span></button></div>") if sample_sha256 else ""
+    path_html = (f"<div class='hero-path'>{_e(sample_path)}</div>"
+                 if sample_path and str(sample_path) != sample_name else "")
+    facts_html = ("<dl class='hero-facts'>" + "".join(
+        f"<div><dt>{_e(k)}</dt><dd>{_e(val)}</dd></div>" for k, val in facts) + "</dl>") if facts else ""
+
     return (
         "<section class='va' aria-label='판정 요약' style='--vc:" + vcolor + "'>"
-        f"<div class='va-head'><span class='va-pill'>{_e(verdict)}</span>"
-        f"<span class='va-name'>{_e(sample_name)}</span>{tags}{host}</div>"
-        + (f"<div class='va-hash'>SHA-256 {_e(sample_sha256)}</div>" if sample_sha256 else "<div class='va-hash'></div>")
-        + f"<div class='va-stats'>{''.join(rings)}</div>"
+        "<div class='hero-top'>" + donut
+        + "<div class='hero-id'>"
+        f"<div class='va-head'><span class='va-pill'>{_e(verdict)}</span>{tags}{host}</div>"
+        f"<h1 class='hero-name'>{_e(sample_name)}</h1>{path_html}{hash_html}</div>"
+        + facts_html + "</div>"
+        f"<div class='va-stats'>{''.join(tiles)}</div>"
         "<div class='va-ind'>"
-        + _indicator_block("악성 근거", C_MAL, mal, len(mal) <= 3)
+        + _indicator_block("악성 근거", C_MAL, mal, True)
         + _indicator_block("의심 근거", C_SUS, sus, len(sus) <= 3)
         + _indicator_block("참고 정보", C_INFO, info, False)
         + "</div></section>"

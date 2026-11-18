@@ -11,6 +11,7 @@ import re as _re
 from datetime import datetime
 from pathlib import Path
 from exporters.report_theme import REPORT_CSS, COMPACT_JS, report_header
+from exporters.report_ui import UI_CSS, UI_JS, icon as _icon, nav_brand as _nav_brand, section_title as _sec
 
 # HH/pe-sieve JIT·UWP 오탐 화이트리스트 — analysis/fp_allowlist.py 단일 소스
 from analysis.fp_allowlist import HH_SYSTEM_FP_NAMES as _HH_FP_ALLOWLIST
@@ -30,165 +31,165 @@ from analysis.registry_relevance import registry_key_interest
 
 _CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #e6edf3; line-height: 1.6; }
+body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg-inset); color: var(--fg-1); line-height: 1.6; }
 .container { max-width: 1300px; margin: 0 auto; padding: 2rem; }
-h1 { font-size: 1.8rem; color: #58a6ff; margin-bottom: 0.25rem; }
-h2 { font-size: 1.15rem; color: #79c0ff; margin: 2rem 0 0.75rem;
-     border-bottom: 1px solid #30363d; padding-bottom: 0.4rem; }
-h3 { font-size: 0.95rem; color: #d2a8ff; margin: 1rem 0 0.4rem; }
-.subtitle { color: #8b949e; font-size: 0.9rem; margin-bottom: 2rem; }
+h1 { font-size: 1.8rem; color: var(--info); margin-bottom: 0.25rem; }
+h2 { font-size: 1.15rem; color: var(--info); margin: 2rem 0 0.75rem;
+     border-bottom: 1px solid var(--line-2); padding-bottom: 0.4rem; }
+h3 { font-size: 0.95rem; color: var(--purple); margin: 1rem 0 0.4rem; }
+.subtitle { color: var(--fg-3); font-size: 0.9rem; margin-bottom: 2rem; }
 table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
-th { background: #161b22; color: #8b949e; text-align: left;
+th { background: var(--surface); color: var(--fg-3); text-align: left;
      padding: 0.5rem 0.75rem; font-weight: 600; white-space: nowrap; }
-td { padding: 0.4rem 0.75rem; border-bottom: 1px solid #21262d;
+td { padding: 0.4rem 0.75rem; border-bottom: 1px solid var(--line);
      word-break: break-all; vertical-align: top; }
-tr:hover td { background: #161b22; }
+tr:hover td { background: var(--surface); }
 .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 9999px;
          font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
-.badge-red    { background: #3d1f1f; color: #ff7b72; }
-.badge-orange { background: #3d2a1f; color: #ffa657; }
-.badge-yellow { background: #3d361f; color: #e3b341; }
-.badge-green  { background: #1f3d2a; color: #56d364; }
-.badge-blue   { background: #1f2d3d; color: #79c0ff; }
-.badge-purple { background: #2d1f3d; color: #d2a8ff; }
-.badge-gray   { background: #21262d; color: #8b949e; }
+.badge-red    { background: var(--danger-bg); color: var(--danger); }
+.badge-orange { background: var(--orange-bg); color: var(--orange); }
+.badge-yellow { background: var(--warn-bg); color: var(--warn); }
+.badge-green  { background: var(--ok-bg); color: var(--ok); }
+.badge-blue   { background: var(--info-bg); color: var(--info); }
+.badge-purple { background: var(--purple-bg); color: var(--purple); }
+.badge-gray   { background: var(--line); color: var(--fg-3); }
 .alert { padding: 0.75rem 1rem; border-radius: 6px; margin: 0.75rem 0; font-size: 0.875rem; }
-.alert-danger  { background: #3d1f1f; border-left: 3px solid #ff7b72; }
-.alert-warning { background: #3d2a1f; border-left: 3px solid #ffa657; }
-.alert-info    { background: #1f2d3d; border-left: 3px solid #79c0ff; }
-.alert-success { background: #1f3d2a; border-left: 3px solid #56d364; }
+.alert-danger  { background: var(--danger-bg); border-left: 3px solid var(--danger); }
+.alert-warning { background: var(--orange-bg); border-left: 3px solid var(--orange); }
+.alert-info    { background: var(--info-bg); border-left: 3px solid var(--info); }
+.alert-success { background: var(--ok-bg); border-left: 3px solid var(--ok); }
 .mono  { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 0.78rem; }
-code   { background: #161b22; padding: 0.1rem 0.3rem; border-radius: 4px;
+code   { background: var(--surface); padding: 0.1rem 0.3rem; border-radius: 4px;
          font-family: monospace; font-size: 0.8rem; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
-.card  { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.25rem; }
-.kv td:first-child { color: #8b949e; width: 180px; font-weight: 500; white-space: nowrap; }
-.tactic-tag { font-size: 0.68rem; color: #8b949e; margin-left: 0.4rem; }
-.ev-file     { color: #79c0ff; }
-.ev-registry { color: #d2a8ff; }
-.ev-process  { color: #ffa657; }
-.ev-network  { color: #56d364; }
-.attk-chip{display:inline-block;font-size:.62rem;font-family:monospace;padding:.08rem .3rem;border-radius:3px;background:#0d2137;color:#79c0ff;border:1px solid #1f4068;white-space:nowrap;cursor:default;vertical-align:middle;line-height:1.5}
-.attk-chip-more{background:#1c2128;color:#8b949e;border-color:#30363d}
-.pg-wrap{display:flex;align-items:center;gap:.75rem;padding:.6rem 0;flex-wrap:wrap;border-top:1px solid #21262d;margin-top:.25rem}
-.pg-info{color:#8b949e;font-size:.78rem;flex:1}
+.card  { background: var(--surface); border: 1px solid var(--line-2); border-radius: 8px; padding: 1.25rem; }
+.kv td:first-child { color: var(--fg-3); width: 180px; font-weight: 500; white-space: nowrap; }
+.tactic-tag { font-size: 0.68rem; color: var(--fg-3); margin-left: 0.4rem; }
+.ev-file     { color: var(--info); }
+.ev-registry { color: var(--purple); }
+.ev-process  { color: var(--orange); }
+.ev-network  { color: var(--ok); }
+.attk-chip{display:inline-block;font-size:.62rem;font-family:monospace;padding:.08rem .3rem;border-radius:3px;background:#0d2137;color:var(--info);border:1px solid #1f4068;white-space:nowrap;cursor:default;vertical-align:middle;line-height:1.5}
+.attk-chip-more{background:#1c2128;color:var(--fg-3);border-color:var(--line-2)}
+.pg-wrap{display:flex;align-items:center;gap:.75rem;padding:.6rem 0;flex-wrap:wrap;border-top:1px solid var(--line);margin-top:.25rem}
+.pg-info{color:var(--fg-3);font-size:.78rem;flex:1}
 .pg-btns{display:flex;gap:.2rem;flex-wrap:wrap}
-.pg-btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:.18rem .52rem;font-size:.78rem;cursor:pointer;min-width:28px}
-.pg-btn:hover{background:#30363d}
-.pg-active{background:#1f6feb!important;color:#fff!important;border-color:#1f6feb!important}
-.pg-ellipsis{color:#8b949e;padding:0 .2rem;line-height:2;font-size:.78rem}
+.pg-btn{background:var(--line);color:var(--fg-2);border:1px solid var(--line-2);border-radius:4px;padding:.18rem .52rem;font-size:.78rem;cursor:pointer;min-width:28px}
+.pg-btn:hover{background:var(--line-2)}
+.pg-active{background:var(--accent-strong)!important;color:#fff!important;border-color:var(--accent-strong)!important}
+.pg-ellipsis{color:var(--fg-3);padding:0 .2rem;line-height:2;font-size:.78rem}
 .srch-wrap{margin:.5rem 0 .35rem}
-.srch-input{background:#0d1117;border:1px solid #30363d;border-radius:6px;
-            color:#e6edf3;font-size:.82rem;padding:.32rem .65rem;
+.srch-input{background:var(--bg-inset);border:1px solid var(--line-2);border-radius:6px;
+            color:var(--fg-1);font-size:.82rem;padding:.32rem .65rem;
             width:min(100%,360px);outline:none;transition:border-color .15s}
-.srch-input:focus{border-color:#58a6ff}
-.srch-input::placeholder{color:#484f58}
-.tabs{display:flex;gap:0;border-bottom:1px solid #30363d;margin-bottom:1.5rem;overflow-x:auto;}
-.tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:#8b949e;
+.srch-input:focus{border-color:var(--info)}
+.srch-input::placeholder{color:var(--fg-4)}
+.tabs{display:flex;gap:0;border-bottom:1px solid var(--line-2);margin-bottom:1.5rem;overflow-x:auto;}
+.tab-btn{background:none;border:none;border-bottom:2px solid transparent;color:var(--fg-3);
          padding:.6rem 1.1rem;cursor:pointer;font-size:.85rem;white-space:nowrap;transition:color .15s;}
-.tab-btn:hover{color:#e6edf3;background:rgba(255,255,255,.03);}
-.tab-btn.active{color:#58a6ff;border-bottom-color:#58a6ff;font-weight:600;}
+.tab-btn:hover{color:var(--fg-1);background:rgba(255,255,255,.03);}
+.tab-btn.active{color:var(--info);border-bottom-color:var(--info);font-weight:600;}
 .tab-panel{display:none;}
 .tab-panel.active{display:block;animation:fadeIn .18s ease;}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 .tbadge{display:inline-flex;align-items:center;justify-content:center;min-width:1.6rem;
         height:1.35rem;padding:0 .45rem;border-radius:9999px;font-size:.72rem;font-weight:700;
         line-height:1;margin-left:.3rem;}
-.tbadge-red   {background:#3d1f1f;color:#ff7b72;}
-.tbadge-orange{background:#3d2a1f;color:#ffa657;}
-.tbadge-green {background:#1f3d2a;color:#56d364;}
-.tbadge-blue  {background:#1f2d3d;color:#79c0ff;}
-.tbadge-gray  {background:#21262d;color:#8b949e;}
+.tbadge-red   {background:var(--danger-bg);color:var(--danger);}
+.tbadge-orange{background:var(--orange-bg);color:var(--orange);}
+.tbadge-green {background:var(--ok-bg);color:var(--ok);}
+.tbadge-blue  {background:var(--info-bg);color:var(--info);}
+.tbadge-gray  {background:var(--line);color:var(--fg-3);}
 /* ── Hunt Tab ── */
-.hunt-box{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.25rem;margin-bottom:1rem}
+.hunt-box{background:var(--surface);border:1px solid var(--line-2);border-radius:8px;padding:1.25rem;margin-bottom:1rem}
 .hunt-row{display:flex;gap:.6rem;align-items:center}
-.hunt-input{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#e6edf3;
+.hunt-input{flex:1;background:var(--bg-inset);border:1px solid var(--line-2);border-radius:6px;color:var(--fg-1);
             font-size:.9rem;padding:.46rem .85rem;outline:none;transition:border-color .15s}
-.hunt-input:focus{border-color:#58a6ff}
-.hunt-input::placeholder{color:#484f58}
-.hunt-btn{background:#1f6feb;color:#fff;border:none;border-radius:6px;padding:.44rem 1.2rem;
+.hunt-input:focus{border-color:var(--info)}
+.hunt-input::placeholder{color:var(--fg-4)}
+.hunt-btn{background:var(--accent-strong);color:#fff;border:none;border-radius:6px;padding:.44rem 1.2rem;
           font-size:.88rem;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s}
-.hunt-btn:hover{background:#388bfd}
-.hunt-btn:disabled{background:#1d2d40;color:#484f58;cursor:not-allowed}
-.hunt-hint{color:#8b949e;font-size:.76rem;margin-top:.4rem;min-height:1.2em}
-.hunt-type-tag{background:#21262d;color:#79c0ff;border-radius:4px;padding:.1rem .45rem;
+.hunt-btn:hover{background:var(--info)}
+.hunt-btn:disabled{background:#1d2d40;color:var(--fg-4);cursor:not-allowed}
+.hunt-hint{color:var(--fg-3);font-size:.76rem;margin-top:.4rem;min-height:1.2em}
+.hunt-type-tag{background:var(--line);color:var(--info);border-radius:4px;padding:.1rem .45rem;
                font-size:.73rem;font-weight:600}
 .hunt-quick{display:flex;flex-wrap:wrap;gap:.35rem;align-items:center;
-            margin-top:.75rem;padding-top:.75rem;border-top:1px solid #21262d}
-.hunt-qlabel{color:#8b949e;font-size:.73rem;white-space:nowrap;margin-right:.15rem}
-.hunt-qchip{background:#21262d;border:1px solid #30363d;border-radius:9999px;color:#c9d1d9;
+            margin-top:.75rem;padding-top:.75rem;border-top:1px solid var(--line)}
+.hunt-qlabel{color:var(--fg-3);font-size:.73rem;white-space:nowrap;margin-right:.15rem}
+.hunt-qchip{background:var(--line);border:1px solid var(--line-2);border-radius:9999px;color:var(--fg-2);
             font-size:.71rem;padding:.12rem .6rem;cursor:pointer;transition:background .12s,color .12s;
             font-family:'Cascadia Code','Consolas',monospace}
-.hunt-qchip:hover{background:#30363d;color:#e6edf3}
-.hunt-qchip.ip    {border-color:#3d2a1f;color:#ffa657}
-.hunt-qchip.domain{border-color:#1f2d3d;color:#79c0ff}
-.hunt-qchip.hash  {border-color:#2d1f3d;color:#d2a8ff}
+.hunt-qchip:hover{background:var(--line-2);color:var(--fg-1)}
+.hunt-qchip.ip    {border-color:var(--orange-bg);color:var(--orange)}
+.hunt-qchip.domain{border-color:var(--info-bg);color:var(--info)}
+.hunt-qchip.hash  {border-color:var(--purple-bg);color:var(--purple)}
 .hunt-svcs{display:flex;gap:.45rem;flex-wrap:wrap;margin-bottom:1rem}
 .svc-badge{display:inline-flex;align-items:center;gap:.3rem;padding:.22rem .75rem;border-radius:6px;
            font-size:.76rem;font-weight:600;border:1px solid transparent;transition:all .2s}
-.svc-badge.idle   {background:#161b22;border-color:#30363d;color:#8b949e}
-.svc-badge.loading{background:#1f2d3d;border-color:#1f6feb;color:#79c0ff;animation:svcPulse .9s ease infinite}
-.svc-badge.found  {background:#3d1f1f;border-color:#ff7b72;color:#ff7b72}
-.svc-badge.clean  {background:#1f3d2a;border-color:#56d364;color:#56d364}
-.svc-badge.error  {background:#21262d;border-color:#484f58;color:#8b949e}
+.svc-badge.idle   {background:var(--surface);border-color:var(--line-2);color:var(--fg-3)}
+.svc-badge.loading{background:var(--info-bg);border-color:var(--accent-strong);color:var(--info);animation:svcPulse .9s ease infinite}
+.svc-badge.found  {background:var(--danger-bg);border-color:var(--danger);color:var(--danger)}
+.svc-badge.clean  {background:var(--ok-bg);border-color:var(--ok);color:var(--ok)}
+.svc-badge.error  {background:var(--line);border-color:var(--fg-4);color:var(--fg-3)}
 @keyframes svcPulse{0%,100%{opacity:1}50%{opacity:.45}}
-.hunt-card{background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:.85rem;overflow:hidden}
-.hunt-card.found .hunt-card-head{border-left:3px solid #ff7b72}
-.hunt-card.clean .hunt-card-head{border-left:3px solid #56d364}
-.hunt-card.error .hunt-card-head{border-left:3px solid #484f58}
+.hunt-card{background:var(--surface);border:1px solid var(--line-2);border-radius:8px;margin-bottom:.85rem;overflow:hidden}
+.hunt-card.found .hunt-card-head{border-left:3px solid var(--danger)}
+.hunt-card.clean .hunt-card-head{border-left:3px solid var(--ok)}
+.hunt-card.error .hunt-card-head{border-left:3px solid var(--fg-4)}
 .hunt-card-head{display:flex;align-items:center;justify-content:space-between;
-                padding:.62rem 1rem;border-bottom:1px solid #21262d}
+                padding:.62rem 1rem;border-bottom:1px solid var(--line)}
 .hunt-card-title{font-weight:600;font-size:.88rem;display:flex;align-items:center;gap:.45rem}
 .hunt-card-body{padding:.85rem 1rem}
 .hunt-kv{font-size:.82rem;width:auto}
-.hunt-kv td:first-child{color:#8b949e;width:130px;padding:.28rem .5rem .28rem 0;white-space:nowrap}
+.hunt-kv td:first-child{color:var(--fg-3);width:130px;padding:.28rem .5rem .28rem 0;white-space:nowrap}
 .hunt-kv td:last-child{padding:.28rem 0}
 .hunt-tags{display:flex;flex-wrap:wrap;gap:.3rem;margin-top:.1rem}
-.hunt-link{color:#58a6ff;font-size:.76rem;text-decoration:none}
+.hunt-link{color:var(--info);font-size:.76rem;text-decoration:none}
 .hunt-link:hover{text-decoration:underline}
-.hunt-none{color:#8b949e;font-size:.83rem}
+.hunt-none{color:var(--fg-3);font-size:.83rem}
 /* ── Process Tree ── */
 .ptree{font-family:'Cascadia Code','Consolas',monospace;font-size:.82rem;
-       background:#0d1117;border:1px solid #30363d;border-radius:8px;
+       background:var(--bg-inset);border:1px solid var(--line-2);border-radius:8px;
        padding:1rem 1.25rem;margin-bottom:1.5rem}
 .pt-wrap{margin-left:0}
-.pt-children{padding-left:1.4rem;border-left:1px solid #21262d;margin-left:.5rem}
+.pt-children{padding-left:1.4rem;border-left:1px solid var(--line);margin-left:.5rem}
 .pt-row{display:flex;align-items:baseline;gap:.4rem;padding:.22rem .4rem;
         border-radius:4px;flex-wrap:wrap;line-height:1.5}
 .pt-row.pt-clickable{cursor:pointer}
-.pt-row.pt-clickable:hover{background:#161b22}
-.pt-arr{color:#484f58;font-size:.65rem;min-width:12px;flex-shrink:0;transition:transform .15s}
-.pt-leaf{color:#30363d;font-size:.55rem;min-width:12px;flex-shrink:0}
-.pt-name-new{color:#ffa657;font-weight:600}
-.pt-name-existing{color:#8b949e}
-.pt-name-suspicious{color:#ff7b72;font-weight:700}
-.pt-name-sample{color:#e3b341;font-weight:700}
-.pt-pid{color:#484f58;font-size:.73rem}
-.pt-meta{color:#3d444d;font-size:.70rem;padding:.02rem 0 .05rem 1.6rem;
+.pt-row.pt-clickable:hover{background:var(--surface)}
+.pt-arr{color:var(--fg-4);font-size:.65rem;min-width:12px;flex-shrink:0;transition:transform .15s}
+.pt-leaf{color:var(--line-2);font-size:.55rem;min-width:12px;flex-shrink:0}
+.pt-name-new{color:var(--orange);font-weight:600}
+.pt-name-existing{color:var(--fg-3)}
+.pt-name-suspicious{color:var(--danger);font-weight:700}
+.pt-name-sample{color:var(--warn);font-weight:700}
+.pt-pid{color:var(--fg-4);font-size:.73rem}
+.pt-meta{color:var(--line-2);font-size:.70rem;padding:.02rem 0 .05rem 1.6rem;
          word-break:break-all;line-height:1.35}
-.pt-legend{display:flex;gap:1.2rem;font-size:.74rem;color:#8b949e;
+.pt-legend{display:flex;gap:1.2rem;font-size:.74rem;color:var(--fg-3);
            margin-bottom:.75rem;flex-wrap:wrap}
 .pt-legend span{display:flex;align-items:center;gap:.3rem}
-.proc-exp-btn{background:none;border:none;color:#8b949e;cursor:pointer;padding:0 .3rem;font-size:.72rem;line-height:1}
-.proc-exp-btn:hover{color:#c9d1d9}
+.proc-exp-btn{background:none;border:none;color:var(--fg-3);cursor:pointer;padding:0 .3rem;font-size:.72rem;line-height:1}
+.proc-exp-btn:hover{color:var(--fg-2)}
 .act-badge{font-size:.6rem;padding:1px 5px;border-radius:3px;margin:0 2px 0 0;white-space:nowrap;font-weight:600;display:inline-block;line-height:1.45}
-.act-file{background:#0d1f37;color:#79c0ff}
-.act-reg{background:#2d270a;color:#e3b341}
-.act-net{background:#0d2415;color:#56d364}
-.act-dns{background:#1a0d37;color:#d2a8ff}
-.act-child{background:#2d1a0a;color:#ffa657}
-.beh-row td{padding:0!important;border-bottom:1px solid #30363d}
-.beh-panel{padding:.55rem .9rem .75rem;background:#0d1117}
+.act-file{background:var(--info-bg);color:var(--info)}
+.act-reg{background:#2d270a;color:var(--warn)}
+.act-net{background:#0d2415;color:var(--ok)}
+.act-dns{background:#1a0d37;color:var(--purple)}
+.act-child{background:#2d1a0a;color:var(--orange)}
+.beh-row td{padding:0!important;border-bottom:1px solid var(--line-2)}
+.beh-panel{padding:.55rem .9rem .75rem;background:var(--bg-inset)}
 .beh-tabs{display:flex;gap:.22rem;margin-bottom:.45rem;flex-wrap:wrap}
-.beh-tab{background:#21262d;border:1px solid #30363d;color:#8b949e;padding:.15rem .5rem;border-radius:.22rem;cursor:pointer;font-size:.7rem}
-.beh-tab.beh-on{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.beh-tab{background:var(--line);border:1px solid var(--line-2);color:var(--fg-3);padding:.15rem .5rem;border-radius:.22rem;cursor:pointer;font-size:.7rem}
+.beh-tab.beh-on{background:var(--accent-strong);border-color:var(--accent-strong);color:#fff}
 .beh-pane{display:none}
 .beh-pane.beh-on{display:block}
 .beh-list{list-style:none;padding:0;margin:0}
-.beh-list li{font-family:monospace;font-size:.7rem;color:#c9d1d9;padding:.1rem 0;border-bottom:1px solid #161b22;word-break:break-all}
+.beh-list li{font-family:monospace;font-size:.7rem;color:var(--fg-2);padding:.1rem 0;border-bottom:1px solid var(--surface);word-break:break-all}
 .beh-list li:last-child{border-bottom:none}
 .beh-sub{font-size:.68rem;font-weight:600;margin:.3rem 0 .1rem;text-transform:uppercase;letter-spacing:.04em}
-.beh-empty{color:#484f58;font-size:.72rem;font-style:italic}
+.beh-empty{color:var(--fg-4);font-size:.72rem;font-style:italic}
 """
 
 _CSS += REPORT_CSS
@@ -365,10 +366,10 @@ document.addEventListener('DOMContentLoaded', function () {
 // ════════════════════════════════════════════════
 
 var _SVC_NAMES = {
-    mb:    '📦 MalwareBazaar',
-    tf:    '🎯 ThreatFox',
-    uh:    '🌐 URLhaus',
-    feodo: '👾 Feodo Tracker'
+    mb:    'MalwareBazaar',
+    tf:    'ThreatFox',
+    uh:    'URLhaus',
+    feodo: 'Feodo Tracker'
 };
 
 // ── 릴레이 fetch 헬퍼 ─────────────────────────────────────────────────
@@ -418,7 +419,7 @@ function huntInputChanged() {
     hint.innerHTML = d
         ? '감지: <span class="hunt-type-tag">' + d.label + '</span> &nbsp;→ '
           + d.svcs.map(function(s){ return _SVC_NAMES[s]; }).join(' &nbsp; ')
-        : '<span style="color:#ffa657">인식 불가 — SHA256·MD5·IP·도메인·URL 형식으로 입력</span>';
+        : '<span style="color:var(--orange)">인식 불가 — SHA256·MD5·IP·도메인·URL 형식으로 입력</span>';
 }
 
 function huntQuick(val) {
@@ -461,7 +462,7 @@ async function huntSearch() {
     }).join('');
     document.getElementById('hunt-results').innerHTML = html ||
         '<div class="hunt-none">모든 서비스에서 결과 없음</div>';
-    btn.disabled = false; btn.textContent = '🔍 Hunt';
+    btn.disabled = false; btn.textContent = 'Hunt';
 }
 
 // ── 카드 빌더 ──────────────────────────────────────────
@@ -525,7 +526,7 @@ function _errCard(svcKey, err) {
         msg = 'API 연결 실패 — 인터넷 연결 또는 CORS 확인 필요 (file:// 로 열었다면 릴레이 주소로 여세요)';
     return _card(svcKey, 'error',
         '<span class="badge badge-gray">조회 실패</span>',
-        '<span class="hunt-none">⚠ ' + _h(msg) + '</span>');
+        '<span class="hunt-none">' + _h(msg) + '</span>');
 }
 
 function _cleanCard(svcKey, text) {
@@ -605,7 +606,7 @@ async function _huntTF(ioc) {
                 + '<td>' + _h(item.ioc_type || '-') + '</td>'
                 + '<td><strong>' + _h(item.malware || '-') + '</strong></td>'
                 + '<td>' + _badge(conf + '%', cc) + '</td>'
-                + '<td style="color:#8b949e;font-size:.75rem">' + _h(item.first_seen || '-') + '</td>'
+                + '<td style="color:var(--fg-3);font-size:.75rem">' + _h(item.first_seen || '-') + '</td>'
                 + '</tr>';
         }).join('');
         return _card('tf', 'found', _badge(d.data.length + '건', 'red'),
@@ -648,7 +649,7 @@ async function _huntUH(ioc, type) {
                 var sc = u.url_status === 'online' ? 'red' : 'gray';
                 return '<tr><td class="mono" style="font-size:.72rem">' + _h(u.url || '-') + '</td>'
                     + '<td>' + _badge(u.url_status || '-', sc) + '</td>'
-                    + '<td style="color:#8b949e">' + _h(u.threat || '-') + '</td></tr>';
+                    + '<td style="color:var(--fg-3)">' + _h(u.threat || '-') + '</td></tr>';
             }).join('');
             if (urows)
                 body2 += '<h3 style="margin-top:.7rem">연관 URL (' + urls.length + '건)</h3>'
@@ -846,7 +847,7 @@ def _cmdline_html(cmdline, limit: int = 160) -> str:
     shown  = full[:limit]
     trunc  = len(full) > limit
     body   = _e(shown) + ("…" if trunc else "")
-    note   = (f"<span style='color:#6e7681;font-size:.68rem'> [전체 {len(full):,}자]</span>"
+    note   = (f"<span style='color:var(--fg-4);font-size:.68rem'> [전체 {len(full):,}자]</span>"
               if trunc else "")
     html   = f"<span title='{_e(full)}'>{body}</span>{note}"
 
@@ -855,8 +856,8 @@ def _cmdline_html(cmdline, limit: int = 160) -> str:
         d_shown = decoded[:400]
         d_note  = "…" if len(decoded) > 400 else ""
         html += (
-            f"<div style='margin-top:2px;color:#ff7b72;font-size:.68rem;white-space:pre-wrap' "
-            f"title='{_e(decoded)}'>🔓 -enc 디코딩: {_e(d_shown)}{d_note}</div>"
+            f"<div style='margin-top:2px;color:var(--danger);font-size:.68rem;white-space:pre-wrap' "
+            f"title='{_e(decoded)}'>-enc 디코딩: {_e(d_shown)}{d_note}</div>"
         )
     return html
 
@@ -896,7 +897,7 @@ def _proc_sort_key(p, susp_pids: set, tag_map: dict, techs: list) -> tuple:
 def _proc_timing_html(p, start_time: float) -> str:
     """프로세스 생성 타이밍 배지. 분석 시작 대비 상대 초로 표시.
 
-    - create_time 있음 & 분석 시작 이후: "⏱ +N.Ns" (실행 타임라인)
+    - create_time 있음 & 분석 시작 이후: "+N.Ns" (실행 타임라인)
     - create_time 있음 & 분석 시작 이전: "분석 전 생성" (인젝션된 기존 프로세스 등)
     - create_time 0: 스냅샷 수집 전 종료된 단명 프로세스 (로더·인젝터 신호)
     """
@@ -904,8 +905,8 @@ def _proc_timing_html(p, start_time: float) -> str:
     if ct <= 0:
         note = getattr(p, "note", "")
         if note:
-            return (f"<span style='color:#ffa657;font-size:.68rem' "
-                    f"title='{_e(note)}'>⏱ 짧게 실행됨 (스냅샷 전 종료)</span>")
+            return (f"<span style='color:var(--orange);font-size:.68rem' "
+                    f"title='{_e(note)}'>짧게 실행됨 (스냅샷 전 종료)</span>")
         return ""
     if start_time and ct >= start_time:
         label = f"+{ct - start_time:.1f}s"
@@ -916,7 +917,7 @@ def _proc_timing_html(p, start_time: float) -> str:
             label = datetime.fromtimestamp(ct).strftime("%H:%M:%S")
         except Exception:
             return ""
-    return f"<span style='color:#6e7681;font-size:.68rem'>⏱ {label}</span>"
+    return f"<span style='color:var(--fg-4);font-size:.68rem'>{label}</span>"
 
 def _tb(val, color: str = "gray") -> str:
     """탭 배지 (숫자 0 이나 빈 값이면 생략)"""
@@ -931,7 +932,7 @@ def _trunc_notice(total: int, shown: int) -> str:
     return (
         f"<p class='alert alert-info' "
         f"style='font-size:.8rem;padding:.45rem .85rem;margin-bottom:.55rem'>"
-        f"📋 총 <strong>{total:,}건</strong> 중 <strong>{shown:,}건</strong>만 표시됩니다"
+        f"총 <strong>{total:,}건</strong> 중 <strong>{shown:,}건</strong>만 표시됩니다"
         f" &nbsp;—&nbsp; 전체 데이터는 <code>_dynamic_report.json</code>을 확인하세요."
         f"</p>"
     )
@@ -951,11 +952,11 @@ def _ext_integration_status_html(result) -> str:
             return ""
         ok   = "건 기여" in status_str
         warn = any(x in status_str for x in ("비활성", "API 키", "미설치", "비PE", "결과 없음", "오류", "건너뜀"))
-        color = "#56d364" if ok else ("#ffa657" if warn else "#8b949e")
-        icon  = "✅" if ok else ("⚠" if warn else "ℹ")
+        color = "var(--ok)" if ok else ("var(--orange)" if warn else "var(--fg-3)")
+        icon  = "" if ok else ("" if warn else "ℹ")
         return (
             f"<span style='display:inline-flex;align-items:center;gap:.35rem;"
-            f"background:#161b22;border:1px solid #30363d;border-radius:6px;"
+            f"background:var(--surface);border:1px solid var(--line-2);border-radius:6px;"
             f"padding:.25rem .7rem;font-size:.78rem;color:{color}'>"
             f"{icon}&nbsp;<b>{label}</b>&nbsp;—&nbsp;{_e(status_str)}</span>"
         )
@@ -963,7 +964,7 @@ def _ext_integration_status_html(result) -> str:
     chips = " ".join(filter(None, [_chip("CAPA", capa_status), _chip("VirusTotal", vt_status)]))
     return (
         f"<div style='display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:.8rem;align-items:center'>"
-        f"<span style='font-size:.75rem;color:#6e7681'>외부 연동:</span> {chips}"
+        f"<span style='font-size:.75rem;color:var(--fg-4)'>외부 연동:</span> {chips}"
         f"</div>"
     )
 
@@ -972,9 +973,9 @@ def _ext_integration_status_html(result) -> str:
 
 _TIER_META: dict[int, tuple[str, str, str]] = {
     # tier: (라벨, 색, 툴팁) — 라벨은 analysis.relevance.TIER_SHORT 와 같아야 한다
-    1: ("샘플", "#f97583", "샘플과 샘플이 실행한 자식 프로세스가 직접 일으킨 행위"),
-    2: ("의심", "#ffa657", "샘플 프로세스는 아니지만 평상시 활동으로도 설명되지 않는 행위"),
-    3: ("평상시", "#6e7681", "샘플이 없어도 평소에 일어나는 Windows 기본 활동 (Windows Update·Defender 등)"),
+    1: ("샘플", "var(--danger)", "샘플과 샘플이 실행한 자식 프로세스가 직접 일으킨 행위"),
+    2: ("의심", "var(--orange)", "샘플 프로세스는 아니지만 평상시 활동으로도 설명되지 않는 행위"),
+    3: ("평상시", "var(--fg-4)", "샘플이 없어도 평소에 일어나는 Windows 기본 활동 (Windows Update·Defender 등)"),
 }
 
 
@@ -995,11 +996,7 @@ def _tier_attr(obj_or_tier) -> str:
 def _tier_badge(obj_or_tier) -> str:
     tier = obj_or_tier if isinstance(obj_or_tier, int) else _tier_of(obj_or_tier)
     label, color, tip = _TIER_META.get(tier, _TIER_META[2])
-    return (
-        f"<span title='{_e(tip)}' style='display:inline-block;padding:0 5px;"
-        f"border:1px solid {color};border-radius:3px;color:{color};"
-        f"font-size:.62rem;line-height:1.35;vertical-align:middle'>{label}</span>"
-    )
+    return f"<span class='tier tier-{tier}' title='{_e(tip)}'>{label}</span>"
 
 
 def _scope_bar_html(result) -> str:
@@ -1018,15 +1015,17 @@ def _scope_bar_html(result) -> str:
     else:
         basis = ("평상시 기준 데이터 없음 — 기본 Windows 활동 목록으로 구분합니다 "
                  "(<code>--baseline-capture</code> 로 수집하면 더 정확합니다)")
-    tip = " · ".join(f"{label}: {desc}" for label, _c, desc in _TIER_META.values())
+    import re as _re_sb
+    tip = (" · ".join(f"{label}: {desc}" for label, _c, desc in _TIER_META.values())
+           + " — " + _re_sb.sub(r"<[^>]+>", "", basis))
     return (
         "<div class='scope-bar' role='group' aria-label='표시 범위'>"
-        f"<span class='scope-label' title='{_e(tip)}'>표시 범위</span>"
+        f"<span class='scope-label' title='{_e(tip)}'>표시 범위</span><span class='scope-seg'>"
         "<button type='button' class='tier-btn' data-tierlevel='1' onclick='setTierFilter(1)'>샘플만</button>"
         "<button type='button' class='tier-btn tier-btn-on' data-tierlevel='2' "
         "onclick='setTierFilter(2)'>샘플 + 의심</button>"
-        "<button type='button' class='tier-btn' data-tierlevel='3' onclick='setTierFilter(3)'>"
-        "전체 (평상시 활동 포함)</button>"
+        "<button type='button' class='tier-btn' data-tierlevel='3' onclick='setTierFilter(3)' "
+        "title='평상시 활동까지 모두 표시'>전체</button></span>"
         "<span class='scope-note' id='scope-note' aria-live='polite'></span>"
         f"<span class='scope-basis'>{basis}</span>"
         "</div>"
@@ -1035,14 +1034,14 @@ def _scope_bar_html(result) -> str:
 
 _TIER_FILTER_CSS = """
 .scope-bar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;margin:0 0 22px;padding:10px 0;
-  border-top:1px solid var(--line,#2a3b54);border-bottom:1px solid var(--line,#2a3b54)}
-.scope-label{font-size:.85rem;font-weight:650;color:var(--text,#e9eff8);margin-right:4px;cursor:help}
-.scope-note{font-size:.8rem;color:#ffa657;margin-left:6px}
-.scope-basis{flex-basis:100%;font-size:.8rem;color:var(--muted,#acbbd0)}
-.tier-btn{background:#21262d;border:1px solid #30363d;color:#a7b9c9;
+  border-top:1px solid var(--line,var(--line-2));border-bottom:1px solid var(--line,var(--line-2))}
+.scope-label{font-size:.85rem;font-weight:650;color:var(--text,var(--fg-1));margin-right:4px;cursor:help}
+.scope-note{font-size:.8rem;color:var(--orange);margin-left:6px}
+.scope-basis{flex-basis:100%;font-size:.8rem;color:var(--muted,var(--fg-2))}
+.tier-btn{background:var(--line);border:1px solid var(--line-2);color:var(--fg-2);
   border-radius:6px;padding:.3rem .75rem;font-size:.8rem;cursor:pointer}
-.tier-btn:hover{border-color:#58a6ff;color:#cdd9e5}
-.tier-btn-on{background:#1f6feb33;border-color:#58a6ff;color:#cdd9e5;font-weight:600}
+.tier-btn:hover{border-color:var(--info);color:var(--fg-2)}
+.tier-btn-on{background:var(--accent-strong)33;border-color:var(--info);color:var(--fg-2);font-weight:600}
 tr[data-tier].tier-hidden,div[data-tier].tier-hidden,li[data-tier].tier-hidden{display:none}
 """
 
@@ -1090,20 +1089,20 @@ def _artifact_intel_html(result) -> str:
     if packers:
         items = []
         for p in packers:
-            color = "#f97583" if p.get("confidence") == "HIGH" else "#ffa657"
+            color = "var(--danger)" if p.get("confidence") == "HIGH" else "var(--orange)"
             ev = "".join(
-                f"<div class='mono' style='color:#6e7681;font-size:.7rem'>{_e(e)}</div>"
+                f"<div class='mono' style='color:var(--fg-4);font-size:.7rem'>{_e(e)}</div>"
                 for e in (p.get("evidence") or [])[:3]
             )
             items.append(
                 f"<li style='margin-bottom:.5rem'>"
                 f"<span style='color:{color};font-weight:600'>{_e(p.get('confidence',''))}</span> "
                 f"<strong>{_e(p.get('name',''))}</strong>"
-                f"<div style='color:#8b949e;font-size:.76rem'>{_e(p.get('description',''))}</div>"
+                f"<div style='color:var(--fg-3);font-size:.76rem'>{_e(p.get('description',''))}</div>"
                 f"{ev}</li>"
             )
         out.append(
-            "<h3 style='color:#79c0ff;margin-top:1.4rem'>📦 패커 / 인스톨러 식별</h3>"
+            "<h3 style='color:var(--info);margin-top:1.4rem'>패커 / 인스톨러 식별</h3>"
             "<ul style='margin:.3rem 0 0 1.1rem;padding:0;font-size:.82rem'>"
             + "".join(items) + "</ul>"
         )
@@ -1111,20 +1110,20 @@ def _artifact_intel_html(result) -> str:
     if masq:
         rows = []
         for m in masq:
-            color = "#f97583" if m.get("confidence") == "HIGH" else "#ffa657"
+            color = "var(--danger)" if m.get("confidence") == "HIGH" else "var(--orange)"
             rows.append(
                 f"<tr{_tier_attr(1 if m.get('in_lineage') else 2)}>"
                 f"<td><span style='color:{color};font-weight:600'>"
                 f"{_e(m.get('confidence',''))}</span></td>"
                 f"<td class='mono' style='font-size:.74rem'>{_e(m.get('path',''))}</td>"
-                f"<td class='mono' style='font-size:.72rem;color:#8b949e'>"
+                f"<td class='mono' style='font-size:.72rem;color:var(--fg-3)'>"
                 f"{_e(m.get('technique',''))}</td>"
-                f"<td style='font-size:.74rem;color:#8b949e'>{_e(m.get('reason',''))}</td>"
+                f"<td style='font-size:.74rem;color:var(--fg-3)'>{_e(m.get('reason',''))}</td>"
                 f"</tr>"
             )
         out.append(
-            "<h3 style='color:#f97583;margin-top:1.4rem'>🎭 정상 구성요소 사칭 탐지</h3>"
-            "<p style='font-size:.78rem;color:#8b949e;margin:.2rem 0 .6rem'>"
+            "<h3 style='color:var(--danger);margin-top:1.4rem'>정상 구성요소 사칭 탐지</h3>"
+            "<p style='font-size:.78rem;color:var(--fg-3);margin:.2rem 0 .6rem'>"
             "실제 Windows 바이너리 이름을 비표준 경로에서 쓰거나, 실존하지 않지만 "
             "정상 구성요소처럼 보이도록 이름을 구성한 드롭 파일입니다. "
             "후자는 추정 규칙에 따른 판정이므로 경로와 근거를 함께 확인하세요.</p>"
@@ -1145,7 +1144,7 @@ def _sideload_html(result) -> str:
     rows = []
     for f in findings:
         conf  = f.get("confidence", "MEDIUM")
-        color = "#f97583" if conf == "HIGH" else "#ffa657"
+        color = "var(--danger)" if conf == "HIGH" else "var(--orange)"
         flags = []
         if f.get("dll_dropped"): flags.append("DLL 드롭됨")
         if f.get("same_dir"):    flags.append("동일 디렉터리")
@@ -1155,21 +1154,21 @@ def _sideload_html(result) -> str:
         comp_html = ""
         if comp:
             comp_html = (
-                "<div style='margin-top:4px;color:#8b949e;font-size:.72rem'>"
+                "<div style='margin-top:4px;color:var(--fg-3);font-size:.72rem'>"
                 "동반 파일: " + ", ".join(_e(c) for c in comp[:5]) + "</div>"
             )
         rows.append(
             f"<tr{_tier_attr(1 if f.get('in_lineage') else 2)}>"
             f"<td><span style='color:{color};font-weight:600'>{_e(conf)}</span></td>"
             f"<td class='mono'>{_e(f.get('loader_name',''))}"
-            f"<span style='color:#8b949e'>({f.get('loader_pid',0)})</span></td>"
+            f"<span style='color:var(--fg-3)'>({f.get('loader_pid',0)})</span></td>"
             f"<td class='mono' style='font-size:.74rem'>{_e(f.get('dll_path',''))}{comp_html}</td>"
-            f"<td style='font-size:.72rem;color:#8b949e'>{_e(' · '.join(flags))}</td>"
+            f"<td style='font-size:.72rem;color:var(--fg-3)'>{_e(' · '.join(flags))}</td>"
             f"</tr>"
         )
 
     return (
-        "<h3 style='color:#f97583;margin-top:1.4rem'>🔗 DLL 사이드로딩 탐지</h3>"
+        "<h3 style='color:var(--danger);margin-top:1.4rem'>DLL 사이드로딩 탐지</h3>"
         "<table id='tbl-sideload'>"
         "<tr><th>신뢰도</th><th>로더</th><th>사이드로드된 DLL</th><th>근거</th></tr>"
         + "".join(rows) + "</table>"
@@ -1196,13 +1195,13 @@ def _section_html(result) -> str:
         if not str(ref).lower().startswith("https://"):
             ref = ""
         evidence_html = "".join(
-            f"<div class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(ev[:120])}</div>"
+            f"<div class='mono' style='color:var(--fg-3);font-size:0.72rem'>{_e(ev[:120])}</div>"
             for ev in t.evidence[:_EV_LIMIT]
         )
         # 근거 잘림 안내: 5건 초과 시 잔여 건수 표시 (전체는 JSON)
         if len(t.evidence) > _EV_LIMIT:
             evidence_html += (
-                f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>"
+                f"<div style='color:var(--fg-4);font-size:0.68rem;margin-top:.15rem'>"
                 f"+{len(t.evidence) - _EV_LIMIT}건 더 — 전체는 "
                 f"<code>_dynamic_report.json</code> 참조</div>"
             )
@@ -1210,7 +1209,7 @@ def _section_html(result) -> str:
         src_badges = _source_badges(getattr(t, "sources", []) or [])
         rows.append(
             f"<tr{_tier_attr(t)}>"
-            + (f"<td><a href='{_e(ref)}' target='_blank' rel='noopener' style='color:#f97583;text-decoration:none'>"
+            + (f"<td><a href='{_e(ref)}' target='_blank' rel='noopener' style='color:var(--danger);text-decoration:none'>"
                f"{_e(t.technique_id)}</a></td>" if ref else f"<td>{_e(t.technique_id)}</td>") +
             f"<td>{_e(tname)}</td>"
             f"<td>{_b(tactic, color)}</td>"
@@ -1280,31 +1279,31 @@ def _file_events_html(result) -> tuple[str, int]:
         e     = item["event"]
         count = item["count"]
         count_html = (
-            f"&nbsp;<span style='background:#30363d;color:#8b949e;font-size:0.68rem;"
+            f"&nbsp;<span style='background:var(--line-2);color:var(--fg-3);font-size:0.68rem;"
             f"padding:1px 5px;border-radius:9px'>×{count}</span>"
             if count > 1 else ""
         )
         detail_str = (e.detail or "").strip()
         detail_html = (
-            f"<div style='color:#6e7681;font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
+            f"<div style='color:var(--fg-4);font-size:0.68rem;margin-top:.15rem'>{_e(detail_str)}</div>"
             if detail_str else ""
         )
         _chips = _attk_chips([e.path], _tag_map, _techs)
         _chips_td = f"<td style='white-space:nowrap'>{_chips}</td>" if _chips else "<td></td>"
         rows.append(
             f"<tr>"
-            f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
-            f"<td class='mono'>{_e(e.process)} <span style='color:#8b949e'>({e.pid})</span></td>"
+            f"<td class='mono' style='color:var(--fg-3);white-space:nowrap'>{_e(e.time_str[:12])}</td>"
+            f"<td class='mono'>{_e(e.process)} <span style='color:var(--fg-3)'>({e.pid})</span></td>"
             f"<td>{_b(e.operation, op_color.get(e.operation,'gray'))}{count_html}</td>"
             f"<td class='mono ev-file'>{_e(e.path)}{detail_html}</td>"
-            f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.result)}</td>"
+            f"<td class='mono' style='color:var(--fg-3);font-size:0.72rem'>{_e(e.result)}</td>"
             f"{_chips_td}"
             f"</tr>"
         )
     dedup_note = (
-        f"<p style='font-size:.78rem;color:#6e7681;margin:.2rem 0 .4rem'>"
+        f"<p style='font-size:.78rem;color:var(--fg-4);margin:.2rem 0 .4rem'>"
         f"총 {total}건 → 중복 제거 후 {total_deduped}건 표시"
-        f"&nbsp;·&nbsp;배지 <span style='background:#30363d;color:#8b949e;font-size:0.68rem;"
+        f"&nbsp;·&nbsp;배지 <span style='background:var(--line-2);color:var(--fg-3);font-size:0.68rem;"
         f"padding:1px 5px;border-radius:9px'>×N</span> = 동일 이벤트 반복 횟수</p>"
         if total != total_deduped else ""
     )
@@ -1380,23 +1379,23 @@ def _registry_events_html(result) -> str:
             k, n, v = entry[0], entry[1], entry[2]
             proc = entry[3] if len(entry) > 3 else ""
             proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
-                       if proc else "<td style='color:#8b949e'>-</td>")
+                       if proc else "<td style='color:var(--fg-3)'>-</td>")
             _chips_td = f"<td style='white-space:nowrap'>{_attk_chips([k], _tag_map, _techs)}</td>"
             rows.append(f"<tr><td>{_b('추가','green')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
-                     f"<td class='mono' style='color:#8b949e'>{_e(str(v)[:80])}</td>"
+                     f"<td class='mono' style='color:var(--fg-3)'>{_e(str(v)[:80])}</td>"
                      f"{proc_td}{_chips_td}</tr>")
         for entry in modified[:_REG_DIFF_LIMIT]:
             k, n, nw = entry[0], entry[1], entry[3]
             proc = entry[4] if len(entry) > 4 else ""
             proc_td = (f"<td class='mono ev-process' style='font-size:0.72rem'>{_e(proc)}</td>"
-                       if proc else "<td style='color:#8b949e'>-</td>")
+                       if proc else "<td style='color:var(--fg-3)'>-</td>")
             _chips_td = f"<td style='white-space:nowrap'>{_attk_chips([k], _tag_map, _techs)}</td>"
             rows.append(f"<tr><td>{_b('변경','orange')}</td>"
                      f"<td class='mono ev-registry'>{_e(k)}</td>"
                      f"<td class='mono'>{_e(n)}</td>"
-                     f"<td class='mono' style='color:#8b949e'>{_e(str(nw)[:80])}</td>"
+                     f"<td class='mono' style='color:var(--fg-3)'>{_e(str(nw)[:80])}</td>"
                      f"{proc_td}{_chips_td}</tr>")
         parts.append(
             f"<h3>레지스트리 스냅샷 비교{_src_note}</h3>"
@@ -1422,11 +1421,11 @@ def _registry_events_html(result) -> str:
         def _reg_row(e, extra_td: str = "") -> str:
             return (
                 f"<tr>"
-                f"<td class='mono' style='color:#8b949e;white-space:nowrap'>{_e(e.time_str[:12])}</td>"
+                f"<td class='mono' style='color:var(--fg-3);white-space:nowrap'>{_e(e.time_str[:12])}</td>"
                 f"<td class='mono'>{_e(e.process)}</td>"
                 f"<td>{_b(e.operation,'purple')}</td>"
                 f"<td class='mono ev-registry'>{_e(e.path)}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(e.detail)}</td>"
+                f"<td class='mono' style='color:var(--fg-3);font-size:0.72rem'>{_e(e.detail)}</td>"
                 f"<td>{_e(e.result)}</td>"
                 f"{extra_td}"
                 f"</tr>"
@@ -1441,7 +1440,7 @@ def _registry_events_html(result) -> str:
                 hi_rows.append(_reg_row(e, extra))
             parts.append(
                 "<h3>지속성 · 보안 관련 레지스트리 변경 및 시도 "
-                "<span style='font-size:.75rem;color:#6e7681'>(자동 실행·서비스·코드 주입·보안 기능 끄기)</span></h3>"
+                "<span style='font-size:.75rem;color:var(--fg-4)'>(자동 실행·서비스·코드 주입·보안 기능 끄기)</span></h3>"
                 + _trunc_notice(len(hi), _REG_EV_LIMIT)
                 + "<table id='tbl-reg-key'><tr><th>시각</th><th>프로세스</th><th>작업</th>"
                 "<th>키 경로</th><th>상세</th><th>결과</th><th>관심 사유</th></tr>"
@@ -1462,7 +1461,7 @@ def _registry_events_html(result) -> str:
             )
             parts.append(
                 f"<details style='margin-top:.6rem'>"
-                f"<summary style='cursor:pointer;color:#8b949e;font-size:.85rem'>"
+                f"<summary style='cursor:pointer;color:var(--fg-3);font-size:.85rem'>"
                 f"그 외 레지스트리 이벤트 {len(lo):,}건 (지속성·보안 무관 — 펼치기)</summary>"
                 f"<div style='margin-top:.5rem'>{lo_table}</div>"
                 f"</details>"
@@ -1491,21 +1490,21 @@ def _proc_cell(procs: list[str], reason: str = "") -> str:
         _tip = _e(reason).replace("\n", "&#10;")
         return (
             f"<td title='{_tip}' style='cursor:help'>"
-            f"<span style='color:#6e7681;font-size:.7rem;border:1px solid #30363d;"
+            f"<span style='color:var(--fg-4);font-size:.7rem;border:1px solid var(--line-2);"
             f"border-radius:3px;padding:1px 4px'>미확인</span>"
             f"</td>"
         )
-    return "<td style='color:#484f58'>-</td>"
+    return "<td style='color:var(--fg-4)'>-</td>"
 
 
 def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
     """process_network_map 진단 패널 HTML."""
     if not pnmap:
         return (
-            "<details style='margin:.5rem 0 1rem;border-left:3px solid #e3b341;padding:.2rem .75rem'>"
-            "<summary style='color:#e3b341;font-size:.82rem;cursor:pointer'>"
+            "<details style='margin:.5rem 0 1rem;border-left:3px solid var(--warn);padding:.2rem .75rem'>"
+            "<summary style='color:var(--warn);font-size:.82rem;cursor:pointer'>"
             "네트워크 연결을 만든 프로세스를 확인하지 못함</summary>"
-            "<p style='font-size:.78rem;color:#8b949e;margin:.4rem 0 0'>"
+            "<p style='font-size:.78rem;color:var(--fg-3);margin:.4rem 0 0'>"
             "ProcMon CSV에 TCP/UDP 네트워크 이벤트가 없습니다.<br>"
             "가능한 원인: 분석 중 연결 없음 · ProcMon 필터에서 Network 카테고리 제외 · CSV 변환 누락.<br>"
             "<code style='font-size:.75rem'>procmon.csv</code> 에서 "
@@ -1520,21 +1519,21 @@ def _pnmap_debug_panel(pnmap: list, ip_proc_lookup: dict) -> str:
     for _pn in pnmap[:8]:
         sample_rows.append(
             f"<tr><td class='mono' style='font-size:.72rem'>{_e(_pn.process)}</td>"
-            f"<td style='color:#8b949e;font-size:.72rem'>({_pn.pid})</td>"
+            f"<td style='color:var(--fg-3);font-size:.72rem'>({_pn.pid})</td>"
             f"<td class='mono' style='font-size:.72rem'>{_e(_pn.proto)}</td>"
             f"<td class='mono' style='font-size:.72rem'>{_e(_pn.remote_ip)}:{_pn.remote_port}</td>"
-            f"<td style='color:#8b949e;font-size:.72rem'>{_pn.event_count}회</td></tr>"
+            f"<td style='color:var(--fg-3);font-size:.72rem'>{_pn.event_count}회</td></tr>"
         )
     more = len(pnmap) - 8
     return (
         f"<details style='margin:.5rem 0 1rem'>"
-        f"<summary style='color:#56d364;font-size:.8rem;cursor:pointer'>"
+        f"<summary style='color:var(--ok);font-size:.8rem;cursor:pointer'>"
         f"✓ 프로세스 매핑 {len(pnmap)}개 / IP 룩업 키 {len(ip_proc_lookup)}개 (클릭하여 샘플 보기)</summary>"
         f"<table style='margin-top:.4rem;border-collapse:collapse'>"
         f"<tr><th style='font-size:.72rem'>프로세스</th><th></th><th>Proto</th>"
         f"<th>Remote</th><th>횟수</th></tr>"
         + "".join(sample_rows)
-        + (f"<tr><td colspan='5' style='color:#6e7681;font-size:.72rem'>… {more}개 더</td></tr>"
+        + (f"<tr><td colspan='5' style='color:var(--fg-4);font-size:.72rem'>… {more}개 더</td></tr>"
            if more > 0 else "")
         + "</table></details>"
     )
@@ -1639,31 +1638,31 @@ def _execution_verdict_banner(br, result=None) -> str:
         return ""
     host_ev = _host_activity_evidence(result) if verdict in ("UNKNOWN", "FAILED") else []
     if host_ev:
-        items = "".join(f"<li style='color:#8b949e;font-size:.78rem;margin:.1rem 0'>{_e(d)}</li>"
+        items = "".join(f"<li style='color:var(--fg-3);font-size:.78rem;margin:.1rem 0'>{_e(d)}</li>"
                         for d in host_ev + details)
         return (
-            "<div style='border-left:3px solid #56d364;padding:.4rem 1rem;margin-bottom:1.2rem'>"
+            "<div style='border-left:3px solid var(--ok);padding:.4rem 1rem;margin-bottom:1.2rem'>"
             "<div style='display:flex;align-items:center;gap:.6rem;margin-bottom:.3rem'>"
-            "<span style='color:#56d364;font-weight:700;font-size:.9rem'>실행됨 — 샘플의 네트워크 활동은 없음</span>"
+            "<span style='color:var(--ok);font-weight:700;font-size:.9rem'>실행됨 — 샘플의 네트워크 활동은 없음</span>"
             "</div>"
-            "<p style='color:#cdd9e5;font-size:.85rem;margin:0'>샘플은 실행되어 시스템에 흔적을 남겼지만, "
+            "<p style='color:var(--fg-2);font-size:.85rem;margin:0'>샘플은 실행되어 시스템에 흔적을 남겼지만, "
             "샘플 프로세스의 네트워크 활동은 확인되지 않았습니다 "
             "(C2 서버 무응답·격리망·지연 실행 가능성).</p>"
             f"<ul style='margin:.5rem 0 0 1rem;padding:0'>{items}</ul></div>"
         )
 
     _CFG = {
-        "CONFIRMED": ("#56d364", "#0d2119", "✅ 실행 확인됨",
+        "CONFIRMED": ("var(--ok)", "var(--ok-bg)", "실행 확인됨",
                       "악성코드가 정상 실행되어 네트워크 활동이 관찰됩니다."),
-        "PARTIAL":   ("#e3b341", "#2d2a0a", "⚠️ 부분 실행",
+        "PARTIAL":   ("var(--warn)", "var(--warn-bg)", "부분 실행",
                       "일부 활동이 확인되었으나 C2 통신은 성공하지 못했습니다."),
-        "EVADED":    ("#ff7b72", "#2d1117", "🚫 분석 환경을 알아채고 멈춘 것으로 의심",
+        "EVADED":    ("var(--danger)", "var(--danger-bg)", "분석 환경을 알아채고 멈춘 것으로 의심",
                       "가상 머신·분석 도구 확인 직후 네트워크 활동 전에 종료한 것으로 추정됩니다. "
                       "FLARE VM 흔적(분석 도구·VM 표식)을 지우거나 다른 환경에서 다시 분석하세요."),
-        "FAILED":    ("#8b949e", "#21262d", "❓ 샘플 실행 실패 의심",
+        "FAILED":    ("var(--fg-3)", "var(--line)", "샘플 실행 실패 의심",
                       "이벤트가 거의 없어 샘플이 제대로 실행되지 않은 것으로 추정됩니다. "
                       "아키텍처(x86/x64) 불일치, 의존 DLL 누락, 실행 권한 문제를 확인하세요."),
-        "UNKNOWN":   ("#8b949e", "#21262d", "❓ 실행 여부 불명확",
+        "UNKNOWN":   ("var(--fg-3)", "var(--line)", "실행 여부 불명확",
                       "이벤트는 있으나 샘플 프로세스의 네트워크 활동이 확인되지 않았습니다. "
                       "긴 Sleep 후 C2 접속 또는 조건부 실행(특정 파일·레지스트리 필요) 가능성을 확인하세요."),
     }
@@ -1672,7 +1671,7 @@ def _execution_verdict_banner(br, result=None) -> str:
     detail_html = ""
     if details:
         items = "".join(
-            f"<li style='color:#8b949e;font-size:.78rem;margin:.1rem 0'>{_e(d)}</li>"
+            f"<li style='color:var(--fg-3);font-size:.78rem;margin:.1rem 0'>{_e(d)}</li>"
             for d in details
         )
         detail_html = f"<ul style='margin:.5rem 0 0 1rem;padding:0'>{items}</ul>"
@@ -1683,7 +1682,7 @@ def _execution_verdict_banner(br, result=None) -> str:
         f"<div style='display:flex;align-items:center;gap:.6rem;margin-bottom:.3rem'>"
         f"<span style='color:{color};font-weight:700;font-size:.9rem'>{title}</span>"
         f"</div>"
-        f"<p style='color:#cdd9e5;font-size:.82rem;margin:0'>{_e(desc)}</p>"
+        f"<p style='color:var(--fg-2);font-size:.82rem;margin:0'>{_e(desc)}</p>"
         f"{detail_html}"
         f"</div>"
     )
@@ -1800,8 +1799,8 @@ def _network_html(result) -> str:
                 ("도메인", f"{s.unique_domains:,}개"))
         parts.append(
             "<p class='cap-summary' style='display:flex;flex-wrap:wrap;gap:6px 26px;margin:0 0 18px;"
-            "font-size:.85rem;color:#acbbd0'>"
-            + "".join(f"<span>{k} <strong style='color:#e9eff8;font-weight:600'>{v}</strong></span>"
+            "font-size:.85rem;color:var(--fg-2)'>"
+            + "".join(f"<span>{k} <strong style='color:var(--fg-1);font-weight:600'>{v}</strong></span>"
                       for k, v in _cap)
             + "</p>"
         )
@@ -1819,18 +1818,18 @@ def _network_html(result) -> str:
             rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(ac.dst_ip)}"
-                + (f"<br><span style='color:#8b949e;font-size:.72rem'>{domain_str}</span>"
+                + (f"<br><span style='color:var(--fg-3);font-size:.72rem'>{domain_str}</span>"
                    if domain_str else "")
                 + f"</td>"
                 f"<td class='mono'>{ac.dst_port}</td>"
-                f"<td style='color:#8b949e'>{ac.count}회</td>"
+                f"<td style='color:var(--fg-3)'>{ac.count}회</td>"
                 f"<td>{port_badge}</td>"
                 + _proc_cell(ac_procs) +
                 f"</tr>"
             )
         parts.append(
-            "<h3 style='color:#ffa657'>⚠️ C2 연결 시도 실패 (SYN without SYN-ACK)</h3>"
-            "<p style='color:#8b949e;font-size:.82rem;margin-bottom:.5rem'>"
+            "<h3 style='color:var(--orange)'>C2 연결 시도 실패 (SYN without SYN-ACK)</h3>"
+            "<p style='color:var(--fg-3);font-size:.82rem;margin-bottom:.5rem'>"
             "TCP SYN을 전송했지만 SYN-ACK가 없음 — C2 서버 오프라인이거나 IP 차단. "
             "상용 샌드박스에서 탐지되는 C2가 FLARE VM에서만 응답 없을 때 이 목록에 나타납니다."
             "</p>"
@@ -1858,7 +1857,7 @@ def _network_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3>🚨 비콘(Beaconing) 탐지</h3>"
+            "<h3>비콘(Beaconing) 탐지</h3>"
             "<table id='tbl-net-beacon'><tr><th>목적지 IP</th><th>포트</th><th>횟수</th>"
             "<th>평균 간격</th><th>규칙성</th><th>프로세스</th></tr>"
             + "".join(rows) + "</table>"
@@ -1886,23 +1885,23 @@ def _network_html(result) -> str:
                 ja3_td = f"<td>{_b(ja3_label, 'red')}</td>"
             elif ja3_hash:
                 ja3_td = (
-                    f"<td><span class='mono' style='font-size:.72rem;color:#8b949e' "
+                    f"<td><span class='mono' style='font-size:.72rem;color:var(--fg-3)' "
                     f"title='{_e(ja3_hash)}'>{ja3_hash[:12]}…</span></td>"
                 )
             else:
-                ja3_td = "<td style='color:#484f58'>-</td>"
+                ja3_td = "<td style='color:var(--fg-4)'>-</td>"
             rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(t.sni)}</td>"
                 f"<td class='mono'>{_e(t.dst_ip)}</td>"
                 f"<td class='mono'>{t.dst_port}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:.78rem'>{_e(tls_ver) or '-'}</td>"
+                f"<td class='mono' style='color:var(--fg-3);font-size:.78rem'>{_e(tls_ver) or '-'}</td>"
                 f"{ja3_td}"
                 + _proc_cell(t_procs) +
                 f"</tr>"
             )
         parts.append(
-            "<h3>🔒 TLS SNI (HTTPS 도메인)</h3>"
+            "<h3>TLS SNI (HTTPS 도메인)</h3>"
             + _trunc_notice(len(seen_vals), _TLS_LIMIT)
             + "<table id='tbl-net-tls'><tr><th>SNI 도메인</th><th>목적지 IP</th><th>포트</th>"
             "<th>TLS 버전</th><th>JA3</th><th>프로세스</th></tr>"
@@ -1924,12 +1923,12 @@ def _network_html(result) -> str:
                         dga_procs.append(_p)
             rows.append(
                 f"<tr>"
-                f"<td class='mono' style='color:#ff7b72'>{_e(d)}</td>"
+                f"<td class='mono' style='color:var(--danger)'>{_e(d)}</td>"
                 + _proc_cell(dga_procs) +
                 f"</tr>"
             )
         parts.append(
-            "<h3>⚠ 무작위로 생성된 것으로 의심되는 도메인 (DGA)</h3>"
+            "<h3>무작위로 생성된 것으로 의심되는 도메인 (DGA)</h3>"
             + f"<table id='tbl-net-dga'><tr><th>도메인</th><th>프로세스</th></tr>" + "".join(rows) + "</table>"
         )
 
@@ -1944,7 +1943,7 @@ def _network_html(result) -> str:
             ip_color = "ev-network" if ext else ""
             susp_badge = _b("!", "red") if c.suspicious_port else ""
             _PORT_NOTE = {5228: "FCM"}  # Firebase Cloud Messaging — RAT C2 채널 악용
-            port_note = (f" <span style='font-size:.7rem;color:#e3b341'>"
+            port_note = (f" <span style='font-size:.7rem;color:var(--warn)'>"
                          f"{_PORT_NOTE[c.dst_port]}</span>"
                          if c.dst_port in _PORT_NOTE else "")
 
@@ -1955,11 +1954,11 @@ def _network_html(result) -> str:
                 extra   = len(conn_doms) - 1
                 dom_td  = (
                     f"<td class='mono ev-network' style='font-size:0.78rem'>{_e(primary)}"
-                    + (f"&nbsp;<span style='color:#8b949e'>+{extra}</span>" if extra else "")
+                    + (f"&nbsp;<span style='color:var(--fg-3)'>+{extra}</span>" if extra else "")
                     + "</td>"
                 )
             else:
-                dom_td = "<td style='color:#484f58'>-</td>"
+                dom_td = "<td style='color:var(--fg-4)'>-</td>"
 
             # 프로세스 lookup — 3단계 순서로 시도
             if _is_private_ip_str(c.dst_ip):
@@ -2016,7 +2015,7 @@ def _network_html(result) -> str:
                 f"<td class='mono {ip_color}'>{_e(c.dst_ip)}</td>"
                 f"{dom_td}"
                 f"<td class='mono'>{c.dst_port}{port_note} {susp_badge}</td>"
-                f"<td style='color:#8b949e'>{c.count}</td>"
+                f"<td style='color:var(--fg-3)'>{c.count}</td>"
                 f"<td class='mono'>{_fmt_bytes(c.bytes_out)}</td>"
                 + _proc_cell(_conn_procs, _reason) +
                 f"{_conn_chips_td}"
@@ -2059,13 +2058,13 @@ def _network_html(result) -> str:
                 "<th>도메인</th><th>포트</th><th>횟수</th><th>송신량</th><th>프로세스</th><th>기법</th></tr>"
             )
             parts.append(
-                f"<details style='margin-top:.6rem;border:1px solid #30363d;"
+                f"<details style='margin-top:.6rem;border:1px solid var(--line-2);"
                 f"border-radius:6px;padding:.4rem .7rem'>"
-                f"<summary style='cursor:pointer;color:#6e7681;font-size:.80rem;"
+                f"<summary style='cursor:pointer;color:var(--fg-4);font-size:.80rem;"
                 f"user-select:none;list-style:none'>"
                 f"&#9654; 브라우저 CDN 인프라 연결 {len(cdn_rows)}개"
                 f" (브라우저 보조 프로세스의 CDN 연결 — C2 아님)</summary>"
-                f"<p style='font-size:.74rem;color:#484f58;margin:.3rem 0'>"
+                f"<p style='font-size:.74rem;color:var(--fg-4);margin:.3rem 0'>"
                 f"&#9888; 샘플 체인 프로세스 → CDN 연결은 Domain Fronting C2 가능성이 있어 위 주 테이블에 표시됩니다."
                 f"</p>"
                 f"{_cdn_tbl_header}{''.join(cdn_rows)}</table>"
@@ -2100,17 +2099,17 @@ def _network_html(result) -> str:
                 susp_badges += _b("응답 없음", "yellow")
             _q_is_ddns = getattr(q, "is_ddns", False)
             _q_cls  = "" if (q.suspicious or _q_is_ddns) else "ev-network"
-            _q_clr  = "color:#ff7b72" if q.suspicious else ("color:#ffa657" if _q_is_ddns else "")
-            _q_rips = _e(", ".join(q.response_ips[:3])) if q.response_ips else "<span style='color:#8b949e;font-size:.72rem'>—</span>"
+            _q_clr  = "color:var(--danger)" if q.suspicious else ("color:var(--orange)" if _q_is_ddns else "")
+            _q_rips = _e(", ".join(q.response_ips[:3])) if q.response_ips else "<span style='color:var(--fg-3);font-size:.72rem'>—</span>"
             _dns_chips = _attk_chips([q.name], _tag_map, _techs)
             _dns_chips_td = (f"<td style='white-space:nowrap'>{_dns_chips}</td>"
                              if _dns_chips else "<td></td>")
             rows.append(
                 f"<tr{_tier_attr(q)}>"
                 f"<td class='mono {_q_cls}' style='{_q_clr}'>{_tier_badge(q)} {_e(q.name)}</td>"
-                f"<td class='mono' style='color:#8b949e'>{_e(q.qtype)}</td>"
-                f"<td class='mono' style='color:#8b949e'>{q.entropy:.2f}</td>"
-                f"<td class='mono' style='color:#56d364;font-size:0.72rem'>{_q_rips}</td>"
+                f"<td class='mono' style='color:var(--fg-3)'>{_e(q.qtype)}</td>"
+                f"<td class='mono' style='color:var(--fg-3)'>{q.entropy:.2f}</td>"
+                f"<td class='mono' style='color:var(--ok);font-size:0.72rem'>{_q_rips}</td>"
                 f"<td>{susp_badges}</td>"
                 + _proc_cell(dns_procs) +
                 f"{_dns_chips_td}"
@@ -2128,7 +2127,7 @@ def _network_html(result) -> str:
     if pcap and not pcap.http_requests:
         parts.append(
             "<h3>HTTP 요청</h3>"
-            "<p style='color:#8b949e;font-size:.85rem;margin:.4rem 0'>관찰되지 않음</p>"
+            "<p style='color:var(--fg-3);font-size:.85rem;margin:.4rem 0'>관찰되지 않음</p>"
         )
     if pcap and pcap.http_requests:
         _HTTP_LIMIT = 500
@@ -2161,8 +2160,8 @@ def _network_html(result) -> str:
             _r_auth = getattr(r, "authorization", "")
             if _r_auth:
                 _detail_rows.append(
-                    f"<b style='color:#ff7b72'>Authorization</b> "
-                    f"<span style='color:#ffa657'>{_e(_r_auth[:80])}</span>"
+                    f"<b style='color:var(--danger)'>Authorization</b> "
+                    f"<span style='color:var(--orange)'>{_e(_r_auth[:80])}</span>"
                 )
             _r_extra = getattr(r, "extra_headers", "")
             if _r_extra:
@@ -2171,7 +2170,7 @@ def _network_html(result) -> str:
             if _r_body:
                 _detail_rows.append(
                     f"<b>Body</b><br><pre style='margin:.2rem 0 0;font-size:.72rem;"
-                    f"background:#0d1117;padding:.4rem;border-radius:4px;overflow-x:auto;"
+                    f"background:var(--bg-inset);padding:.4rem;border-radius:4px;overflow-x:auto;"
                     f"max-width:600px;white-space:pre-wrap'>{_e(_r_body[:512])}</pre>"
                 )
 
@@ -2180,7 +2179,7 @@ def _network_html(result) -> str:
                 _detail_id = f"hreq-{_hi}"
                 _detail_html = (
                     f"<details id='{_detail_id}' style='margin:.1rem 0'>"
-                    f"<summary style='font-size:.72rem;color:#8b949e;cursor:pointer'>상세 보기</summary>"
+                    f"<summary style='font-size:.72rem;color:var(--fg-3);cursor:pointer'>상세 보기</summary>"
                     f"<div style='font-size:.75rem;padding:.3rem .5rem;line-height:1.6'>"
                     + "<br>".join(_detail_rows)
                     + "</div></details>"
@@ -2196,9 +2195,9 @@ def _network_html(result) -> str:
                 f"<td class='mono ev-network' style='word-break:break-all;min-width:180px'>"
                 f"<span title='{_e(_full_url)}'>{_path_display}</span>"
                 f"{_detail_html}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:0.72rem'>{_e(r.user_agent[:80])}</td>"
+                f"<td class='mono' style='color:var(--fg-3);font-size:0.72rem'>{_e(r.user_agent[:80])}</td>"
                 f"<td class='mono'>{_fmt_bytes(r.content_length) if r.content_length else '-'}</td>"
-                f"<td>{'🍪' if r.has_cookie else ''}</td>"
+                f"<td>{'' if r.has_cookie else ''}</td>"
                 + _proc_cell(h_procs) +
                 f"</tr>"
             )
@@ -2231,8 +2230,8 @@ def _network_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3 style='color:#ff7b72'>SMTP 세션</h3>"
-            "<p style='font-size:.76rem;color:#8b949e;margin:.2rem 0 .5rem'>전체 캡처에서 확인된 세션입니다. "
+            "<h3 style='color:var(--danger)'>SMTP 세션</h3>"
+            "<p style='font-size:.76rem;color:var(--fg-3);margin:.2rem 0 .5rem'>전체 캡처에서 확인된 세션입니다. "
             "프로세스 열이 비어 있으면 샘플과의 연결이 확인되지 않은 것이므로 C2·유출로 단정하지 마세요.</p>"
             "<table id='tbl-net-smtp'><tr><th>서버 IP</th><th>포트</th><th>EHLO 도메인</th>"
             "<th>발신자 (MAIL FROM)</th><th>수신자 (RCPT TO)</th>"
@@ -2259,8 +2258,8 @@ def _network_html(result) -> str:
                 f"</tr>"
             )
         parts.append(
-            "<h3 style='color:#ff7b72'>FTP 세션</h3>"
-            "<p style='font-size:.76rem;color:#8b949e;margin:.2rem 0 .5rem'>전체 캡처에서 확인된 세션입니다. "
+            "<h3 style='color:var(--danger)'>FTP 세션</h3>"
+            "<p style='font-size:.76rem;color:var(--fg-3);margin:.2rem 0 .5rem'>전체 캡처에서 확인된 세션입니다. "
             "프로세스 열이 비어 있으면 샘플과의 연결이 확인되지 않은 것입니다.</p>"
             "<table id='tbl-net-ftp'><tr><th>서버 IP</th><th>포트</th><th>사용자명</th>"
             "<th>업로드 파일</th><th>다운로드 파일</th><th>플래그</th><th>프로세스</th></tr>"
@@ -2280,24 +2279,24 @@ def _network_html(result) -> str:
             status   = str(getattr(req, "resp_status", "") or "")
             ct_resp  = _e(getattr(req, "resp_content_type", "") or "")
             if status.startswith("2"):
-                st_color = "color:#56d364"
+                st_color = "color:var(--ok)"
             elif status.startswith("3"):
-                st_color = "color:#e3b341"
+                st_color = "color:var(--warn)"
             else:
-                st_color = "color:#ff7b72" if status else "color:#8b949e"
+                st_color = "color:var(--danger)" if status else "color:var(--fg-3)"
             rows.append(
                 f"<tr>"
                 f"<td>{_b(method, 'orange')}</td>"
                 f"<td class='mono ev-network'>{host}</td>"
                 f"<td class='mono'>{path}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:.72rem'>{ua}</td>"
+                f"<td class='mono' style='color:var(--fg-3);font-size:.72rem'>{ua}</td>"
                 f"<td class='mono' style='{st_color}'>{status or '-'}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:.72rem'>{ct_resp}</td>"
+                f"<td class='mono' style='color:var(--fg-3);font-size:.72rem'>{ct_resp}</td>"
                 f"</tr>"
             )
         parts.append(
-            f"<h3>🔓 HTTPS 복호화 요청 ({len(decrypted)}건)</h3>"
-            f"<p style='color:#8b949e;font-size:.78rem;margin-bottom:.5rem'>"
+            f"<h3>HTTPS 복호화 요청 ({len(decrypted)}건)</h3>"
+            f"<p style='color:var(--fg-3);font-size:.78rem;margin-bottom:.5rem'>"
             f"SSLKEYLOGFILE 기반 TLS 복호화 — Python/Go/NSS TLS 구현에서만 작동 "
             f"(Schannel/WinHTTP 기반 악성코드는 FakeNet-NG 사용)</p>"
             + _trunc_notice(len(decrypted), _DEC_LIMIT)
@@ -2315,10 +2314,10 @@ def _network_html(result) -> str:
     fn_tcp   = fn.get("tcp_sessions",  []) or []
     if fn and (fn_dns or fn_http or fn_tcp):
         fn_elapsed = fn.get("elapsed_sec", 0)
-        err_html = f'&nbsp;|&nbsp; <span style="color:#ff7b72">{_e(fn_err)}</span>' if fn_err else ''
+        err_html = f'&nbsp;|&nbsp; <span style="color:var(--danger)">{_e(fn_err)}</span>' if fn_err else ''
         fn_parts = [
-            f"<h3>🎭 FakeNet-NG 캡처</h3>"
-            f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
+            f"<h3>FakeNet-NG 캡처</h3>"
+            f"<p style='color:var(--fg-3);font-size:.82rem;margin-bottom:1rem'>"
             f"실행 {fn_elapsed}s &nbsp;|&nbsp; DNS {len(fn_dns)}건 &nbsp;|&nbsp; "
             f"HTTP {len(fn_http)}건 &nbsp;|&nbsp; 바이너리 TCP {len(fn_tcp)}건"
             f"{err_html}"
@@ -2328,7 +2327,7 @@ def _network_html(result) -> str:
             rows = "".join(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(d.get('domain',''))}</td>"
-                f"<td class='mono' style='color:#56d364'>{_e(d.get('resolved','127.0.0.1'))}</td>"
+                f"<td class='mono' style='color:var(--ok)'>{_e(d.get('resolved','127.0.0.1'))}</td>"
                 f"</tr>"
                 for d in fn_dns[:200]
             )
@@ -2344,12 +2343,12 @@ def _network_html(result) -> str:
                 f"<td>{_b(h.get('method',''), 'orange')}</td>"
                 f"<td class='mono ev-network'>{_e(h.get('host',''))}</td>"
                 f"<td class='mono'>{_e((h.get('path','') or '')[:80])}</td>"
-                f"<td class='mono' style='color:#8b949e;font-size:.72rem'>{_e((h.get('user_agent','') or '')[:50])}</td>"
+                f"<td class='mono' style='color:var(--fg-3);font-size:.72rem'>{_e((h.get('user_agent','') or '')[:50])}</td>"
                 f"</tr>"
                 for h in fn_http[:300]
             )
             fn_parts.append(
-                "<h4>HTTP / HTTPS 요청 <span style='color:#8b949e;font-size:.78rem'>"
+                "<h4>HTTP / HTTPS 요청 <span style='color:var(--fg-3);font-size:.78rem'>"
                 "(FakeNet-NG가 TLS 종단 — Schannel/WinHTTP 포함)</span></h4>"
                 "<table id='tbl-fn-http'><tr><th>프로토콜</th><th>메서드</th>"
                 "<th>호스트</th><th>경로</th><th>User-Agent</th></tr>"
@@ -2695,7 +2694,7 @@ def _process_tree_html(result) -> str:
         if exe:
             html += f"<div class='pt-meta'>{_e(exe)}</div>"
         if cmd_html:
-            html += f"<div class='pt-meta' style='color:#484f58'>▸ {cmd_html}</div>"
+            html += f"<div class='pt-meta' style='color:var(--fg-4)'>▸ {cmd_html}</div>"
         _timing = _proc_timing_html(proc, _start_time) if proc else ""
         if _timing:
             html += f"<div class='pt-meta'>{_timing}</div>"
@@ -2712,18 +2711,18 @@ def _process_tree_html(result) -> str:
 
     # ── 전체 트리 렌더링 ─────────────────────────────────────────────
     _excl_note = (
-        f"&nbsp;·&nbsp;<span style='color:#6e7681'>정상 시스템 프로세스 {_excl}개 제외</span>"
+        f"&nbsp;·&nbsp;<span style='color:var(--fg-4)'>정상 시스템 프로세스 {_excl}개 제외</span>"
         if _excl else ""
     )
     _hh_excl_note = (
-        f"&nbsp;·&nbsp;<span style='color:#6e7681' "
+        f"&nbsp;·&nbsp;<span style='color:var(--fg-4)' "
         f"title='JIT 컴파일 엔진(Chrome V8, DWM, SearchApp 등)은 셸코드로 오탐되기 쉽습니다'>"
         f"셸코드만 탐지된 프로세스 {len(_hh_shc_only_excl)}개 제외</span>"
         if _hh_shc_only_excl else ""
     )
     parts = [
         "<div style='display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem'>",
-        "<span style='font-size:.78rem;color:#8b949e'>",
+        "<span style='font-size:.78rem;color:var(--fg-3)'>",
         "<span class='pt-ic pt-ic-s'>S</span> 샘플&nbsp;&nbsp;",
         "<span class='pt-ic pt-ic-n'>N</span> 신규 프로세스&nbsp;&nbsp;",
         "<span class='pt-ic pt-ic-x'>!</span> 주입 의심 (pe-sieve/HH)&nbsp;&nbsp;",
@@ -2731,10 +2730,10 @@ def _process_tree_html(result) -> str:
         _excl_note,
         _hh_excl_note,
         "</span>",
-        "<button onclick='expandAllPT()' style='background:#21262d;border:1px solid #30363d;"
-        "color:#8b949e;border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 펼치기</button>",
-        "<button onclick='collapseAllPT()' style='background:#21262d;border:1px solid #30363d;"
-        "color:#8b949e;border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 접기</button>",
+        "<button onclick='expandAllPT()' style='background:var(--line);border:1px solid var(--line-2);"
+        "color:var(--fg-3);border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 펼치기</button>",
+        "<button onclick='collapseAllPT()' style='background:var(--line);border:1px solid var(--line-2);"
+        "color:var(--fg-3);border-radius:4px;padding:.15rem .6rem;font-size:.73rem;cursor:pointer'>모두 접기</button>",
         "</div>",
         "<div class='ptree'>",
     ]
@@ -2768,7 +2767,7 @@ def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
 
     if b.children:
         items = "".join(
-            f"<li>{_e(nm)} <span style='color:#484f58'>(PID {cp})</span></li>"
+            f"<li>{_e(nm)} <span style='color:var(--fg-4)'>(PID {cp})</span></li>"
             for cp, nm in b.children[:50]
         )
         tabs.append((f"자식 {len(b.children)}", "ch"))
@@ -2778,11 +2777,11 @@ def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
     if nf:
         html = ""
         if b.files_written:
-            html += f"<p class='beh-sub' style='color:#56d364'>쓰기 ({len(b.files_written)})</p>"
+            html += f"<p class='beh-sub' style='color:var(--ok)'>쓰기 ({len(b.files_written)})</p>"
             html += "<ul class='beh-list'>" + "".join(
                 f"<li>{_e(p[:160])}</li>" for p in b.files_written[:50]) + "</ul>"
         if b.files_deleted:
-            html += f"<p class='beh-sub' style='color:#ff7b72'>삭제 ({len(b.files_deleted)})</p>"
+            html += f"<p class='beh-sub' style='color:var(--danger)'>삭제 ({len(b.files_deleted)})</p>"
             html += "<ul class='beh-list'>" + "".join(
                 f"<li>{_e(p[:160])}</li>" for p in b.files_deleted[:50]) + "</ul>"
         tabs.append((f"파일 {nf}", "fi"))
@@ -2792,11 +2791,11 @@ def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
     if nr:
         html = ""
         if b.reg_written:
-            html += f"<p class='beh-sub' style='color:#56d364'>쓰기 ({len(b.reg_written)})</p>"
+            html += f"<p class='beh-sub' style='color:var(--ok)'>쓰기 ({len(b.reg_written)})</p>"
             html += "<ul class='beh-list'>" + "".join(
                 f"<li>{_e(p[:160])}</li>" for p in b.reg_written[:50]) + "</ul>"
         if b.reg_deleted:
-            html += f"<p class='beh-sub' style='color:#ff7b72'>삭제 ({len(b.reg_deleted)})</p>"
+            html += f"<p class='beh-sub' style='color:var(--danger)'>삭제 ({len(b.reg_deleted)})</p>"
             html += "<ul class='beh-list'>" + "".join(
                 f"<li>{_e(p[:160])}</li>" for p in b.reg_deleted[:50]) + "</ul>"
         tabs.append((f"레지스트리 {nr}", "re"))
@@ -2812,10 +2811,10 @@ def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
                 _req_parts = []
                 for r in reqs[:5]:
                     _full = "http://" + (r.host or "") + (r.path or "/")
-                    _size = (f" <span style='color:#6e7681'>({_fmt_bytes(r.content_length)})</span>"
+                    _size = (f" <span style='color:var(--fg-4)'>({_fmt_bytes(r.content_length)})</span>"
                              if r.content_length else "")
                     _req_parts.append(
-                        f"<div style='font-size:.70rem;color:#79c0ff;padding-left:.8rem'>"
+                        f"<div style='font-size:.70rem;color:var(--info);padding-left:.8rem'>"
                         f"{_e(r.method)} "
                         f"<span title='{_e(_full)}'>"
                         f"{_e(r.path[:120] or '/')}</span>{_size}</div>"
@@ -2823,7 +2822,7 @@ def _behavior_panel_html(b, pid: int, http_by_conn: dict = None) -> str:
                 req_lines = "".join(_req_parts)
                 item_parts.append(
                     f"<li>{_e(ip)}:{port}"
-                    f"<span style='font-size:.70rem;color:#56d364'> HTTP</span>"
+                    f"<span style='font-size:.70rem;color:var(--ok)'> HTTP</span>"
                     f"{req_lines}</li>"
                 )
             else:
@@ -3094,33 +3093,33 @@ def _quick_scan_card_html(result) -> str:
         return ""
 
     _LVL = {
-        "critical": ("#ff7b72", "#2d1117", "CRITICAL"),
-        "high":     ("#ffa657", "#2d1f0a", "HIGH"),
-        "medium":   ("#e3b341", "#2d2a0a", "MEDIUM"),
-        "info":     ("#79c0ff", "#0d1f37", "INFO"),
+        "critical": ("var(--danger)", "var(--danger-bg)", "CRITICAL"),
+        "high":     ("var(--orange)", "var(--orange-bg)", "HIGH"),
+        "medium":   ("var(--warn)", "var(--warn-bg)", "MEDIUM"),
+        "info":     ("var(--info)", "var(--info-bg)", "INFO"),
     }
     _ORDER = {"critical": 0, "high": 1, "medium": 2, "info": 3}
 
     rows = []
     for level, title, detail in sorted(findings, key=lambda x: _ORDER.get(x[0], 9))[:8]:
-        color, bg, label = _LVL.get(level, ("#8b949e", "#21262d", level.upper()))
-        det = (f"<span style='color:#6e7681;font-size:.76rem;margin-left:.1rem'>"
+        color, bg, label = _LVL.get(level, ("var(--fg-3)", "var(--line)", level.upper()))
+        det = (f"<span style='color:var(--fg-4);font-size:.76rem;margin-left:.1rem'>"
                f"{_e(detail)}</span>") if detail else ""
         rows.append(
             f"<div style='display:flex;align-items:center;gap:.55rem;"
-            f"padding:.3rem 0;border-bottom:1px solid #21262d'>"
+            f"padding:.3rem 0;border-bottom:1px solid var(--line)'>"
             f"<span style='background:{bg};color:{color};border:1px solid {color};"
             f"border-radius:3px;padding:1px 7px;font-size:.66rem;font-weight:700;"
             f"flex-shrink:0;letter-spacing:.04em'>{label}</span>"
-            f"<span style='font-size:.82rem;color:#c9d1d9;font-weight:500;flex-shrink:0'>"
+            f"<span style='font-size:.82rem;color:var(--fg-2);font-weight:500;flex-shrink:0'>"
             f"{_e(title)}</span>"
             f"{det}</div>"
         )
 
     return (
         f"<div class='card' style='margin-bottom:1.2rem;"
-        f"border-left:3px solid #ffa657;padding:.7rem 1rem'>"
-        f"<p style='font-size:.67rem;color:#6e7681;text-transform:uppercase;"
+        f"border-left:3px solid var(--orange);padding:.7rem 1rem'>"
+        f"<p style='font-size:.67rem;color:var(--fg-4);text-transform:uppercase;"
         f"letter-spacing:.06em;margin-bottom:.4rem'>빠른 위협 요약</p>"
         + "".join(rows)
         + "</div>"
@@ -3175,7 +3174,7 @@ def _all_procs_html(result, chain_pids: set, *, detailed=True) -> str:
             f"<td class='mono'>{p.pid}</td>"
             f"<td>{name_cell}</td>"
             f"<td style='white-space:nowrap'>{_tier_badge(p)}</td>"
-            f"<td class='mono' style='color:#a9b8cc' title='{_e(p.exe or '')}'>"
+            f"<td class='mono' style='color:var(--fg-2)' title='{_e(p.exe or '')}'>"
             f"{cmd_html or _e(p.exe or '')}</td>"
             f"{_chips2_td}"
             f"</tr>{beh_detail_row}"
@@ -3207,20 +3206,20 @@ def _render_proc_result(proc, exe: str = "") -> str:
     pe_badge  = _b(f"PE 주입 {proc.implanted_pe}개", "orange") if proc.implanted_pe else ""
     proc_name = _e(proc.name) if getattr(proc, "name", "") else ""
     name_tag  = (
-        f" <span style='color:#e3b341;font-weight:600'>{proc_name}</span>"
+        f" <span style='color:var(--warn);font-weight:600'>{proc_name}</span>"
         if proc_name else ""
     )
     exe_tag = (
-        f"<div style='font-size:0.72rem;color:#8b949e;margin:.1rem 0 .5rem 0'>"
+        f"<div style='font-size:0.72rem;color:var(--fg-3);margin:.1rem 0 .5rem 0'>"
         f"{_e(exe)}</div>"
         if exe else ""
     )
 
     if not proc.modules:
         return (
-            f"<p style='margin:.4rem 0;font-size:0.85rem'>🚨 PID {proc.pid}"
+            f"<p style='margin:.4rem 0;font-size:0.85rem'>PID {proc.pid}"
             f"{name_tag} "
-            f"<span style='color:#8b949e'>({_e(arch)})</span> "
+            f"<span style='color:var(--fg-3)'>({_e(arch)})</span> "
             f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}</p>"
             f"{exe_tag}"
         )
@@ -3236,16 +3235,16 @@ def _render_proc_result(proc, exe: str = "") -> str:
             kind_badge = _b("훅/패치", "yellow")
         rows.append(
             f"<tr>"
-            f"<td class='mono' style='color:#c9d1d9'>{_e(mod_name)}</td>"
+            f"<td class='mono' style='color:var(--fg-2)'>{_e(mod_name)}</td>"
             f"<td>{kind_badge}</td>"
-            f"<td class='mono' style='color:#8b949e'>{mod.patches_count}</td>"
-            f"<td class='mono' style='color:#8b949e'>{mod.implanted_count}</td>"
+            f"<td class='mono' style='color:var(--fg-3)'>{mod.patches_count}</td>"
+            f"<td class='mono' style='color:var(--fg-3)'>{mod.implanted_count}</td>"
             f"<td class='mono ev-file'>{_e(dump_name)}</td>"
             f"</tr>"
         )
     return (
-        f"<h3>🚨 PID {proc.pid}{name_tag} "
-        f"<span style='color:#8b949e;font-size:0.8rem;font-weight:normal'>"
+        f"<h3>PID {proc.pid}{name_tag} "
+        f"<span style='color:var(--fg-3);font-size:0.8rem;font-weight:normal'>"
         f"({_e(arch)}) &nbsp;"
         f"{_b(f'의심 {proc.suspicious}개', 'orange')} {shc_badge} {pe_badge}"
         f"</span></h3>"
@@ -3306,7 +3305,7 @@ def _shellcode_html(result) -> str:
             full_err  = _e(hh_r.error)
             short_err = _e(hh_r.error[:200]) + ("…" if len(hh_r.error) > 200 else "")
             parts.append(
-                f"<p style='color:#484f58;font-size:.78rem;margin:.3rem 0' title='{full_err}'>"
+                f"<p style='color:var(--fg-4);font-size:.78rem;margin:.3rem 0' title='{full_err}'>"
                 f"hollows-hunter: {short_err}</p>"
             )
         else:
@@ -3331,9 +3330,9 @@ def _shellcode_html(result) -> str:
     if has_hh_data or has_pe_data:
         rows = []
         if has_hh_data:
-            ss = "#ff7b72" if hh_susp   else "#56d364"
-            pi = "#e3b341" if hh_pe_inj else "#8b949e"
-            sc = "#ff7b72" if hh_shc    else "#8b949e"
+            ss = "var(--danger)" if hh_susp   else "var(--ok)"
+            pi = "var(--warn)" if hh_pe_inj else "var(--fg-3)"
+            sc = "var(--danger)" if hh_shc    else "var(--fg-3)"
             rows.append(
                 f"<tr><td>hollows-hunter (전체 시스템)</td><td>"
                 f"{hh_scanned}개 스캔 &nbsp;"
@@ -3343,9 +3342,9 @@ def _shellcode_html(result) -> str:
                 f"</td></tr>"
             )
         if has_pe_data:
-            pss = "#ff7b72" if pe_susp   else "#56d364"
-            ppi = "#e3b341" if pe_pe_inj else "#8b949e"
-            psc = "#ff7b72" if pe_shc    else "#8b949e"
+            pss = "var(--danger)" if pe_susp   else "var(--ok)"
+            ppi = "var(--warn)" if pe_pe_inj else "var(--fg-3)"
+            psc = "var(--danger)" if pe_shc    else "var(--fg-3)"
             rows.append(
                 f"<tr><td>pe-sieve (신규 + 의심 DLL 로드 프로세스)</td><td>"
                 f"{len(pe_valid)}개 스캔 &nbsp;"
@@ -3378,26 +3377,26 @@ def _shellcode_html(result) -> str:
                 parts.append(_render_proc_result(proc, exe=snap_exe_hh))
             if hh_noise_n:
                 parts.append(
-                    f"<p style='font-size:.76rem;color:#6e7681;margin:.25rem 0'>"
+                    f"<p style='font-size:.76rem;color:var(--fg-4);margin:.25rem 0'>"
                     f"시스템 프로세스 {hh_noise_n}개 제외 "
                     f"(셸코드·후킹만 탐지되고 PE 주입·교체는 없음 — 오탐 가능성 높음)</p>"
                 )
         else:
             if hh_noise_n:
                 parts.append(
-                    f"<p class='alert alert-success'>✅ hollows-hunter: 의미 있는 코드 주입 없음"
-                    f"<span style='font-size:.8rem;color:#6e7681'> "
+                    f"<p class='alert alert-success'>hollows-hunter: 의미 있는 코드 주입 없음"
+                    f"<span style='font-size:.8rem;color:var(--fg-4)'> "
                     f"(시스템 프로세스 {hh_noise_n}개 제외)</span></p>"
                 )
             else:
                 parts.append(
-                    "<p class='alert alert-success'>✅ hollows-hunter: 코드 주입·셸코드 없음</p>"
+                    "<p class='alert alert-success'>hollows-hunter: 코드 주입·셸코드 없음</p>"
                 )
 
     # ── pe-sieve 프로세스 상세 ────────────────────────────────────
     if pe_list:
         parts.append(
-            "<h3 style='margin-top:1.5rem;border-top:1px solid #30363d;padding-top:.75rem'>"
+            "<h3 style='margin-top:1.5rem;border-top:1px solid var(--line-2);padding-top:.75rem'>"
             "pe-sieve — 신규 프로세스 &amp; 의심 DLL 로드 프로세스 스캔 결과</h3>"
         )
 
@@ -3413,7 +3412,7 @@ def _shellcode_html(result) -> str:
                 short_err = _e(r.error[:160]) + ("…" if len(r.error) > 160 else "")
                 name_hint = f" [{_e(r.name)}]" if r.name else ""
                 parts.append(
-                    f"<p style='color:#8b949e;font-size:0.82rem;margin:.25rem 0' title='{full_err}'>"
+                    f"<p style='color:var(--fg-3);font-size:0.82rem;margin:.25rem 0' title='{full_err}'>"
                     f"PID {r.pid}{name_hint}: {short_err}</p>"
                 )
             elif r.suspicious > 0:
@@ -3425,7 +3424,7 @@ def _shellcode_html(result) -> str:
             else:
                 arch      = "64bit" if r.is_64bit else "32bit"
                 name_part = (
-                    f"&nbsp;<span class='mono' style='color:#e3b341'>{_e(r.name)}</span>"
+                    f"&nbsp;<span class='mono' style='color:var(--warn)'>{_e(r.name)}</span>"
                     if r.name else ""
                 )
                 exe_part = ""
@@ -3433,18 +3432,18 @@ def _shellcode_html(result) -> str:
                     exe_val = getattr(snap, "exe", "") or ""
                     if exe_val:
                         exe_part = (
-                            f"&nbsp;<span style='color:#8b949e;font-size:0.72rem'>"
+                            f"&nbsp;<span style='color:var(--fg-3);font-size:0.72rem'>"
                             f"— {_e(exe_val)}</span>"
                         )
                 parts.append(
-                    f"<p style='color:#56d364;font-size:0.82rem;margin:.25rem 0'>"
-                    f"✅ PID {r.pid}{name_part}"
-                    f"&nbsp;<span style='color:#6e7681'>({_e(arch)})</span>"
+                    f"<p style='color:var(--ok);font-size:0.82rem;margin:.25rem 0'>"
+                    f"PID {r.pid}{name_part}"
+                    f"&nbsp;<span style='color:var(--fg-4)'>({_e(arch)})</span>"
                     f": 이상 없음{exe_part}</p>"
                 )
         if pe_noise_n:
             parts.append(
-                f"<p style='font-size:.76rem;color:#6e7681;margin:.25rem 0'>"
+                f"<p style='font-size:.76rem;color:var(--fg-4);margin:.25rem 0'>"
                 f"pe-sieve: 시스템 프로세스 {pe_noise_n}개 제외 "
                 f"(PE 주입·교체 없음 — 오탐 가능성 높음)</p>"
             )
@@ -3510,7 +3509,7 @@ def _geo_lookup_html(ips: list) -> str:
     cfg = _geo_cfg()
     host = urlparse(cfg["url"]).netloc or "ip-api.com"
     plain = cfg["url"].lower().startswith("http://")
-    note_style = "font-size:.74rem;color:#8b949e;margin:.2rem 0 .5rem"
+    note_style = "font-size:.74rem;color:var(--fg-3);margin:.2rem 0 .5rem"
     if not ips:
         return ""
     if not cfg["enabled"]:
@@ -3539,7 +3538,7 @@ def _geo_lookup_html(ips: list) -> str:
         "list.forEach(function(it){if(!it||it.status!=='success')return;var cell=cells[it.query];if(!cell)return;"
         "var asn=String(it.as||'').split(' ')[0];var org=String(it.org||it.as||'').replace(/^AS[0-9]+[ ]*/,'').split(' ').slice(0,4).join(' ');"
         "var f=flag(it.countryCode);"
-        "cell.innerHTML=(f?f+' ':'')+h(it.country||'-')+'<br><span style=\"color:#8b949e;font-size:.7rem\">'+h(asn)+(org?' · '+h(org):'')+'</span>';});"
+        "cell.innerHTML=(f?f+' ':'')+h(it.country||'-')+'<br><span style=\"color:var(--fg-3);font-size:.7rem\">'+h(asn)+(org?' · '+h(org):'')+'</span>';});"
         "btn.textContent='조회 완료';"
         "}).catch(function(e){btn.disabled=false;btn.textContent='조회 실패 — 다시 시도';btn.title=String(e&&e.message||e);});}"
         "</script>"
@@ -3550,9 +3549,9 @@ def _ioc_copy_btn(key: str) -> str:
     """카테고리별 IOC 복사 버튼 (해당 섹션 제목 옆)."""
     return (
         "<button onclick=\"copyIOC('" + key + "',this)\" "
-        "style='margin-left:.5rem;background:#21262d;border:1px solid #30363d;"
-        "color:#8b949e;border-radius:4px;padding:.1rem .5rem;font-size:.68rem;"
-        "cursor:pointer;font-weight:400;vertical-align:middle'>📋 복사</button>"
+        "style='margin-left:.5rem;background:var(--line);border:1px solid var(--line-2);"
+        "color:var(--fg-3);border-radius:4px;padding:.1rem .5rem;font-size:.68rem;"
+        "cursor:pointer;font-weight:400;vertical-align:middle'>복사</button>"
     )
 
 
@@ -3584,10 +3583,10 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
         parts.append(
             "<div style='margin-bottom:.8rem;display:flex;align-items:center;"
             "gap:.6rem;flex-wrap:wrap'>"
-            "<button onclick=\"copyIOC('all',this)\" style='background:#1f6feb;border:none;"
+            "<button onclick=\"copyIOC('all',this)\" style='background:var(--accent-strong);border:none;"
             "color:#fff;border-radius:5px;padding:.35rem .9rem;font-size:.8rem;"
             "cursor:pointer;font-weight:600'>\U0001F4CB 전체 IOC 복사</button>"
-            "<span style='color:#6e7681;font-size:.74rem'>"
+            "<span style='color:var(--fg-4);font-size:.74rem'>"
             "IP·도메인·URL·드롭파일·"
             "레지스트리를 텍스트로 클립보드에 복사 (평상시 활동 파일 제외)</span>"
             "</div>" + _copy_js
@@ -3647,24 +3646,24 @@ def _ioc_html(result, sample_sha256: str = "") -> str:
             dom_html = (
                 "<span class='mono ev-network' style='font-size:.78rem'>"
                 + _e(doms[0]) + "</span>"
-                + (f"<span style='color:#8b949e'>&nbsp;+{len(doms)-1}</span>" if len(doms) > 1 else "")
-                if doms else "<span style='color:#484f58'>-</span>"
+                + (f"<span style='color:var(--fg-3)'>&nbsp;+{len(doms)-1}</span>" if len(doms) > 1 else "")
+                if doms else "<span style='color:var(--fg-4)'>-</span>"
             )
             port_html = (
                 "&nbsp;".join(
-                    f"<span style='background:#21262d;border-radius:4px;padding:.1rem .4rem;"
+                    f"<span style='background:var(--line);border-radius:4px;padding:.1rem .4rem;"
                     f"font-size:.72rem;font-family:monospace'>{_e(p)}</span>"
                     for p in ports[:5]
-                ) + (f"<span style='color:#8b949e'>&nbsp;+{len(ports)-5}</span>" if len(ports) > 5 else "")
-                if ports else "<span style='color:#484f58'>-</span>"
+                ) + (f"<span style='color:var(--fg-3)'>&nbsp;+{len(ports)-5}</span>" if len(ports) > 5 else "")
+                if ports else "<span style='color:var(--fg-4)'>-</span>"
             )
             rows.append(
                 f"<tr>"
                 f"<td class='mono ev-network'>{_e(ip)}</td>"
                 f"<td>{dom_html}</td>"
                 f"<td style='white-space:nowrap'>{port_html}</td>"
-                f"<td data-geo-ip='{_e(ip)}' style='color:#8b949e;font-size:.78rem'>"
-                f"<span style='color:#484f58'>-</span></td>"
+                f"<td data-geo-ip='{_e(ip)}' style='color:var(--fg-3);font-size:.78rem'>"
+                f"<span style='color:var(--fg-4)'>-</span></td>"
                 + _proc_cell(ip_proc_lookup.get(ip, [])) +
                 f"</tr>"
             )
@@ -3815,19 +3814,19 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
         short = sample_sha256[:20] + "…"
         chips.append(
             f"<span class='hunt-qchip hash' title='{_e(sample_sha256)}' data-q='{_e(sample_sha256)}' "
-            f"onclick='huntQuick(this.dataset.q)'>🔑 {_e(short)}</span>"
+            f"onclick='huntQuick(this.dataset.q)'>{_e(short)}</span>"
         )
 
     # IOC IP 칩 (최대 8개)
     for ip in (ioc.ip_addresses[:8] if ioc else []):
         chips.append(
-            f"<span class='hunt-qchip ip' data-q='{_e(ip)}' onclick='huntQuick(this.dataset.q)'>🌐 {_e(ip)}</span>"
+            f"<span class='hunt-qchip ip' data-q='{_e(ip)}' onclick='huntQuick(this.dataset.q)'>{_e(ip)}</span>"
         )
 
     # IOC 도메인 칩 (최대 6개)
     for d in (ioc.domains[:6] if ioc else []):
         chips.append(
-            f"<span class='hunt-qchip domain' data-q='{_e(d)}' onclick='huntQuick(this.dataset.q)'>🔗 {_e(d)}</span>"
+            f"<span class='hunt-qchip domain' data-q='{_e(d)}' onclick='huntQuick(this.dataset.q)'>{_e(d)}</span>"
         )
 
     quick_html = ""
@@ -3840,7 +3839,7 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
         )
 
     return f"""
-<h2>위협 조회 — abuse.ch</h2>
+{_sec("hunt", "위협 조회", "abuse.ch — MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker")}
 
 <div class="alert alert-info" style="font-size:.82rem;margin-bottom:.6rem">
   <strong>MalwareBazaar · ThreatFox · URLhaus · Feodo Tracker</strong>
@@ -3857,7 +3856,7 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
 
 <div id="hunt-cors-warn" class="alert alert-warning"
      style="display:none;font-size:.82rem;margin-bottom:.8rem">
-  ⚠ <strong>file:// 프로토콜 감지 — API 요청이 차단될 수 있습니다.</strong><br>
+  <strong>file:// 프로토콜 감지 — API 요청이 차단될 수 있습니다.</strong><br>
   브라우저는 <code>file://</code>에서 열린 페이지의 외부 fetch 를 CORS origin=null 로 처리합니다.<br>
   <strong>해결:</strong> <code>config.json</code> → <code>hunt.serve_port</code> 값을 설정하면 다음 실행부터
   <code>http://127.0.0.1:PORT</code>로 자동 서빙됩니다.
@@ -3879,7 +3878,7 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
            placeholder="SHA256 · MD5 · IP 주소 · 도메인 · URL …"
            oninput="huntInputChanged()"
            onkeydown="if(event.key==='Enter')huntSearch()">
-    <button id="hunt-go" class="hunt-btn" onclick="huntSearch()">🔍 Hunt</button>
+    <button id="hunt-go" class="hunt-btn" onclick="huntSearch()">Hunt</button>
   </div>
   <div id="hunt-hint" class="hunt-hint"></div>
   {quick_html}
@@ -3887,10 +3886,10 @@ def _hunt_html(sample_sha256: str, ioc) -> str:
 
 <!-- 서비스 상태 배지 -->
 <div class="hunt-svcs">
-  <span id="svc-mb"    class="svc-badge idle">📦 MalwareBazaar</span>
-  <span id="svc-tf"    class="svc-badge idle">🎯 ThreatFox</span>
-  <span id="svc-uh"    class="svc-badge idle">🌐 URLhaus</span>
-  <span id="svc-feodo" class="svc-badge idle">👾 Feodo Tracker</span>
+  <span id="svc-mb"    class="svc-badge idle">MalwareBazaar</span>
+  <span id="svc-tf"    class="svc-badge idle">ThreatFox</span>
+  <span id="svc-uh"    class="svc-badge idle">URLhaus</span>
+  <span id="svc-feodo" class="svc-badge idle">Feodo Tracker</span>
 </div>
 
 <!-- 결과 영역 -->
@@ -4071,17 +4070,17 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
             "<div style='"
             "margin:1rem 0 1.2rem;"
             "padding:.8rem 1rem;"
-            "border:1.5px solid #d29922;"
+            "border:1.5px solid var(--warn);"
             "border-radius:8px;"
             "background:#272115;"
             "'>"
-            "<div style='font-size:1rem;font-weight:700;color:#e3b341;margin-bottom:.4rem'>"
+            "<div style='font-size:1rem;font-weight:700;color:var(--warn);margin-bottom:.4rem'>"
             "&#9888; 샘플 비활성 추정 — 유의미한 행위 미관찰"
             "</div>"
-            "<ul style='margin:.3rem 0 .5rem 1.2rem;padding:0;color:#8b949e;font-size:.82rem'>"
+            "<ul style='margin:.3rem 0 .5rem 1.2rem;padding:0;color:var(--fg-3);font-size:.82rem'>"
             + _sig_items +
             "</ul>"
-            "<div style='font-size:.78rem;color:#6e7681'>"
+            "<div style='font-size:.78rem;color:var(--fg-4)'>"
             "가능한 원인: 분석 환경 감지(안티-샌드박스) · 네트워크/C2 의존 실패 · "
             "비활성 샘플 · 실행 조건 미충족. "
             "상용 샌드박스(Any.run, JoeSandbox) 결과와 교차 확인 권장."
@@ -4095,7 +4094,19 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
     _report_header = report_header(
         sample_name=sample_name, sample_path=result.config.sample_path or "전체 시스템 모니터링",
         generated=generated, timeout=result.config.timeout, duration=result.end_time-result.start_time,
+        verdict=_verdict, controls=_scope_bar_html(result),
     )
+    # 히어로 카드 오른쪽 정보 칸
+    _mins, _secs = divmod(int(max(0, result.end_time - result.start_time)), 60)
+    _bl_info = getattr(result, "baseline_info", None) or {}
+    _hero_facts = [
+        ("분석 시각", generated),
+        ("관찰 시간", f"{result.config.timeout}초"),
+        ("전체 소요", f"{_mins}분 {_secs}초"),
+        ("샘플 실행 권한", (result.tools_used or {}).get("sample_privilege") or "관리자 (기본)"),
+    ]
+    if _bl_info.get("mode") == "baseline":
+        _hero_facts.append(("평상시 기준", f"{_bl_info.get('host', '')} · {_bl_info.get('age_days', '?')}일 전 수집"))
     # 행위 그래프 — 판정·탐지 근거·프로세스 실행 흐름과 각 프로세스의 행위를 한 장에.
     # 계보를 못 찾았으면 트리에 표시되는 프로세스로 대신 그린다.
     from exporters.behavior_graph import behavior_graph_html
@@ -4107,7 +4118,8 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
         _overview_graph = f"<p>행위 그래프 생성 실패: {_e(type(_ge).__name__)}</p>"
 
     fragment = (lambda html: html) if detailed else _without_disclosures
-    evidence_button = '<button class="tab-btn" data-tab="tab-evidence">증거</button>' if detailed else ""
+    evidence_button = (f'<button class="tab-btn" data-tab="tab-evidence">{_icon("evidence")}<span>증거</span></button>'
+                       if detailed else "")
     evidence_panel = (f'<div id="tab-evidence" class="tab-panel">{_evidence_html(result, output_path)}</div>'
                       if detailed else "")
     attack_appendix = (f'<details class="plain"><summary>ATT&amp;CK 전체 표 (VirusTotal·CAPA·AI 포함)</summary>'
@@ -4132,49 +4144,33 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 
 {_report_header}
 
-{"".join(f'<p class="alert alert-warning">⚠ {_e(e)}</p>' for e in result.errors) if result.errors else ""}
+{"".join(f'<p class="alert alert-warning">{_e(e)}</p>' for e in result.errors) if result.errors else ""}
 
 {_inactivity_banner}
 
-{_scope_bar_html(result)}
-
-<!-- ── 탭 네비게이션 ── -->
+<!-- ── 왼쪽 메뉴 ── -->
 <nav class="tabs" aria-label="보고서 섹션">
-  <button class="tab-btn active" data-tab="tab-basic">
-    분석 개요{tab1_b}
-  </button>
-  <button class="tab-btn" data-tab="tab-process">
-    프로세스{tab_proc_b}
-  </button>
-  <button class="tab-btn" data-tab="tab-filesystem">
-    파일{tab2_b}
-  </button>
-  <button class="tab-btn" data-tab="tab-registry">
-    레지스트리{tab3_b}
-  </button>
-  <button class="tab-btn" data-tab="tab-network">
-    네트워크{tab4_b}
-  </button>
-  <button class="tab-btn" data-tab="tab-memory">
-    메모리{tab_mem_b}
-  </button>
-  <button class="tab-btn" data-tab="tab-ioc">
-    IOC{tab5_b}
-  </button>
+  {_nav_brand()}
+  <button class="tab-btn active" data-tab="tab-basic">{_icon("overview")}<span>분석 개요</span>{tab1_b}</button>
+  <button class="tab-btn" data-tab="tab-process">{_icon("process")}<span>프로세스</span>{tab_proc_b}</button>
+  <button class="tab-btn" data-tab="tab-filesystem">{_icon("file")}<span>파일</span>{tab2_b}</button>
+  <button class="tab-btn" data-tab="tab-registry">{_icon("registry")}<span>레지스트리</span>{tab3_b}</button>
+  <button class="tab-btn" data-tab="tab-network">{_icon("network")}<span>네트워크</span>{tab4_b}</button>
+  <button class="tab-btn" data-tab="tab-memory">{_icon("memory")}<span>메모리</span>{tab_mem_b}</button>
+  <button class="tab-btn" data-tab="tab-ioc">{_icon("ioc")}<span>IOC</span>{tab5_b}</button>
   {evidence_button}
-  <button class="tab-btn" data-tab="tab-hunt">
-    위협 조회
-  </button>
+  <button class="tab-btn" data-tab="tab-hunt">{_icon("hunt")}<span>위협 조회</span></button>
 </nav>
 
 <!-- ══════════ 탭 1: 기본 분석 ══════════ -->
 <div id="tab-basic" class="tab-panel active">
   {_VISUALS_CSS}
-  {_verdict_overview_html(result, sample_name, sample_sha256, verdict=_verdict)}  <!-- 판정 근거 목록은 요약판에서도 남긴다 — 접힌 부록이 아니라 판정의 근거다 -->
+  {_verdict_overview_html(result, sample_name, sample_sha256, verdict=_verdict,
+                          sample_path=str(result.config.sample_path or ""), facts=_hero_facts)}  <!-- 판정 근거 목록은 요약판에서도 남긴다 — 접힌 부록이 아니라 판정의 근거다 -->
 
   {fragment(_ai_html(result))}
 
-  <h2>행위 그래프</h2>{_overview_graph}
+  {_sec("graph", "행위 그래프", "실행 흐름과 각 프로세스가 한 일")}{_overview_graph}
 
   {attack_appendix}
 
@@ -4183,7 +4179,7 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 <!-- ══════════ 탭 3: 프로세스 ══════════ -->
 <div id="tab-process" class="tab-panel">
 
-  <h2>프로세스</h2>
+  {_sec("process", "프로세스", "샘플이 실행한 프로세스와 명령줄")}
   {_process_html(result, detailed=detailed)}
   {_sideload_html(result)}
 
@@ -4192,7 +4188,7 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 <!-- ══════════ 탭 4: 파일시스템 활동 ══════════ -->
 <div id="tab-filesystem" class="tab-panel">
 
-  <h2>파일</h2>
+  {_sec("file", "파일", "파일 생성 · 쓰기 · 삭제")}
   {fragment(_file_events_html(result)[0])}
   {_artifact_intel_html(result) if detailed else ""}
 
@@ -4201,7 +4197,7 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 <!-- ══════════ 탭 3: 레지스트리 활동 ══════════ -->
 <div id="tab-registry" class="tab-panel">
 
-  <h2>레지스트리</h2>
+  {_sec("registry", "레지스트리", "자동 실행 · 서비스 등 레지스트리 변경")}
   {fragment(_registry_events_html(result))}
 
 </div>
@@ -4209,7 +4205,7 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 <!-- ══════════ 탭 4: 네트워크 연결 ══════════ -->
 <div id="tab-network" class="tab-panel">
 
-  <h2>네트워크</h2>
+  {_sec("network", "네트워크", "연결 · DNS · HTTP · 메일/파일 전송")}
   {fragment(_network_html(result))}
 
 </div>
@@ -4217,7 +4213,7 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 <!-- ══════════ 탭 5: 메모리 ══════════ -->
 <div id="tab-memory" class="tab-panel">
 
-  <h2>메모리 · 코드 주입</h2>
+  {_sec("memory", "메모리 · 코드 주입", "pe-sieve · hollows-hunter · Volatility")}
   {memory_open}
   {fragment(_lineage_dumps_html(result))}
   {fragment(_shellcode_html(result))}
@@ -4229,7 +4225,7 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 <!-- ══════════ 탭 6: IOC ══════════ -->
 <div id="tab-ioc" class="tab-panel">
 
-  <h2>IOC (침해 지표)</h2>
+  {_sec("ioc", "IOC (침해 지표)", "차단·탐지에 쓸 IP · 도메인 · 파일 · 레지스트리")}
   {fragment(_ioc_html(result, sample_sha256))}
 
 </div>
@@ -4244,6 +4240,8 @@ def _render_html_report(result, output_path: str, *, detailed: bool) -> None:
 
 </div>
 {_PG_INIT}
+{UI_CSS}
+<script>{UI_JS}</script>
 </body>
 </html>"""
 
@@ -4289,8 +4287,8 @@ _AI_PENDING_POLL_JS = """<script>
 
 def _ai_pending_notice_html() -> str:
     return (
-        "<div class='ai-pending' style='border-left:3px solid #f0b429;padding:6px 14px;margin:0 0 14px;"
-        "font-size:.86rem;color:#e9eff8'>"
+        "<div class='ai-pending' style='border-left:3px solid var(--warn);padding:6px 14px;margin:0 0 14px;"
+        "font-size:.86rem;color:var(--fg-1)'>"
         "AI 해석 진행 중 · <button type=\"button\" onclick=\"location.reload()\">새로고침</button>"
         "</div>"
     )
@@ -4310,7 +4308,7 @@ def _volatility_html(result) -> str:
     if err:
         return (
             f"<div style='margin-top:1.5rem'>"
-            f"<h3>🔬 Volatility3 메모리 포렌식</h3>"
+            f"<h3>Volatility3 메모리 포렌식</h3>"
             f"<p class='alert alert-warning'>{_e(err)}</p>"
             f"</div>"
         )
@@ -4330,18 +4328,18 @@ def _volatility_html(result) -> str:
 
     parts = [
         f"<div style='margin-top:1.5rem'>",
-        f"<h3>🔬 Volatility3 메모리 포렌식</h3>",
-        f"<p style='color:#8b949e;font-size:.82rem;margin-bottom:1rem'>"
+        f"<h3>Volatility3 메모리 포렌식</h3>",
+        f"<p style='color:var(--fg-3);font-size:.82rem;margin-bottom:1rem'>"
         f"덤프 {dump_gb} GB &nbsp;|&nbsp; 분석 {vol_sec}s &nbsp;|&nbsp; "
-        f"malfind <strong style='color:{'#ff7b72' if malfind else 'inherit'}'>{len(malfind)}</strong>건 &nbsp;|&nbsp; "
+        f"malfind <strong style='color:{'var(--danger)' if malfind else 'inherit'}'>{len(malfind)}</strong>건 &nbsp;|&nbsp; "
         f"netscan {len(netscan)}건"
-        + (f" <span style='color:#ffa657'>({sum(1 for e in netscan if e.get('suspicious'))}건 의심)</span>"
+        + (f" <span style='color:var(--orange)'>({sum(1 for e in netscan if e.get('suspicious'))}건 의심)</span>"
            if any(e.get("suspicious") for e in netscan) else "")
         + f" &nbsp;|&nbsp; connscan {len(connscan)}건 &nbsp;|&nbsp; "
-        f"psxview 은닉 <strong style='color:{'#ff7b72' if any(e.get('hidden') for e in psxview) else 'inherit'}'>"
+        f"psxview 은닉 <strong style='color:{'var(--danger)' if any(e.get('hidden') for e in psxview) else 'inherit'}'>"
         f"{sum(1 for e in psxview if e.get('hidden'))}</strong>건 &nbsp;|&nbsp; "
         f"handles(Mutant) {len([h for h in handles if h.get('type')=='Mutant'])}건"
-        + (f" <span style='color:#ffa657'>({sum(1 for h in handles if h.get('suspicious'))}건 의심)</span>"
+        + (f" <span style='color:var(--orange)'>({sum(1 for h in handles if h.get('suspicious'))}건 의심)</span>"
            if any(h.get("suspicious") for h in handles) else "")
         + f" &nbsp;|&nbsp; PE 추출 {len(procdumps)}건</p>",
     ]
@@ -4350,19 +4348,19 @@ def _volatility_html(result) -> str:
     if plugin_errors:
         err_rows = "".join(
             f"<tr>"
-            f"<td class='mono' style='color:#e3b341'>{_e(pname)}</td>"
-            f"<td style='font-size:.78rem;color:#8b949e;white-space:pre-wrap'>{_e(pmsg[:300])}</td>"
+            f"<td class='mono' style='color:var(--warn)'>{_e(pname)}</td>"
+            f"<td style='font-size:.78rem;color:var(--fg-3);white-space:pre-wrap'>{_e(pmsg[:300])}</td>"
             f"</tr>"
             for pname, pmsg in plugin_errors.items()
         )
         parts.append(
             f"<details style='margin-bottom:1rem'>"
-            f"<summary style='color:#e3b341;cursor:pointer;font-size:.83rem'>"
-            f"⚠ 플러그인 오류 {len(plugin_errors)}건 (클릭하여 확인)</summary>"
+            f"<summary style='color:var(--warn);cursor:pointer;font-size:.83rem'>"
+            f"플러그인 오류 {len(plugin_errors)}건 (클릭하여 확인)</summary>"
             f"<div style='overflow-x:auto;margin-top:.5rem'>"
             f"<table><tr><th>플러그인</th><th>오류 메시지</th></tr>{err_rows}</table>"
-            f"<p style='color:#8b949e;font-size:.76rem;margin-top:.5rem'>"
-            f"💡 심볼 파일 없음 오류 → "
+            f"<p style='color:var(--fg-3);font-size:.76rem;margin-top:.5rem'>"
+            f"심볼 파일 없음 오류 → "
             f"<code>pip install volatility3</code> 후 "
             f"<code>vol -f memory.raw windows.info</code> 로 심볼 자동 다운로드</p>"
             f"</div></details>"
@@ -4372,7 +4370,7 @@ def _volatility_html(result) -> str:
     has_any = any([malfind, pstree, netscan, connscan, psxview, cmdline, handles, dlllist, procdumps])
     if not has_any and not plugin_errors:
         parts.append(
-            f"<p style='color:#8b949e;font-size:.83rem;margin-bottom:1rem'>"
+            f"<p style='color:var(--fg-3);font-size:.83rem;margin-bottom:1rem'>"
             f"분석 결과 없음 — 의심 항목이 탐지되지 않았거나 심볼 파일 미설치로 플러그인이 "
             f"빈 결과를 반환했을 수 있습니다.<br>"
             f"<code>vol -f {mf.get('dump_path','memory.raw')} windows.info</code> 로 덤프 유효성 확인 권장</p>"
@@ -4382,22 +4380,22 @@ def _volatility_html(result) -> str:
     if malfind:
         rows = ""
         _SHC_COLORS = {
-            "PEB워크": "#ff7b72",
-            "Metasploit": "#ff7b72",
-            "NOP": "#e3b341",
-            "롤링 XOR": "#e3b341",
-            "XOR 디코더": "#e3b341",
-            "위치독립": "#d2a8ff",
-            "암호화": "#8b949e",
-            "RWX": "#8b949e",
+            "PEB워크": "var(--danger)",
+            "Metasploit": "var(--danger)",
+            "NOP": "var(--warn)",
+            "롤링 XOR": "var(--warn)",
+            "XOR 디코더": "var(--warn)",
+            "위치독립": "var(--purple)",
+            "암호화": "var(--fg-3)",
+            "RWX": "var(--fg-3)",
         }
         for e in malfind[:50]:
             prot = _e(e.get("protection", ""))
             rw   = "PAGE_EXECUTE_READWRITE" in prot or "PAGE_EXECUTE_WRITECOPY" in prot
-            prot_cell = (f"<span style='color:#ff7b72'>{prot}</span>" if rw
-                         else f"<span style='color:#e3b341'>{prot}</span>")
+            prot_cell = (f"<span style='color:var(--danger)'>{prot}</span>" if rw
+                         else f"<span style='color:var(--warn)'>{prot}</span>")
             sc_type = e.get("shellcode_type", "")
-            sc_color = next((v for k, v in _SHC_COLORS.items() if k in sc_type), "#8b949e")
+            sc_color = next((v for k, v in _SHC_COLORS.items() if k in sc_type), "var(--fg-3)")
             sc_cell = (f"<span style='font-size:.75rem;color:{sc_color}'>{_e(sc_type)}</span>"
                        if sc_type else "")
             disasm_raw  = e.get("disasm", "")
@@ -4407,23 +4405,23 @@ def _volatility_html(result) -> str:
             disasm_rest  = _e("\n".join(disasm_lines[1:])) if len(disasm_lines) > 1 else ""
             disasm_cell  = (
                 f"<details style='max-width:480px'>"
-                f"<summary class='mono' style='font-size:.75rem;cursor:pointer;color:#c9d1d9;list-style:none'>"
+                f"<summary class='mono' style='font-size:.75rem;cursor:pointer;color:var(--fg-2);list-style:none'>"
                 f"&#9658; {disasm_first}</summary>"
                 f"<pre style='font-size:.72rem;margin:.35rem 0 0;padding:.4rem .5rem;"
-                f"background:#0d1117;border-radius:4px;color:#c9d1d9;"
+                f"background:var(--bg-inset);border-radius:4px;color:var(--fg-2);"
                 f"white-space:pre;overflow-x:auto;max-height:320px;overflow-y:auto'>"
                 f"{disasm_rest}</pre>"
                 + (f"<pre style='font-size:.70rem;margin:.25rem 0 0;padding:.35rem .5rem;"
-                   f"background:#0d1117;border-radius:4px;color:#484f58;"
+                   f"background:var(--bg-inset);border-radius:4px;color:var(--fg-4);"
                    f"white-space:pre;overflow-x:auto'>hexdump:\n{_e(hexdump_raw)}</pre>"
                    if hexdump_raw else "")
                 + f"</details>"
                 if disasm_rest else
-                f"<span class='mono' style='font-size:.75rem;color:#c9d1d9'>{disasm_first}</span>"
+                f"<span class='mono' style='font-size:.75rem;color:var(--fg-2)'>{disasm_first}</span>"
             )
             rows += (
                 f"<tr>"
-                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono' style='color:var(--info)'>{e.get('pid','')}</td>"
                 f"<td class='mono'>{_e(e.get('process',''))}</td>"
                 f"<td class='mono' style='font-size:.78rem'>{_e(e.get('start_vpn',''))}</td>"
                 f"<td>{prot_cell}</td>"
@@ -4431,11 +4429,11 @@ def _volatility_html(result) -> str:
                 f"<td style='font-size:.75rem'>{disasm_cell}</td>"
                 f"</tr>"
             )
-        note = (f"<p style='color:#484f58;font-size:.78rem'>(전체 {len(malfind)}건 중 50건 표시)</p>"
+        note = (f"<p style='color:var(--fg-4);font-size:.78rem'>(전체 {len(malfind)}건 중 50건 표시)</p>"
                 if len(malfind) > 50 else "")
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
-            f"<h4 style='color:#ff7b72;margin-top:0'>⚠ malfind — 주입 코드 탐지</h4>"
+            f"<h4 style='color:var(--danger);margin-top:0'>malfind — 주입 코드 탐지</h4>"
             f"<div style='overflow-x:auto'><table>"
             f"<tr><th>PID</th><th>프로세스</th><th>주소</th><th>보호 속성</th><th>셸코드 유형</th><th>디스어셈블</th></tr>"
             f"{rows}</table></div>{note}</div>"
@@ -4447,10 +4445,10 @@ def _volatility_html(result) -> str:
         for e in pstree[:40]:
             rows += (
                 f"<tr>"
-                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
-                f"<td class='mono' style='color:#484f58'>{e.get('ppid','')}</td>"
+                f"<td class='mono' style='color:var(--info)'>{e.get('pid','')}</td>"
+                f"<td class='mono' style='color:var(--fg-4)'>{e.get('ppid','')}</td>"
                 f"<td class='mono'>{_e(e.get('name',''))}</td>"
-                f"<td class='mono' style='font-size:.78rem;color:#8b949e'>{_e(e.get('create_time',''))}</td>"
+                f"<td class='mono' style='font-size:.78rem;color:var(--fg-3)'>{_e(e.get('create_time',''))}</td>"
                 f"<td class='mono' style='font-size:.75rem;max-width:260px;overflow:hidden;white-space:nowrap'>"
                 f"{_e(e.get('cmd',''))}</td>"
                 f"</tr>"
@@ -4458,7 +4456,7 @@ def _volatility_html(result) -> str:
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0'>프로세스 트리 (메모리 기준)</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>DKOM으로 숨겨진 프로세스가 있으면 여기에 표시됩니다.</p>"
+            f"<p style='color:var(--fg-3);font-size:.78rem'>DKOM으로 숨겨진 프로세스가 있으면 여기에 표시됩니다.</p>"
             f"<div style='overflow-x:auto'><table>"
             f"<tr><th>PID</th><th>PPID</th><th>이름</th><th>생성 시각</th><th>커맨드라인</th></tr>"
             f"{rows}</table></div></div>"
@@ -4473,33 +4471,33 @@ def _volatility_html(result) -> str:
         rows = ""
         for e in display_ns:
             state = _e(e.get("state", ""))
-            state_style = "color:#ff7b72" if state == "ESTABLISHED" else "color:#8b949e"
+            state_style = "color:var(--danger)" if state == "ESTABLISHED" else "color:var(--fg-3)"
             is_susp = e.get("suspicious", False)
             row_style = "background:#2d1f0f" if is_susp else ""
             reason = _e(e.get("susp_reason", ""))
-            susp_td = (f"<span style='color:#ffa657;font-size:.74rem'>{reason}</span>"
-                       if is_susp else "<span style='color:#484f58;font-size:.74rem'>—</span>")
+            susp_td = (f"<span style='color:var(--orange);font-size:.74rem'>{reason}</span>"
+                       if is_susp else "<span style='color:var(--fg-4);font-size:.74rem'>—</span>")
             rows += (
                 f"<tr style='{row_style}'>"
                 f"<td class='mono'>{_e(e.get('proto',''))}</td>"
                 f"<td class='mono'>{_e(e.get('local',''))}</td>"
-                f"<td class='mono' style='color:{'#ff7b72' if is_susp else '#e3b341'}'>"
+                f"<td class='mono' style='color:{'var(--danger)' if is_susp else 'var(--warn)'}'>"
                 f"{_e(e.get('foreign',''))}</td>"
                 f"<td style='{state_style}'>{state}</td>"
-                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono' style='color:var(--info)'>{e.get('pid','')}</td>"
                 f"<td class='mono'>{_e(e.get('owner',''))}</td>"
                 f"<td>{susp_td}</td>"
                 f"</tr>"
             )
         susp_cnt = len(susp_conns)
-        hdr_color = "#ffa657" if susp_cnt else "inherit"
-        susp_badge = (f" &nbsp;<span style='color:#ffa657;font-size:.8rem'>"
+        hdr_color = "var(--orange)" if susp_cnt else "inherit"
+        susp_badge = (f" &nbsp;<span style='color:var(--orange);font-size:.8rem'>"
                       f"의심 {susp_cnt}건</span>" if susp_cnt else "")
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0;color:{hdr_color}'>"
             f"네트워크 흔적 (메모리 기준){susp_badge}</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>이미 종료된 연결 포함 — "
+            f"<p style='color:var(--fg-3);font-size:.78rem'>이미 종료된 연결 포함 — "
             f"외부 IP·비표준 포트 자동 플래깅 (주황색 행)</p>"
             f"<div style='overflow-x:auto'><table>"
             f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th>"
@@ -4512,21 +4510,21 @@ def _volatility_html(result) -> str:
         rows = ""
         for e in connscan[:40]:
             state = _e(e.get("state", ""))
-            state_style = "color:#ff7b72" if state == "ESTABLISHED" else "color:#8b949e"
+            state_style = "color:var(--danger)" if state == "ESTABLISHED" else "color:var(--fg-3)"
             rows += (
                 f"<tr>"
                 f"<td class='mono'>{_e(e.get('proto',''))}</td>"
                 f"<td class='mono'>{_e(e.get('local',''))}</td>"
-                f"<td class='mono' style='color:#e3b341'>{_e(e.get('foreign',''))}</td>"
+                f"<td class='mono' style='color:var(--warn)'>{_e(e.get('foreign',''))}</td>"
                 f"<td style='{state_style}'>{state or '(종료)'}</td>"
-                f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+                f"<td class='mono' style='color:var(--info)'>{e.get('pid','')}</td>"
                 f"<td class='mono'>{_e(e.get('owner',''))}</td>"
                 f"</tr>"
             )
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0'>연결 이력 (connscan — 종료 소켓 포함)</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>"
+            f"<p style='color:var(--fg-3);font-size:.78rem'>"
             f"pool-tag 스캔으로 이미 닫힌 TCP 소켓 구조체까지 복원 — netscan 누락분 보완</p>"
             f"<div style='overflow-x:auto'><table>"
             f"<tr><th>Proto</th><th>로컬</th><th>원격</th><th>상태</th><th>PID</th><th>프로세스</th></tr>"
@@ -4536,22 +4534,22 @@ def _volatility_html(result) -> str:
     # ── psxview ───────────────────────────────────────────────────────
     if psxview:
         hidden_entries = [e for e in psxview if e.get("hidden")]
-        _CHK  = "<span style='color:#3fb950'>✓</span>"
-        _MISS = "<span style='color:#ff7b72'>✗</span>"
-        _GRAY = "<span style='color:#484f58'>✗</span>"
+        _CHK  = "<span style='color:var(--ok)'>✓</span>"
+        _MISS = "<span style='color:var(--danger)'>✗</span>"
+        _GRAY = "<span style='color:var(--fg-4)'>✗</span>"
         rows = ""
         for e in psxview[:60]:
             is_hidden  = e.get("hidden", False)
-            row_style  = "background:#3d1f1f" if is_hidden else ""
-            td_color   = "#ff7b72" if is_hidden else "#8b949e"
+            row_style  = "background:var(--danger-bg)" if is_hidden else ""
+            td_color   = "var(--danger)" if is_hidden else "var(--fg-3)"
             td_weight  = "bold" if is_hidden else "normal"
-            hidden_lbl = "⚠ 은닉 의심" if is_hidden else "-"
+            hidden_lbl = "은닉 의심" if is_hidden else "-"
             pslist_sp  = _MISS if not e.get("pslist") else _CHK
             psscan_sp  = _CHK  if e.get("psscan")    else _GRAY
             csrss_sp   = _CHK  if e.get("csrss")     else _GRAY
             rows += (
                 f"<tr style='{row_style}'>"
-                f"<td class='mono' style='color:#79c0ff'>{e.get('pid', '')}</td>"
+                f"<td class='mono' style='color:var(--info)'>{e.get('pid', '')}</td>"
                 f"<td class='mono'>{_e(e.get('name', ''))}</td>"
                 f"<td style='text-align:center'>{pslist_sp}</td>"
                 f"<td style='text-align:center'>{psscan_sp}</td>"
@@ -4560,13 +4558,13 @@ def _volatility_html(result) -> str:
                 f"</tr>"
             )
         hidden_count = len(hidden_entries)
-        hdr_color = "#ff7b72" if hidden_count else "inherit"
+        hdr_color = "var(--danger)" if hidden_count else "inherit"
         hdr_badge = (f" — <strong>{hidden_count}개 은닉 의심</strong>"
                      if hidden_count else "")
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0;color:{hdr_color}'>프로세스 은닉 탐지 (psxview){hdr_badge}</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>"
+            f"<p style='color:var(--fg-3);font-size:.78rem'>"
             f"EPROCESS 목록(pslist)과 pool-tag 스캔(psscan)·CSRSS 목록 교차 비교 — "
             f"pslist에 없지만 psscan에서 발견되면 루트킷 은닉 의심</p>"
             f"<div style='overflow-x:auto'><table>"
@@ -4583,18 +4581,18 @@ def _volatility_html(result) -> str:
 
         rows = "".join(
             f"<tr>"
-            f"<td class='mono' style='color:#79c0ff'>{e.get('pid','')}</td>"
+            f"<td class='mono' style='color:var(--info)'>{e.get('pid','')}</td>"
             f"<td class='mono'>{_e(e.get('name',''))}</td>"
-            f"<td class='mono' style='font-size:.75rem;color:#e3b341'>{_e(e.get('reason',''))}</td>"
+            f"<td class='mono' style='font-size:.75rem;color:var(--warn)'>{_e(e.get('reason',''))}</td>"
             f"<td class='mono' style='font-size:.75rem;word-break:break-all'>{_e(e.get('dump_path',''))}</td>"
-            f"<td class='mono' style='color:#8b949e'>{_sz(e.get('size',0))}</td>"
+            f"<td class='mono' style='color:var(--fg-3)'>{_sz(e.get('size',0))}</td>"
             f"</tr>"
             for e in procdumps
         )
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
-            f"<h4 style='margin-top:0;color:#e3b341'>추출된 프로세스 PE ({len(procdumps)}개)</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>"
+            f"<h4 style='margin-top:0;color:var(--warn)'>추출된 프로세스 PE ({len(procdumps)}개)</h4>"
+            f"<p style='color:var(--fg-3);font-size:.78rem'>"
             f"malfind RWX 영역·psxview 은닉 프로세스에서 추출 — "
             f"VT 업로드·YARA 스캔·strings 분석 권장</p>"
             f"<div style='overflow-x:auto'><table>"
@@ -4615,16 +4613,16 @@ def _volatility_html(result) -> str:
             family   = h.get("family", "")
             entropy  = h.get("entropy", 0.0)
             row_style = "background:#1f2d1f" if family else ("background:#2d2d1f" if is_susp else "")
-            name_color = "#ff7b72" if family else ("#ffa657" if is_susp else "#d2a8ff")
+            name_color = "var(--danger)" if family else ("var(--orange)" if is_susp else "var(--purple)")
             if family:
-                analysis = f"<span style='color:#ff7b72;font-size:.74rem'>패밀리: {_e(family)}</span>"
+                analysis = f"<span style='color:var(--danger);font-size:.74rem'>패밀리: {_e(family)}</span>"
             elif is_susp:
-                analysis = f"<span style='color:#ffa657;font-size:.74rem'>무작위 문자열 (H={entropy:.2f})</span>"
+                analysis = f"<span style='color:var(--orange);font-size:.74rem'>무작위 문자열 (H={entropy:.2f})</span>"
             else:
-                analysis = f"<span style='color:#484f58;font-size:.74rem'>{entropy:.2f}</span>"
+                analysis = f"<span style='color:var(--fg-4);font-size:.74rem'>{entropy:.2f}</span>"
             rows += (
                 f"<tr style='{row_style}'>"
-                f"<td class='mono' style='color:#79c0ff'>{h.get('pid','')}</td>"
+                f"<td class='mono' style='color:var(--info)'>{h.get('pid','')}</td>"
                 f"<td class='mono'>{_e(h.get('name',''))}</td>"
                 f"<td class='mono' style='color:{name_color}'>{_e(h.get('handle_name',''))}</td>"
                 f"<td>{analysis}</td>"
@@ -4632,22 +4630,22 @@ def _volatility_html(result) -> str:
             )
         family_cnt = sum(1 for h in susp_mut if h.get("family"))
         random_cnt = sum(1 for h in susp_mut if not h.get("family"))
-        hdr_color = "#ff7b72" if family_cnt else ("#ffa657" if random_cnt else "inherit")
+        hdr_color = "var(--danger)" if family_cnt else ("var(--orange)" if random_cnt else "inherit")
         badge_parts = []
         if family_cnt:
-            badge_parts.append(f"<span style='color:#ff7b72;font-size:.8rem'>패밀리 매칭 {family_cnt}건</span>")
+            badge_parts.append(f"<span style='color:var(--danger);font-size:.8rem'>패밀리 매칭 {family_cnt}건</span>")
         if random_cnt:
-            badge_parts.append(f"<span style='color:#ffa657;font-size:.8rem'>무작위 문자열 {random_cnt}건</span>")
+            badge_parts.append(f"<span style='color:var(--orange);font-size:.8rem'>무작위 문자열 {random_cnt}건</span>")
         susp_badge = (" &nbsp;" + " &nbsp;".join(badge_parts)) if badge_parts else ""
         truncated_note = (
-            f"<p style='color:#484f58;font-size:.78rem'>"
+            f"<p style='color:var(--fg-4);font-size:.78rem'>"
             f"전체 {len(mutants)}건 중 2000건 표시 — 검색으로 필터링 가능</p>"
             if len(mutants) > 2000 else ""
         )
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0;color:{hdr_color}'>뮤텍스 (Mutant) 핸들{susp_badge}</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>악성코드 패밀리 식별에 핵심 — "
+            f"<p style='color:var(--fg-3);font-size:.78rem'>악성코드 패밀리 식별에 핵심 — "
             f"패밀리 매칭(빨강) / 무작위 문자열(주황) 순으로 표시 &nbsp;|&nbsp; "
             f"검색창으로 뮤텍스 이름 필터링 가능</p>"
             f"{truncated_note}"
@@ -4661,7 +4659,7 @@ def _volatility_html(result) -> str:
     if cmdline:
         rows = "".join(
             f"<tr>"
-            f"<td class='mono' style='color:#79c0ff'>{c.get('pid','')}</td>"
+            f"<td class='mono' style='color:var(--info)'>{c.get('pid','')}</td>"
             f"<td class='mono'>{_e(c.get('name',''))}</td>"
             f"<td class='mono' style='font-size:.78rem'>{_e(c.get('args',''))}</td>"
             f"</tr>"
@@ -4670,7 +4668,7 @@ def _volatility_html(result) -> str:
         parts.append(
             f"<div class='card' style='margin-bottom:1.2rem'>"
             f"<h4 style='margin-top:0'>커맨드라인 (메모리 기준)</h4>"
-            f"<p style='color:#8b949e;font-size:.78rem'>프로세스 홀로잉 탐지 — "
+            f"<p style='color:var(--fg-3);font-size:.78rem'>프로세스 홀로잉 탐지 — "
             f"원본 EXE와 다른 커맨드라인은 위장 징후</p>"
             f"<div style='overflow-x:auto'><table>"
             f"<tr><th>PID</th><th>프로세스</th><th>커맨드라인</th></tr>"
@@ -4716,15 +4714,15 @@ def _md_to_html(text: str) -> str:
         h1 = re.match(r"^# (.+)", line)
         if h1:
             if in_ul: out.append("</ul>"); in_ul = False
-            out.append(f"<h2 style='color:#58a6ff;margin-top:1.8rem'>{_e(h1.group(1))}</h2>")
+            out.append(f"<h2 style='color:var(--info);margin-top:1.8rem'>{_e(h1.group(1))}</h2>")
             continue
         if h2:
             if in_ul: out.append("</ul>"); in_ul = False
-            out.append(f"<h3 style='color:#79c0ff;margin-top:1.4rem'>{_e(h2.group(1))}</h3>")
+            out.append(f"<h3 style='color:var(--info);margin-top:1.4rem'>{_e(h2.group(1))}</h3>")
             continue
         if h3:
             if in_ul: out.append("</ul>"); in_ul = False
-            out.append(f"<h4 style='color:#d2a8ff;margin-top:1rem'>{_e(h3.group(1))}</h4>")
+            out.append(f"<h4 style='color:var(--purple);margin-top:1rem'>{_e(h3.group(1))}</h4>")
             continue
 
         # 목록
@@ -4746,7 +4744,7 @@ def _md_to_html(text: str) -> str:
 
         # 구분선
         if re.match(r"^---+$", line.strip()):
-            out.append("<hr style='border-color:#30363d;margin:1rem 0'>")
+            out.append("<hr style='border-color:var(--line-2);margin:1rem 0'>")
             continue
 
         # 빈 줄
@@ -4757,7 +4755,7 @@ def _md_to_html(text: str) -> str:
         # 일반 텍스트 (굵게·코드 인라인)
         rendered = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _e(line))
         rendered = re.sub(r"`(.+?)`",
-                          r"<code style='background:#0d1117;padding:.1rem .3rem;"
+                          r"<code style='background:var(--bg-inset);padding:.1rem .3rem;"
                           r"border-radius:3px;font-size:.8rem'>\1</code>",
                           rendered)
         out.append(f"<p style='margin:.25rem 0;line-height:1.7'>{rendered}</p>")
@@ -4875,11 +4873,11 @@ def _render_classification(body: str) -> str:
     # 위협 수준 색상
     tl = threat.lower()
     if "악성" in tl or "malicious" in tl:
-        threat_color = "#ff7b72"; threat_bg = "rgba(255,123,114,.12)"
+        threat_color = "var(--danger)"; threat_bg = "rgba(255,123,114,.12)"
     elif "의심" in tl or "suspicious" in tl:
-        threat_color = "#ffa657"; threat_bg = "rgba(255,166,87,.12)"
+        threat_color = "var(--orange)"; threat_bg = "rgba(255,166,87,.12)"
     else:
-        threat_color = "#56d364"; threat_bg = "rgba(86,211,100,.10)"
+        threat_color = "var(--ok)"; threat_bg = "rgba(86,211,100,.10)"
 
     # 태그 파싱 (태그 및 해석 블록)
     tag_block_m = _re.search(
@@ -4901,17 +4899,17 @@ def _render_classification(body: str) -> str:
                 tag_desc = _e(tm.group(2).strip())
                 tag_rows.append(
                     f"<div style='display:flex;align-items:flex-start;gap:.55rem;"
-                    f"padding:.28rem 0;border-bottom:1px solid #21262d'>"
-                    f"<span style='flex-shrink:0;background:#1f2d3d;border:1px solid #264466;"
-                    f"border-radius:10px;padding:1px 9px;font-size:.7rem;color:#79c0ff;"
+                    f"padding:.28rem 0;border-bottom:1px solid var(--line)'>"
+                    f"<span style='flex-shrink:0;background:var(--info-bg);border:1px solid #264466;"
+                    f"border-radius:10px;padding:1px 9px;font-size:.7rem;color:var(--info);"
                     f"white-space:nowrap;margin-top:2px'>{badge}</span>"
-                    f"<span style='font-size:.82rem;color:#8b949e;line-height:1.5'>{tag_desc}</span>"
+                    f"<span style='font-size:.82rem;color:var(--fg-3);line-height:1.5'>{tag_desc}</span>"
                     f"</div>"
                 )
         if tag_rows:
             tag_html = (
-                f"<div style='margin-top:.7rem;border-top:1px solid #21262d;padding-top:.45rem'>"
-                f"<p style='font-size:.68rem;color:#6e7681;margin-bottom:.3rem;"
+                f"<div style='margin-top:.7rem;border-top:1px solid var(--line);padding-top:.45rem'>"
+                f"<p style='font-size:.68rem;color:var(--fg-4);margin-bottom:.3rem;"
                 f"text-transform:uppercase;letter-spacing:.05em'>태그 및 해석</p>"
                 + "".join(tag_rows) + "</div>"
             )
@@ -4920,7 +4918,7 @@ def _render_classification(body: str) -> str:
     packer_row = ""
     if packer and packer.strip() not in ("미식별", "없음", "N/A", "-"):
         packer_row = (
-            f"<tr><td style='color:#8b949e'>패커 / 빌드</td>"
+            f"<tr><td style='color:var(--fg-3)'>패커 / 빌드</td>"
             f"<td class='mono' style='font-size:.85rem'>{_e(packer)}</td></tr>"
         )
 
@@ -4929,13 +4927,13 @@ def _render_classification(body: str) -> str:
         f"<div style='display:flex;align-items:center;gap:.6rem;margin-bottom:.7rem'>"
         f"<span style='background:{threat_bg};color:{threat_color};border:1px solid {threat_color};"
         f"border-radius:4px;padding:3px 10px;font-size:.82rem;font-weight:600'>{_e(threat)}</span>"
-        f"<span style='color:#8b949e;font-size:.8rem'>위협 수준</span>"
+        f"<span style='color:var(--fg-3);font-size:.8rem'>위협 수준</span>"
         f"</div>"
         f"<table class='kv' style='margin-bottom:.4rem'>"
-        f"<tr><td style='width:130px;color:#8b949e'>주요 분석 대상</td>"
+        f"<tr><td style='width:130px;color:var(--fg-3)'>주요 분석 대상</td>"
         f"<td class='mono' style='font-size:.85rem'>{_e(obj)}</td></tr>"
         f"{packer_row}"
-        f"<tr><td style='color:#8b949e'>설명</td>"
+        f"<tr><td style='color:var(--fg-3)'>설명</td>"
         f"<td style='font-size:.85rem;line-height:1.6'>{_e(desc)}</td></tr>"
         f"</table>"
         f"{tag_html}"
@@ -4955,14 +4953,14 @@ def _render_exec_flow(body: str) -> str:
     import re as _re
 
     LABEL_STYLES = {
-        "사용자 행위":  ("#79c0ff", "#1a2d3d"),
-        "User-driven":  ("#79c0ff", "#1a2d3d"),
-        "준비 단계":    ("#ffa657", "#2d1f0a"),
-        "Preparatory":  ("#ffa657", "#2d1f0a"),
-        "자율 실행":    ("#ff7b72", "#2d1117"),
-        "Autonomous":   ("#ff7b72", "#2d1117"),
+        "사용자 행위":  ("var(--info)", "var(--info-bg)"),
+        "User-driven":  ("var(--info)", "var(--info-bg)"),
+        "준비 단계":    ("var(--orange)", "var(--orange-bg)"),
+        "Preparatory":  ("var(--orange)", "var(--orange-bg)"),
+        "자율 실행":    ("var(--danger)", "var(--danger-bg)"),
+        "Autonomous":   ("var(--danger)", "var(--danger-bg)"),
     }
-    DEFAULT_STYLE = ("#8b949e", "#161b22")
+    DEFAULT_STYLE = ("var(--fg-3)", "var(--surface)")
 
     rows = []
     for line in body.splitlines():
@@ -4976,7 +4974,7 @@ def _render_exec_flow(body: str) -> str:
             color, bg = LABEL_STYLES.get(lbl, DEFAULT_STYLE)
             rows.append(
                 f"<div style='display:flex;align-items:flex-start;gap:.6rem;"
-                f"padding:.45rem 0;border-bottom:1px solid #21262d'>"
+                f"padding:.45rem 0;border-bottom:1px solid var(--line)'>"
                 f"<span style='flex-shrink:0;background:{bg};color:{color};"
                 f"border:1px solid {color};border-radius:4px;padding:1px 8px;"
                 f"font-size:.72rem;font-weight:600;margin-top:2px'>[{_e(lbl)}]</span>"
@@ -4985,8 +4983,8 @@ def _render_exec_flow(body: str) -> str:
             )
         else:
             rows.append(
-                f"<div style='padding:.4rem 0;border-bottom:1px solid #21262d;"
-                f"font-size:.85rem;color:#c9d1d9'>{_e(line)}</div>"
+                f"<div style='padding:.4rem 0;border-bottom:1px solid var(--line);"
+                f"font-size:.85rem;color:var(--fg-2)'>{_e(line)}</div>"
             )
 
     if not rows:
@@ -5027,10 +5025,10 @@ def _render_behavioral(body: str) -> str:
             val = "관찰되지 않음"
 
         absent = val in ("관찰되지 않음", "관찰 안됨", "없음", "Not observed", "활동 없음")
-        val_style = "color:#6e7681;font-style:italic" if absent else "color:#c9d1d9"
+        val_style = "color:var(--fg-4);font-style:italic" if absent else "color:var(--fg-2)"
         rows.append(
             f"<tr>"
-            f"<td style='color:#8b949e;font-size:.8rem;width:220px;"
+            f"<td style='color:var(--fg-3);font-size:.8rem;width:220px;"
             f"padding:.45rem .6rem;vertical-align:top;white-space:nowrap'>{_e(shown_label)}</td>"
             f"<td style='{val_style};font-size:.85rem;padding:.45rem .6rem;"
             f"line-height:1.6'>{_e(val)}</td>"
@@ -5061,17 +5059,17 @@ def _render_ioc_section(body: str) -> str:
         if indented:
             lines.append(
                 f"<div class='mono' style='margin-left:1rem;font-size:.78rem;"
-                f"color:#cdd9e5'>· {txt}</div>"
+                f"color:var(--fg-2)'>· {txt}</div>"
             )
         else:
             lines.append(
-                f"<div style='margin-top:.5rem;font-size:.82rem;color:#8b949e'>{txt}</div>"
+                f"<div style='margin-top:.5rem;font-size:.82rem;color:var(--fg-3)'>{txt}</div>"
             )
     return (
-        "<div class='card' style='margin-bottom:1rem;border-left:3px solid #f97583;"
+        "<div class='card' style='margin-bottom:1rem;border-left:3px solid var(--danger);"
         "padding-left:1rem'>"
         + "".join(lines)
-        + "<div style='margin-top:.6rem;font-size:.7rem;color:#6e7681'>"
+        + "<div style='margin-top:.6rem;font-size:.7rem;color:var(--fg-4)'>"
           "데이터에서 직접 계산한 값입니다 (AI 판단 아님) — 평상시 활동·사설/멀티캐스트 주소 제외</div>"
         "</div>"
     )
@@ -5079,7 +5077,7 @@ def _render_ioc_section(body: str) -> str:
 
 def _render_conclusion(body: str) -> str:
     return (
-        f"<div class='card' style='margin-bottom:1rem;border-left:3px solid #58a6ff;"
+        f"<div class='card' style='margin-bottom:1rem;border-left:3px solid var(--info);"
         f"padding-left:1rem'>"
         f"<p style='margin:0;line-height:1.8;font-size:.88rem'>{_e(body).replace(chr(10), '<br>')}</p>"
         f"</div>"
@@ -5100,7 +5098,7 @@ def _ai_html(result) -> str:
     PROVIDER_LABEL = {"nvidia": "NVIDIA NIM (클라우드)", "ollama": "Ollama (로컬)"}
     prov_label = PROVIDER_LABEL.get(provider, provider)
 
-    parts = ["<h2>AI 위협 분석</h2>"]
+    parts = [_sec("ai", "AI 위협 분석", "수집 결과를 바탕으로 한 AI 요약 — 판정 근거는 위 목록이 기준")]
 
     if not ai:
         return ""
@@ -5109,7 +5107,7 @@ def _ai_html(result) -> str:
 
     # 메타
     parts.append(
-        f"<p style='color:#8b949e;font-size:.8rem;margin-bottom:1.2rem'>"
+        f"<p style='color:var(--fg-3);font-size:.8rem;margin-bottom:1.2rem'>"
         f"제공자: {_e(provider.upper())} &nbsp;|&nbsp; 모델: <code>{_e(model)}</code> &nbsp;|&nbsp; "
 
         f"응답 시간: {elapsed}s &nbsp;|&nbsp; 입력: {prompt_ch:,}자"
@@ -5166,7 +5164,7 @@ def _ai_html(result) -> str:
         if not body:
             continue
         parts.append(
-            f"<h3 style='color:#79c0ff;margin:1.4rem 0 .5rem;font-size:.95rem;"
+            f"<h3 style='color:var(--info);margin:1.4rem 0 .5rem;font-size:.95rem;"
             f"letter-spacing:.02em'>{_e(title)}</h3>"
         )
         parts.append(renderer(body))
@@ -5183,12 +5181,12 @@ def _ai_html(result) -> str:
     # 원문 접기
     parts.append(
         f"<details style='margin-top:1rem'>"
-        f"<summary style='cursor:pointer;color:#8b949e;font-size:.8rem'>"
+        f"<summary style='cursor:pointer;color:var(--fg-3);font-size:.8rem'>"
         f"▶ AI 응답 원문</summary>"
 
-        f"<pre style='background:#0d1117;border:1px solid #30363d;border-radius:6px;"
+        f"<pre style='background:var(--bg-inset);border:1px solid var(--line-2);border-radius:6px;"
         f"padding:1rem;margin-top:.5rem;font-size:.76rem;overflow-x:auto;"
-        f"white-space:pre-wrap;color:#c9d1d9'>{_e(response)}</pre>"
+        f"white-space:pre-wrap;color:var(--fg-2)'>{_e(response)}</pre>"
         f"</details>"
     )
 

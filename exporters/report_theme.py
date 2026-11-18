@@ -92,10 +92,16 @@ document.addEventListener('DOMContentLoaded', function(){
  nav.id='report-navigation';
  const toggle=document.createElement('button');
  toggle.className='report-menu-toggle';toggle.setAttribute('aria-controls',nav.id);
+ toggle.type='button';
+ toggle.innerHTML='<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18 M3 12h18 M3 18h18"/></svg>';
  function show(open){document.body.classList.toggle('menu-hidden',!open);
- toggle.textContent='=';toggle.title=open?'메뉴 접기':'메뉴 열기';toggle.setAttribute('aria-label',toggle.title);toggle.setAttribute('aria-expanded',String(open));}
- toggle.onclick=()=>show(document.body.classList.contains('menu-hidden'));
- document.body.prepend(toggle);show(false);
+ toggle.title=open?'메뉴 접기':'메뉴 열기';toggle.setAttribute('aria-label',toggle.title);toggle.setAttribute('aria-expanded',String(open));}
+ toggle.onclick=()=>{const open=document.body.classList.contains('menu-hidden');show(open);
+  try{localStorage.setItem('da-nav',open?'1':'0')}catch(e){}};
+ (document.querySelector('.topbar')||document.body).prepend(toggle);
+ // 넓은 화면은 메뉴를 펼쳐 두고, 사용자가 접거나 펼친 선택은 기억한다
+ let saved=null;try{saved=localStorage.getItem('da-nav')}catch(e){}
+ show(saved===null?window.innerWidth>=1200:saved==='1');
  window.addEventListener('load',function(){
  document.querySelectorAll('.tab-panel table[id]').forEach(table=>{
  table.querySelectorAll('td').forEach(td=>{const t=td.textContent.trim();
@@ -129,11 +135,18 @@ td.mono,td code,.report-table-scroll td.mono{font-size:.8125rem}
 REPORT_CSS += TYPE_CSS
 
 
-def report_header(*, sample_name, sample_path, generated, timeout, duration):
-    """사용자 데이터는 이스케이프한다.
+def report_header(*, sample_name, sample_path="", generated="", timeout=0, duration=0,
+                  verdict=None, controls=""):
+    """상단 고정 바 (exporters.report_ui.topbar). 대상·실행 정보는 판정 히어로 카드가 보여준다.
 
-    판정·점수·개수는 바로 아래 판정 요약이 보여주므로 헤더에는 대상과 실행 정보만 둔다.
+    sample_path·generated·timeout·duration 은 이전 보고서 재가공(tools/restyle_report)과의
+    호환을 위해 받기만 한다.
     """
+    from exporters.report_ui import topbar
+    return topbar(sample_name, verdict, controls)
+
+
+def _legacy_report_header(*, sample_name, sample_path, generated, timeout, duration):
     e = lambda value: escape(str(value), quote=True)
     minutes, seconds = divmod(int(max(0, duration)), 60)
     return f'''<header class="report-header">
