@@ -35,7 +35,7 @@ _DEFAULTS: dict = {
         # provider: auto(NVIDIA 우선 → Ollama 폴백) | nvidia | ollama
         "enabled":  True,
         "provider": "nvidia",
-        "model": "mistralai/mistral-large-4-1t-a52b",
+        "model": "qwen/qwen2.5-72b-instruct",
         "api_key": "",
         "timeout":  600,
         "nvidia": {
@@ -105,27 +105,33 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def load_config(path: str | Path | None = None) -> dict:
+def load_config(path: str | Path | None = None, *, with_defaults: bool = True) -> dict:
     """
     config.json 을 로드하고 기본값과 병합해 반환합니다.
 
     path 미지정 시 프로젝트 루트(이 파일 기준 상위 두 단계)의
     config.json 을 탐색합니다.  파일이 없거나 파싱 실패 시 기본값만 반환합니다.
+
+    with_defaults=False 면 기본값을 섞지 않고 파일에 실제로 적힌 값만 돌려준다 —
+    사용자가 직접 넣은 값과 기본값을 구분해야 할 때 쓴다 (없거나 깨졌으면 {}).
     """
     if path is None:
         path = CONFIG_PATH
     else:
         path = Path(path)
 
-    cfg = _deep_merge({}, _DEFAULTS)   # 기본값 복사
+    user: dict = {}
     if path.exists():
         try:
             with open(path, encoding="utf-8-sig") as f:
                 user = json.load(f)
-            cfg = _deep_merge(cfg, user)
         except Exception:
-            pass  # 파싱 실패 → 기본값 사용
-    return cfg
+            user = {}  # 파싱 실패 → 기본값 사용
+    if not isinstance(user, dict):
+        user = {}
+    if not with_defaults:
+        return user
+    return _deep_merge(_deep_merge({}, _DEFAULTS), user)
 
 
 def get_hunt_cfg(path: str | Path | None = None) -> dict:
@@ -147,12 +153,10 @@ def get_hunt_auth_key(path: str | Path | None = None) -> str:
 def get_ai_cfg() -> dict:
     """config.json의 AI 설정을 우선 사용하고 빈 값만 환경변수로 보완한다."""
     cfg = dict(load_config()["ai"])
-    # 원격 버전의 중첩 ai.nvidia 설정도 읽되, 기존 ai.api_key/model을 우선한다.
-    try:
-        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")) if CONFIG_PATH.exists() else {}
-        raw_ai = raw.get("ai", {}) if isinstance(raw, dict) else {}
-    except (OSError, ValueError):
-        raw_ai = {}
+    # 원격 버전의 중첩 ai.nvidia 설정도 읽되, 사용자가 직접 넣은 ai.api_key/model 을 우선한다.
+    # '직접 넣었는지'는 기본값을 섞기 전 원본으로만 알 수 있다. 파일을 여기서 따로 열면
+    # 설정 출처가 둘로 갈라진다(테스트가 load_config 를 바꿔도 실제 config.json 이 섞여 들어온다).
+    raw_ai = load_config(with_defaults=False).get("ai", {})
     if not isinstance(raw_ai, dict):
         raw_ai = {}
     nested = raw_ai.get("nvidia", {})

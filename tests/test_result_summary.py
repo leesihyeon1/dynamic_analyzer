@@ -37,8 +37,8 @@ class ResultSummaryTests(unittest.TestCase):
         self.assertEqual(summary.collection[0][0], "ProcMon")
         self.assertEqual(summary.collection[0][1], "fail")
         self.assertIn("변환 결과 없음", summary.collection[0][2])
-        # 계보 정보가 없는 기록은 배경으로 표시하고 샘플 통신으로 단정하지 않는다
-        self.assertEqual(summary.connections[0][0], "배경")
+        # 샘플 프로세스 정보가 없는 기록은 평상시로 표시하고 샘플 통신으로 단정하지 않는다
+        self.assertEqual(summary.connections[0][0], "평상시")
         self.assertTrue(any("단정하지 마세요" in w for w in summary.warnings))
         self.assertIn("AI 해석", summary.techniques[0][3])
         self.assertIn("관찰 60초", summary.subtitle)
@@ -118,8 +118,8 @@ class ResultSummaryTests(unittest.TestCase):
         self.assertEqual(procs[7000].tier, 1)
         self.assertEqual(procs[7000].files, 5)
         self.assertEqual(procs[8100].tier, 3)
-        # 샘플 계보 연결이 배경 연결보다 먼저
-        self.assertEqual([c[0] for c in summary.connections], ["샘플 계보", "배경"])
+        # 샘플 연결이 평상시 연결보다 먼저
+        self.assertEqual([c[0] for c in summary.connections], ["샘플", "평상시"])
 
     def test_ai_sections_are_extracted(self):
         self.data["ai_analysis"] = {"model": "x/y", "response": "## 핵심 요약\n로더가 DLL 을 떨궜다.\n\n**결론**\n악성.\n\n마이터 기법 목록\nT1|a|b|c"}

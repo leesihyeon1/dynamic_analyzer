@@ -292,6 +292,7 @@ class AnalysisConfig:
     # ── TLS 복호화 옵션 ──────────────────────────────────────────────
     use_keylog:   bool = True             # SSLKEYLOGFILE 환경변수 주입
     use_fakenet:  bool = False            # FakeNet-NG 실행 (tshark 대체)
+    run_unelevated: bool = False          # 샘플을 일반 사용자 권한으로 실행 (core.unelevated)
     fakenet_path: Optional[str] = None   # FakeNet-NG 실행파일 명시 경로
     # ── 메모리 포렌식 옵션 ───────────────────────────────────────────
     use_memdump:      bool = False        # 물리 메모리 덤프 + Volatility3 실행
@@ -337,6 +338,8 @@ class AnalysisResult:
     start_time:         float = 0.0
     end_time:           float = 0.0
     sample_pid:         Optional[int] = None
+    sample_sha256:      str   = ""                             # 실행 전에 계산한 원본 해시
+    sample_copy:        Optional[Path] = None                  # 실행 전 원본 사본 (정적 분석용, .evd)
     all_pids:           set   = field(default_factory=set)    # 이벤트 수집 포커스 PID (주입 탐지·실시간 감지 포함)
     lineage_pids:       set   = field(default_factory=set)    # 샘플 계보 — 샘플 + 실제 자손만 (Tier 1 기준)
     injected_pids:      set   = field(default_factory=set)    # HH/pe-sieve 주입 탐지 PID (오탐 비중 높음 → Tier 2)
@@ -359,6 +362,7 @@ class AnalysisResult:
     packer_findings:    list  = field(default_factory=list)   # 패커/인스톨러 식별
     masquerade_findings: list = field(default_factory=list)   # 정상 구성요소 사칭 의심
     sideload_findings:  list  = field(default_factory=list)   # DLL 사이드로딩 탐지 결과
+    malware_traits:     dict  = field(default_factory=dict)   # 패밀리 지문·수집 행위 (analysis.malware_traits)
     injection_findings: list  = field(default_factory=list)   # 주입 탐지 + 신뢰도 (HIGH/MEDIUM/LOW)
     relevance_counts:   dict  = field(default_factory=dict)   # {항목종류: {tier: 개수}}
     baseline_info:      dict  = field(default_factory=dict)   # 적용된 베이스라인 메타
@@ -481,6 +485,57 @@ def _stop_requested(output_dir: Path, *, optional: bool = False) -> bool:
     except OSError:
         return False
     return level == "skip" if optional else level in ("monitor", "skip")
+
+
+def _unelevation_wanted(result, status) -> bool:
+    """분석기가 관리자일 때만 권한을 낮춰 실행할 의미가 있다."""
+    from core.unelevated import needs_unelevation
+    if needs_unelevation():
+        return True
+    result.tools_used["sample_privilege"] = "일반 사용자 (분석기가 관리자가 아님)"
+    status("      분석기가 관리자가 아니므로 샘플은 이미 일반 사용자 권한으로 실행됩니다")
+    return False
+
+
+def _note_unelevated(result, status, ok: bool) -> None:
+    if ok:
+        result.tools_used["sample_privilege"] = "일반 사용자 (중간 무결성)"
+        status("      일반 사용자 권한(중간 무결성)으로 실행 — 권한 상승 시도를 관찰합니다")
+    else:
+        result.tools_used["sample_privilege"] = "관리자 (일반 사용자 실행 실패)"
+        result.errors.append("일반 사용자 권한 실행 실패 — 관리자 권한으로 실행했습니다 "
+                             "(UAC 우회 같은 권한 상승 행위는 나타나지 않을 수 있음)")
+        status("      [주의] 일반 사용자 권한 실행 실패 — 관리자 권한으로 실행합니다")
+
+
+def _preserve_sample(config, result, status) -> None:
+    """샘플 실행 전에 SHA-256 을 계산하고 evidence/sample/ 에 사본(.evd)을 남긴다.
+
+    정적 분석(CAPA·YARA)과 VirusTotal 조회는 이 사본·해시를 쓴다. 사본에 .evd 를
+    붙여 결과 폴더에서 실수로 실행하지 않게 한다 (증거 보존과 같은 규칙).
+    """
+    import hashlib
+    import shutil
+    src = Path(config.sample_path)
+    try:
+        h = hashlib.sha256()
+        with open(src, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        result.sample_sha256 = h.hexdigest()
+    except OSError as e:
+        result.errors.append(f"샘플 해시 계산 실패: {e}")
+        return
+    try:
+        dst_dir = Path(config.output_dir) / "evidence" / "sample"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / f"{src.name}.evd"
+        shutil.copy2(src, dst)
+        result.sample_copy = dst
+        status(f"      실행 전 원본 보존: SHA-256 {result.sample_sha256[:16]}… "
+               f"→ evidence\\sample\\{dst.name}")
+    except OSError as e:
+        result.errors.append(f"샘플 사본 보존 실패: {e}")
 
 
 def run_analysis(
@@ -636,6 +691,9 @@ def run_analysis(
                 result.tools_used["dns_etw"] = False
         sample_proc = None
         if config.sample_path:
+            # 실행 전에 해시·사본 확보 — Remcos 처럼 실행 직후 자신을 옮기고 원본을 지우는
+            # 샘플은 실행 뒤에는 CAPA·VirusTotal·YARA 가 원래 경로를 읽지 못한다.
+            _preserve_sample(config, result, status)
             status(f"[3/6] 샘플 실행: {config.sample_path.name}")
             ext = config.sample_path.suffix.lower()
             try:
@@ -656,16 +714,31 @@ def run_analysis(
                             _kill_analysis_tool(None, exe_names=_exes, status=status, label=_label)
                             break
                     import os as _os
-                    _os.startfile(str(config.sample_path))
+                    _handed = None
+                    if config.run_unelevated and _unelevation_wanted(result, status):
+                        from core.unelevated import launch_unelevated
+                        _explorer = _os.path.join(_os.environ.get("SystemRoot", r"C:\Windows"), "explorer.exe")
+                        _handed = launch_unelevated([_explorer, str(config.sample_path)],
+                                                    cwd=str(config.sample_path.parent))
+                        _note_unelevated(result, status, _handed is not None)
+                    if _handed is None:
+                        _os.startfile(str(config.sample_path))
                     result.sample_pid = None   # 호스트 앱 PID는 procmon/process_diff 로 추적
                     status(f"      ShellExecute 실행 ({ext}) — 호스트 앱 PID는 procmon이 추적")
                 else:
                     _sample_env = tls_keylogger.get_env() if tls_keylogger else None
-                    sample_proc = subprocess.Popen(
-                        [str(config.sample_path)],
-                        cwd=str(config.sample_path.parent),
-                        env=_sample_env,
-                    )
+                    if config.run_unelevated and _unelevation_wanted(result, status):
+                        from core.unelevated import launch_unelevated
+                        sample_proc = launch_unelevated([str(config.sample_path)],
+                                                        cwd=str(config.sample_path.parent),
+                                                        env=_sample_env)
+                        _note_unelevated(result, status, sample_proc is not None)
+                    if sample_proc is None:
+                        sample_proc = subprocess.Popen(
+                            [str(config.sample_path)],
+                            cwd=str(config.sample_path.parent),
+                            env=_sample_env,
+                        )
                     result.sample_pid = sample_proc.pid
                     result.all_pids.add(sample_proc.pid)
                     result.lineage_pids.add(sample_proc.pid)
@@ -1020,7 +1093,7 @@ def run_analysis(
                            f"(PID {_host.child_pid}) — 계보 추적 기준으로 사용")
                 else:
                     status("      [ShellExecute] 샘플 호스트 프로세스를 특정하지 못함 "
-                           "— 계보 등급 없이 신규 프로세스 전체를 추적합니다")
+                           "— 샘플 프로세스 구분 없이 새 프로세스 전체를 추적합니다")
             if result.sample_pid:
                 result.lineage_pids.add(result.sample_pid)
                 child_pids = pm_child_pids(result.procmon_events, result.sample_pid)
@@ -1108,7 +1181,7 @@ def run_analysis(
                     exe         = _ci.exe,
                     cmdline     = _ci.cmdline,
                     create_time = 0.0,
-                    note        = "단명 프로세스 (ProcMon Process Create 보완)",
+                    note        = "짧게 실행된 프로세스 (ProcMon 프로세스 생성 기록으로 보완)",
                 ))
                 result.all_pids.add(_ci.child_pid)
                 _new_proc_pids.add(_ci.child_pid)
@@ -1150,7 +1223,7 @@ def run_analysis(
                         _add_proc(_ci)
 
             if _added:
-                status(f"      [ProcMon] 단명 프로세스 {_added}개 보완 (스냅샷 누락)")
+                status(f"      [ProcMon] 짧게 실행된 프로세스 {_added}개 보완 (스냅샷 누락)")
 
             # ── 브라우저 서브프로세스 분류 ────────────────────────────────────
             # proc_after 스냅샷으로 pid→name 역색인을 만들어 부모 이름을 조회한다.
@@ -1178,7 +1251,7 @@ def run_analysis(
                 )
                 if _susp_pids:
                     result.all_pids.update(_susp_pids)
-                    status(f"      [보완] 악성 신호 프로세스 {len(_susp_pids)}개 focus 편입 "
+                    status(f"      [보완] 악성 신호 프로세스 {len(_susp_pids)}개 집중 분석 대상에 추가 "
                            f"(PID {sorted(_susp_pids)})")
 
             # 포커스 PID 기반 필터 (단명 프로세스 보완 후 실행)
@@ -1234,10 +1307,9 @@ def run_analysis(
                             pr.raw_dns_queries, result.procmon_events,
                         )
                         _attr_n = sum(1 for q in result.dns_attributed if q.attributed)
-                        status(f"      DNS 귀속: {_attr_n}/{len(result.dns_attributed)}건 "
-                               f"프로세스 매핑 성공")
+                        status(f"      DNS 요청 프로세스 확인: {_attr_n}/{len(result.dns_attributed)}건")
                     except Exception as _de:
-                        result.errors.append(f"DNS 귀속 실패: {_de}")
+                        result.errors.append(f"DNS 요청 프로세스 확인 실패: {_de}")
         else:
             from parsers.pcap_parser import PcapResult as _PR
             result.pcap_result = _PR()
@@ -1367,7 +1439,7 @@ def run_analysis(
                 result.pcap_result, result.procmon_events, result.all_pids,
                 dns_attributed=result.dns_attributed,
             )
-            status("      샘플 네트워크 분류: 프로세스 귀속이 확인된 연결만 사용 (전체 관찰은 네트워크 탭)")
+            status("      샘플 네트워크 분류: 프로세스가 확인된 연결만 사용 (전체 관찰은 네트워크 탭)")
 
         # ── 8. 행동 분류 + IOC ──────────────────────────────────────────
         status("[분석] 행동 분류 및 MITRE ATT&CK 매핑...")
@@ -1419,7 +1491,8 @@ def run_analysis(
                     result.tools_used["capa"] = f"미설치 (경로: {_capa_exe})"
                     status(f"      CAPA: 실행 파일 미발견 ({_capa_exe}) — config.json > capa.path 확인")
                 else:
-                    _capa_techs = run_capa(config.sample_path, _capa_exe, _capa_timeout)
+                    _capa_techs = run_capa(result.sample_copy or config.sample_path,
+                                           _capa_exe, _capa_timeout)
                     if _capa_techs:
                         _merge_external_techniques(result.behavior_report, _capa_techs)
                         _capa_new = sum(1 for t in result.behavior_report.techniques
@@ -1448,8 +1521,8 @@ def run_analysis(
         else:
             _vt_key     = _vt_cfg["api_key"]
             _vt_timeout = int(_vt_cfg.get("timeout", 20))
-            _sha256 = ""
-            if config.sample_path:
+            _sha256 = result.sample_sha256
+            if not _sha256 and config.sample_path:
                 try:
                     import hashlib as _hl
                     _h = _hl.sha256()
@@ -1541,11 +1614,22 @@ def run_analysis(
         # "실행되지 않음" 이 찍혔다. 샘플 + 드롭 파일을 대상으로 스캔한다.
         try:
             from analysis.yara_scanner import run_yara_scan
-            _drops_for_yara = list(getattr(result.ioc_report, "dropped_files", []) or [])
+            # OS 배경 경로(Edge 업데이트 설치 파일 등)는 스캔하지 않는다 — 정상 바이너리에
+            # 일반 룰이 걸리는 오탐(Luckyware·cobalt_strike → Edge 설치기)만 늘린다.
+            from analysis.relevance import _is_os_background_path
+            _drops_for_yara = [f for f in (getattr(result.ioc_report, "dropped_files", []) or [])
+                               if not _is_os_background_path(str(f))]
+            _yara_sample = result.sample_copy or config.sample_path
             result.yara_result = run_yara_scan(
-                config.sample_path, _drops_for_yara[:300]
+                _yara_sample, _drops_for_yara[:300]
             )
             _yr = result.yara_result
+            # 사본으로 검사했어도 보고서에는 원래 샘플 경로로 보인다
+            if result.sample_copy and config.sample_path:
+                _copy_s = str(Path(result.sample_copy).resolve())
+                for _ym in getattr(_yr, "matches", None) or []:
+                    if str(getattr(_ym, "file_scanned", "")) == _copy_s:
+                        _ym.file_scanned = str(config.sample_path)
             if not _yr.available:
                 result.tools_used["yara"] = f"미실행 ({_yr.error})"
                 status(f"[YARA] 건너뜀 — {_yr.error}")
@@ -1614,6 +1698,21 @@ def run_analysis(
                     status(f"      {_f.confidence} {_f.summary()}")
         except Exception as _sle:
             result.errors.append(f"사이드로딩 탐지 실패: {_sle}")
+
+        # ── 패밀리 지문 · 수집 행위(화면 캡처·키 입력 기록) ─────────────────
+        # 샘플이 자기 파일을 지워 YARA 가 못 읽어도, 실행 중 남긴 흔적으로 패밀리를 가린다.
+        # 관련성 판정(아래) 전에 병합해야 새 기법도 샘플/의심/평상시 구분을 받는다.
+        try:
+            from analysis.malware_traits import find_traits, add_trait_techniques
+            result.malware_traits = find_traits(result)
+            add_trait_techniques(result, result.malware_traits)
+            for _fam in result.malware_traits.get("families", []):
+                status(f"[패밀리] {_fam['name']} — 흔적 {_fam['matched']}/{_fam['total']}개 일치 "
+                       f"({'확정' if _fam['confidence'] == 'HIGH' else '의심'})")
+            for _beh in result.malware_traits.get("behaviors", []):
+                status(f"[수집 행위] {_beh['label']} ({_beh['technique_id']}) — {len(_beh['evidence'])}건")
+        except Exception as _mte:
+            result.errors.append(f"패밀리·수집 행위 판정 실패: {_mte}")
             status(f"      [오류] 사이드로딩 탐지 실패: {_sle}")
 
         # ── 샘플 프로세스 항목 보장 ──────────────────────────────────────
@@ -1668,8 +1767,8 @@ def run_analysis(
                     _bl = load_baseline(config.baseline_path or None)
                 if _bl is None:
                     if config.use_baseline:
-                        status("[관련도] 베이스라인 없음 — 내장 OS 배경 프로파일로 판정 "
-                               "(--baseline-capture 로 수집하면 정확도가 올라갑니다)")
+                        status("[관련성] 평상시 기준 없음 — 기본 Windows 활동 목록으로 구분 "
+                               "(--baseline-capture 로 수집하면 더 정확합니다)")
                     result.baseline_info = {"mode": "builtin"}
                 else:
                     _stale = _bl.is_stale()
@@ -1678,7 +1777,7 @@ def run_analysis(
                         "age_days": round(_bl.age_days, 1), "stale": _stale,
                         "items": _bl.item_count(), "summary": _bl.summary(),
                     }
-                    status(f"[관련도] 베이스라인 적용 ({_bl.host}, {_bl.age_days:.1f}일 전, "
+                    status(f"[관련성] 평상시 기준 적용 ({_bl.host}, {_bl.age_days:.1f}일 전, "
                            f"{_bl.item_count()}개 항목)")
                     if _stale:
                         status("      [주의] 베이스라인이 오래되었습니다 — 재수집 권장")
@@ -1687,7 +1786,7 @@ def run_analysis(
                 result.relevance_counts = annotate(result, _ctx)
                 _summary = summarize_counts(result.relevance_counts)
                 if _summary:
-                    status(f"      등급 (계보/의심/배경): {_summary}")
+                    status(f"      구분 (샘플/의심/평상시): {_summary}")
 
                 # 주입 탐지 신뢰도 판정 — 오탐을 지우지 않고 등급만 매긴다
                 from analysis.relevance import classify_injections
@@ -1699,8 +1798,8 @@ def run_analysis(
                     status(f"      주입 탐지 신뢰도: HIGH {_ic['HIGH']} / "
                            f"MEDIUM {_ic['MEDIUM']} / LOW(오탐추정) {_ic['LOW']}")
             except Exception as _rle:
-                result.errors.append(f"관련도 등급 부여 실패: {_rle}")
-                status(f"      [오류] 관련도 등급 부여 실패: {_rle}")
+                result.errors.append(f"샘플 관련성 구분 실패: {_rle}")
+                status(f"      [오류] 샘플 관련성 구분 실패: {_rle}")
 
         # ── 증거 보존 ───────────────────────────────────────────────────
         # 샘플 계보가 드롭한 파일을 결과 폴더로 복사하고 해시를 남긴다.

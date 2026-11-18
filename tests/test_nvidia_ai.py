@@ -109,6 +109,24 @@ class NvidiaTests(unittest.TestCase):
         self.assertIn("세 차례", result.error)
         self.assertEqual(self.opener.open.call_count, 3)
 
+    @patch("core.ai_analyzer.time.sleep")
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["busy-a", "busy-b", "fast"])
+    def test_stalled_model_moves_to_next_candidate_immediately(self, _models, sleep):
+        # 무응답(혼잡)은 같은 모델을 다시 불러도 또 기다리게 된다 — 재시도 없이 다음 후보로
+        self.respond()
+        self.opener.open.side_effect = [TimeoutError(), TimeoutError(), self.opener.open.return_value]
+        result = NvidiaAnalyzer("test-key", "busy-a").analyze(object())
+        self.assertFalse(result.error)
+        self.assertEqual([json.loads(call.args[0].data)["model"] for call in self.opener.open.call_args_list],
+                         ["busy-a", "busy-b", "fast"])
+        sleep.assert_not_called()
+
+    @patch("core.ai_analyzer.nvidia_model_candidates", return_value=["a", "b", "c"])
+    def test_stall_error_lists_every_tried_model(self, _models):
+        self.opener.open.side_effect = TimeoutError()
+        result = NvidiaAnalyzer("test-key", "a").analyze(object())
+        self.assertIn("a → b → c", result.error)
+
     def test_request_streams_and_reports_progress(self):
         chunks = [_data({"choices": [{"delta": {"content": part}, "finish_reason": None}]})
                   for part in ("분석 ", "분류" + NL, "핵심 요약")]
@@ -201,6 +219,28 @@ class NvidiaTests(unittest.TestCase):
         with patch.dict("os.environ", {"NVIDIA_API_KEY": "env-key", "NVIDIA_MODEL": "env/model"}):
             self.assertEqual(get_ai_cfg()["api_key"], "env-key")
             self.assertEqual(get_ai_cfg()["model"], "env/model")
+
+    @patch("core.config_loader.load_config",
+           return_value={"ai": {"nvidia": {"api_key": "nested-key", "model": "nested/model"}}})
+    def test_nested_nvidia_settings_fill_missing_top_level(self, _config):
+        with patch.dict("os.environ", {"NVIDIA_API_KEY": "env-key", "NVIDIA_MODEL": "env/model"}):
+            self.assertEqual(get_ai_cfg()["api_key"], "nested-key")
+            self.assertEqual(get_ai_cfg()["model"], "nested/model")
+
+    @patch("core.config_loader.load_config",
+           return_value={"ai": {"api_key": "top-key", "model": "top/model",
+                                "nvidia": {"api_key": "nested-key", "model": "nested/model"}}})
+    def test_top_level_settings_win_over_nested(self, _config):
+        self.assertEqual(get_ai_cfg()["api_key"], "top-key")
+        self.assertEqual(get_ai_cfg()["model"], "top/model")
+
+    @patch("core.config_loader.CONFIG_PATH")
+    @patch("core.config_loader.load_config", return_value={"ai": {"api_key": "config-key", "model": "m"}})
+    def test_reads_settings_only_through_load_config(self, _config, path):
+        # 파일을 따로 열면 테스트·호출자가 바꾼 설정 대신 실제 config.json 이 섞여 들어온다
+        get_ai_cfg()
+        path.read_text.assert_not_called()
+        path.exists.assert_not_called()
 
     @patch("core.config_loader.CONFIG_PATH")
     def test_gui_save_preserves_other_sections_and_existing_key(self, path):

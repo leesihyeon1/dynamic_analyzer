@@ -280,6 +280,8 @@ _REG_RUN_KEYS: tuple[str, ...] = (
 )
 
 
+from parsers.pcap_parser import DGA_ENTROPY_THRESHOLD as _DGA_ENTROPY_THRESHOLD  # noqa: E402
+
 # ── T1543.003 (Windows Service) 판정 ─────────────────────────────────────────
 # "\services\" 부분 문자열만 보면 서비스 생성과 무관한 키가 대량으로 걸린다.
 # 특히 BAM/DAM(Background/Desktop Activity Moderator)은 프로그램이 실행될
@@ -377,6 +379,24 @@ def _is_user_task(lower: str) -> bool:
     return bool(name) and not name.startswith("microsoft\\") and name != "microsoft"
 
 
+def _vendor_service_names(events) -> set:
+    """ImagePath 가 OS 배경 설치 경로(Edge 업데이트 등)를 가리키는 서비스 이름.
+
+    Edge 가 업데이트되면 SCM 이 MicrosoftEdgeElevationService 를 지우고 새 버전 경로로
+    다시 만든다. '이번 실행에서 생긴 서비스'라 신규 등록처럼 보이지만 정상 업데이트다.
+    """
+    from analysis.relevance import _is_os_background_path
+    out: set = set()
+    for ev in events:
+        path = (getattr(ev, "path", "") or "").lower()
+        if "\\services\\" not in path or not path.rstrip("\\").endswith("\\imagepath"):
+            continue
+        m = re.search(r'data:\s*"?([^"]+?\.exe)', getattr(ev, "detail", "") or "", re.I)
+        if m and _is_os_background_path(m.group(1)):
+            out.add(_service_name(path))
+    return out
+
+
 def _classify_registry_events(
     events: list[ProcMonEvent],
     reg_diff: dict,
@@ -385,6 +405,7 @@ def _classify_registry_events(
 ) -> None:
 
     created_services = _created_service_names(events)
+    vendor_services = _vendor_service_names(events)
 
     def _check_reg_path(path: str, detail: str = "", process: str = "") -> None:
         lower = path.lower()
@@ -411,7 +432,7 @@ def _classify_registry_events(
                     and not is_new_svc):
                 pass
             else:
-                if proc_l in _SCM_PROCS and is_new_svc:
+                if proc_l in _SCM_PROCS and is_new_svc and svc not in vendor_services:
                     # CreateService → SCM 이 대신 쓴 신규 서비스 — 프로세스 접두 없이
                     # 남겨 services.exe(OS 배경) 귀속으로 강등되지 않게 한다.
                     _ev_text, _ev_proc = f"신규 서비스 등록(SCM 경유): {path}", ""
@@ -1086,9 +1107,14 @@ def _classify_network(
                       reference="https://attack.mitre.org/techniques/T1071/004/")
         _tag_entity(report.tag_map, q.name.lower(), "T1071.004")
 
-    # DGA
-    if pcap.suspicious_domains:
-        for domain in pcap.suspicious_domains:
+    # DGA — 무작위성(엔트로피)으로 판정한 이름만. 같은 C2 를 반복 조회하거나 하위 이름이
+    # 많은 것은 DGA 가 아니다 (그쪽은 아래 터널링 판정이 따로 다룬다).
+    _dga = getattr(pcap, "dga_domains", None)
+    if _dga is None:   # dga_domains 가 없던 이전 결과 — 엔트로피로 다시 고른다
+        _dga = [q.name for q in (pcap.dns_queries or [])
+                if getattr(q, "entropy", 0) >= _DGA_ENTROPY_THRESHOLD]
+    if _dga:
+        for domain in _dga:
             _add_evidence(technique_map, "T1568.002",
                           "Domain Generation Algorithms", "Command and Control",
                           evidence=f"고엔트로피 도메인: {domain}",

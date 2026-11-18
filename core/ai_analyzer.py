@@ -264,8 +264,9 @@ NVIDIA_MODEL_PREFERENCES: tuple[str, ...] = (
     #   mistral-large-4     첫 토큰 79초 · 초당 3.2토큰 — 품질은 좋지만 4천 토큰에 20분 이상
     #   nemotron-3.5-lightning · glm-5.3-flash — 추론 모델, 7천 토큰을 생각 과정에 다 써서 본문 0자
     # 설정 모델이 끊기거나 멈추면 이 순서로 대체한다.
+    # mistral-large-4 는 여기서 뺐다 — 위 실측대로 너무 느려, 대체로 들어가면 남은 시간을
+    # 무응답 대기로 다 쓰고 실패한다(Remcos 분석에서 실제로 600초를 소진). 직접 지정하면 쓴다.
     "google/gemma-4-31b-it",
-    "mistralai/mistral-large-4-1t-a52b",
     # Qwen 계열 — CJK 비중이 높아 한국어 서술이 자연스럽다 (카탈로그에 있을 때)
     "qwen/qwen2.5-72b-instruct",
     "qwen/qwen3-235b-a22b",
@@ -283,6 +284,9 @@ NVIDIA_MODEL_PREFERENCES: tuple[str, ...] = (
     "mistralai/mistral-large",
     "google/gemma-2-27b-it",
 )
+
+# 자동 대체 후보에서 빼는 모델 — 응답이 너무 느려 대체 의미가 없다 (설정에 직접 적으면 쓴다)
+_SLOW_FALLBACK_MODELS: frozenset[str] = frozenset({"mistralai/mistral-large-4-1t-a52b"})
 
 # 자동 선택에서 배제 — 임베딩·리랭킹·비전·음성 등 대화형이 아닌 모델
 _NON_CHAT_HINTS: tuple[str, ...] = (
@@ -384,7 +388,7 @@ def nvidia_model_candidates(
     out: list = []
 
     def _add(m: str) -> None:
-        if m and m not in out:
+        if m and m not in out and (m == wanted or m not in _SLOW_FALLBACK_MODELS):
             out.append(m)
 
     if wanted in catalog:
@@ -1667,6 +1671,15 @@ def _build_prompt(result, max_chars: int = _MAX_PROMPT_CHARS) -> str:
             lines.append(f"- [{_t.technique_id}] {_t.technique_name} ({_t.tactic})")
         lines.append("")
 
+    # ── 악성코드 패밀리 지문 ─────────────────────────────────────────────
+    _fams = (getattr(result, "malware_traits", None) or {}).get("families") or []
+    if _fams:
+        lines.append("## 악성코드 패밀리 지문 ← 실행 중 남긴 흔적으로 확인, 분류·요약에 패밀리명을 쓸 것")
+        for _f in _fams:
+            lines.append(f"- {_f['name']} ({'확정' if _f.get('confidence') == 'HIGH' else '의심'}, "
+                         f"흔적 {_f.get('matched')}/{_f.get('total')}개): " + "; ".join(_f.get("evidence", [])[:4]))
+        lines.append("")
+
     # ── DLL 사이드로딩 ───────────────────────────────────────────────────
     _sl = getattr(result, "sideload_findings", None) or []
     if _sl:
@@ -2557,7 +2570,8 @@ class _NoApiRedirect(urllib.request.HTTPRedirectHandler):
 # 같은 요청을 처음부터 다시 보내도 같은 이유로 또 끊긴다("세 차례 끊김").
 # 스트리밍은 토큰이 생성되는 대로 흘러와 연결이 유휴 상태가 되지 않고,
 # 소켓 타임아웃이 "토큰 사이 무응답 시간" 이 되며, 끊겨도 받은 만큼은 남는다.
-_AI_IDLE_TIMEOUT      = 180   # 토큰 사이 최대 무응답(초) — 첫 토큰 대기(대기열·입력 처리) 포함
+# 무응답 120초면 그 모델은 지금 혼잡한 것이다 — 기다리기보다 다음 후보로 넘긴다
+_AI_IDLE_TIMEOUT      = 120   # 토큰 사이 최대 무응답(초) — 첫 토큰 대기(대기열·입력 처리) 포함
 _AI_PROGRESS_EVERY    = 10    # 수신 진행 알림 간격(초)
 _AI_PARTIAL_MIN_CHARS = 600   # 끊긴 응답을 부분 결과로 채택할 최소 본문 길이
 _DISCONNECT_ERRORS    = (RemoteDisconnected, ConnectionResetError, ConnectionAbortedError,
@@ -2648,7 +2662,7 @@ def _read_chat_stream(response, deadline: float, on_progress=None) -> tuple:
 class NvidiaAnalyzer:
     """NVIDIA NIM으로 기존 행위 요약 프롬프트를 분석한다."""
 
-    def __init__(self, api_key: str = "", model: str = "mistralai/mistral-large-4-1t-a52b") -> None:
+    def __init__(self, api_key: str = "", model: str = NVIDIA_DEFAULT_MODEL) -> None:
         self.api_key = api_key.strip()
         self.model = model.strip()
         self.model_note = ""   # 자동 대체가 일어났을 때의 안내 문구
@@ -2748,15 +2762,21 @@ class NvidiaAnalyzer:
                     # 여기까지 왔으면 끊김 또는 무응답 — 같은 모델 1회 재시도 후 다음 후보
                     disconnects += 1
                     if disconnects >= 3 or time.monotonic() > deadline:
+                        _chain = " → ".join(tried)
                         if isinstance(last_failure, TimeoutError):
                             ai.error = (f"NVIDIA 응답이 세 차례 {idle}초 이상 멈추거나 전체 제한 {timeout}초를 넘겨 "
-                                        f"AI 분석을 완료하지 못했습니다 (모델 {cand}). 서버 혼잡일 수 있으니 "
+                                        f"AI 분석을 완료하지 못했습니다 (시도한 모델: {_chain}). 서버 혼잡일 수 있으니 "
                                         "잠시 후 다시 시도하거나 AI 설정에서 더 작은 모델을 지정하세요.")
                         else:
-                            ai.error = (f"NVIDIA 응답 연결이 세 차례 끊겨 AI 분석을 완료하지 못했습니다 (모델 {cand}). "
+                            ai.error = (f"NVIDIA 응답 연결이 세 차례 끊겨 AI 분석을 완료하지 못했습니다 (시도한 모델: {_chain}). "
                                         "분석 VM 의 외부 통신(프록시·FakeNet·방화벽)을 확인하거나 더 작은 모델을 지정하세요.")
                         ai.elapsed_sec = round(time.monotonic() - start, 1)
                         return ai
+                    # 무응답(혼잡)은 같은 모델을 다시 불러도 또 기다리게 된다 — 바로 다음 후보로.
+                    # 연결 끊김은 일시적일 수 있어 같은 모델을 한 번 더 시도한다(아래).
+                    if isinstance(last_failure, TimeoutError) and idx + 1 < len(candidates):
+                        next_candidate = True
+                        break
                     time.sleep(disconnects)
                     if disconnects == 2 and idx + 1 < len(candidates):
                         next_candidate = True

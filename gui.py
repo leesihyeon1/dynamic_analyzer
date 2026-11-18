@@ -52,7 +52,7 @@ _OBSERVE_RE = re.compile(r"\[4/6\].*?\((\d+)초\)")
 _REMAIN_RE = re.compile(r"(\d+)s 경과 / 잔여 (\d+)s")
 _LOG_ERR_RE = re.compile(r"\[오류\]|오류:|실패|Traceback|Error\b|예외")
 _LOG_WARN_RE = re.compile(r"\[경고\]|\[주의\]|\[!\]|경고|⚠|\[알림\]")
-_LOG_STAGE_RE = re.compile(r"^\s*(\[[1-6]/6\]|\[분석\]|\[AI 분석\]|\[보고서\]|\[완료\]|\[도구 확인\]|\[관련도\]|\[메모리 포렌식\]|\[TLS\]|\[YARA\]|\[FakeNet\]|\[\*\])")
+_LOG_STAGE_RE = re.compile(r"^\s*(\[[1-6]/6\]|\[분석\]|\[AI 분석\]|\[보고서\]|\[완료\]|\[도구 확인\]|\[관련(?:도|성)\]|\[메모리 포렌식\]|\[TLS\]|\[YARA\]|\[FakeNet\]|\[\*\])")
 
 TIMEOUT_PRESETS = ("60", "120", "300", "600")
 
@@ -64,12 +64,13 @@ OPTION_ROWS = (  # (키, 이름, 설명, 도구 점검 키)
     ("memdump",  "메모리 덤프",        "winpmem + Volatility3 (느림)",    "winpmem"),
     ("ph",       "Process Hacker 창", "분석 중 프로세스 창 띄우기",        "process_hacker"),
     ("ai",       "AI 해석",           "NVIDIA NIM — 요약만 전송",        "ai"),
+    ("unelevated", "일반 사용자 권한",   "UAC 우회 등 권한 상승 관찰",       None),
 )
 
 
 def build_command(path: Path, output: Path, timeout: int, *, procmon: bool,
                   tshark: bool, ph: bool, keylog: bool, ai: bool,
-                  memdump: bool, fakenet: bool) -> list[str]:
+                  memdump: bool, fakenet: bool, unelevated: bool = False) -> list[str]:
     """GUI 선택값을 기존 CLI 인자로 변환한다."""
     command = [sys.executable, "-u", str(ROOT / "analyzer.py")]
     if path.suffix.lower() in PCAP_SUFFIXES:
@@ -88,6 +89,8 @@ def build_command(path: Path, output: Path, timeout: int, *, procmon: bool,
             command.append("--memdump")
         if fakenet:
             command.append("--fakenet")
+        if unelevated:
+            command.append("--unelevated")
     if not ai:
         command.append("--no-ai")
     command += ["--timeout", str(timeout), "--output", str(output), "--no-open"]
@@ -511,7 +514,7 @@ class AnalyzerGUI:
         self.status = tk.StringVar(value="분석할 파일을 고르세요.")
         self.options = {name: tk.BooleanVar(value=default) for name, default in {
             "procmon": True, "tshark": True, "ph": False, "keylog": True,
-            "ai": True, "memdump": False, "fakenet": False,
+            "ai": True, "memdump": False, "fakenet": False, "unelevated": False,
         }.items()}
         self.log_filter = tk.StringVar(value="all")
         self.autoscroll = tk.BooleanVar(value=True)
@@ -705,7 +708,7 @@ class AnalyzerGUI:
         proc = tk.Frame(stack, bg=BG)
         bar = tk.Frame(proc, bg=BG)
         bar.pack(fill="x", pady=(0, S(6)))
-        for value, text in (("lineage", "샘플 계보"), ("related", "계보 + 의심"), ("all", "전체")):
+        for value, text in (("lineage", "샘플만"), ("related", "샘플 + 의심"), ("all", "전체")):
             ttk.Radiobutton(bar, text=text, value=value, variable=self.proc_scope, style="Seg.TRadiobutton",
                             command=self.fill_processes).pack(side="left", padx=(0, S(4)))
         self.proc_note = tk.Label(bar, text="", bg=BG, fg=MUTED, font=(UI_FAMILY, 9))
@@ -722,8 +725,8 @@ class AnalyzerGUI:
         self.tabs.add(proc, "프로세스")
         # 네트워크
         net = tk.Frame(stack, bg=BG)
-        section_label(net, "연결", note="프로세스 귀속을 확인한 순서로 정렬").pack(fill="x", pady=(0, S(4)))
-        cf, self.connection_tree = make_tree(net, ("귀속", "프로세스", "PID", "원격 주소", "도메인", "이벤트"),
+        section_label(net, "연결", note="샘플과 가까운 관계부터 정렬").pack(fill="x", pady=(0, S(4)))
+        cf, self.connection_tree = make_tree(net, ("관계", "프로세스", "PID", "원격 주소", "도메인", "이벤트"),
                                              (90, 170, 64, 190, 260, 60), height=8)
         cf.pack(fill="both", expand=True)
         section_label(net, "DNS 질의", note="응답 없는 질의는 접속 시도로만 본다").pack(fill="x", pady=(S(10), S(4)))
@@ -733,7 +736,7 @@ class AnalyzerGUI:
         self.tabs.add(net, "네트워크")
         # 파일·레지스트리
         fr = tk.Frame(stack, bg=BG)
-        section_label(fr, "드롭 파일", note="샘플 계보가 쓴 파일 — 증거 폴더 사본 포함").pack(fill="x", pady=(0, S(4)))
+        section_label(fr, "드롭 파일", note="샘플 프로세스가 쓴 파일 — 증거 폴더 사본 포함").pack(fill="x", pady=(0, S(4)))
         ff, self.file_tree = make_tree(fr, ("경로", "크기", "SHA-256", "등급"), (470, 80, 200, 70), height=8)
         ff.pack(fill="both", expand=True)
         section_label(fr, "레지스트리 변경", note="사전·사후 스냅샷 차이").pack(fill="x", pady=(S(10), S(4)))
@@ -1063,7 +1066,7 @@ class AnalyzerGUI:
             t.put("이번 분석에서는 AI 해석을 사용하지 않았습니다.", "para", "muted")
             t.nl("para")
 
-        t.h("샘플 귀속 IOC", "계보 프로세스가 직접 만든 지표만")
+        t.h("샘플 IOC", "샘플 프로세스가 직접 만든 지표만")
         any_ioc = False
         for label, key in (("도메인", "domains"), ("IP", "ip_addresses"), ("URL", "urls"),
                            ("드롭 파일", "dropped_files"), ("레지스트리", "registry_keys"), ("뮤텍스", "mutexes")):
@@ -1077,7 +1080,7 @@ class AnalyzerGUI:
                 t.put(f"\t… 외 {len(values) - 12}개 — HTML 보고서 IOC 섹션", "kv", "faint")
                 t.nl("kv")
         if not any_ioc:
-            t.put("샘플에 귀속된 IOC 가 없습니다.", "para", "muted")
+            t.put("샘플 프로세스가 만든 IOC 가 없습니다.", "para", "muted")
             t.nl("para")
 
         if r.techniques:
@@ -1122,7 +1125,7 @@ class AnalyzerGUI:
 
         def add(parent_iid: str, parent_pid: int, depth: int) -> None:
             for p in sorted(by_parent.get(parent_pid, []), key=lambda x: x.pid):
-                tier_text = {1: "계보", 2: "의심", 3: "배경"}.get(p.tier, "—")
+                tier_text = {1: "샘플", 2: "의심", 3: "평상시"}.get(p.tier, "—")
                 tags = ("mal" if p.injected else ("accent" if p.is_sample else
                         {1: "", 2: "sus", 3: "faint"}.get(p.tier, "muted")),)
                 if p.is_sample:
@@ -1199,7 +1202,7 @@ class AnalyzerGUI:
         tree.delete(*tree.get_children())
         for i, (path, size, sha, tier) in enumerate(r.dropped):
             level = {1: "mal", 2: "sus", 3: "faint"}.get(tier, "")
-            tree.insert("", "end", iid=str(i), values=(path, size, sha, {1: "계보", 2: "의심", 3: "배경"}.get(tier, "—")),
+            tree.insert("", "end", iid=str(i), values=(path, size, sha, {1: "샘플", 2: "의심", 3: "평상시"}.get(tier, "—")),
                         tags=(level,))
         if not r.dropped:
             tree.insert("", "end", iid="none", values=("샘플이 쓴 파일 없음", "", "", ""), tags=("muted",))

@@ -194,8 +194,9 @@ def sample_network_view(pcap, events, pids, dns_attributed=None):
             q = DNSQuery(name=name, qtype=qtype, response_ips=answers,
                          entropy=round(ent, 3), is_ddns=_is_ddns_domain(name),
                          no_response=failed)
-            q.suspicious = (ent >= DGA_ENTROPY_THRESHOLD
-                            or len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN)
+            q.reasons = (["dga"] if ent >= DGA_ENTROPY_THRESHOLD else []) + (
+                ["long"] if len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN else [])
+            q.suspicious = bool(q.reasons)
         scoped.dns_queries.append(q)
     scoped_names = {q.name for q in scoped.dns_queries}
     scoped.raw_dns_queries = [r for r in (getattr(pcap, "raw_dns_queries", None) or [])
@@ -203,6 +204,9 @@ def sample_network_view(pcap, events, pids, dns_attributed=None):
     scoped.suspicious_domains = sorted(
         {d for d in (pcap.suspicious_domains or []) if d in scoped_names}
         | {q.name for q in scoped.dns_queries if q.suspicious})
+    scoped.dga_domains = sorted(
+        {d for d in (getattr(pcap, "dga_domains", None) or []) if d in scoped_names}
+        | {q.name for q in scoped.dns_queries if "dga" in (getattr(q, "reasons", None) or [])})
     bases = {_base_domain(n) for n in scoped_names}
     scoped.dns_tunnel_suspects = [b for b in (pcap.dns_tunnel_suspects or []) if b in bases]
 

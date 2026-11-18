@@ -31,16 +31,24 @@ TIER_SAMPLE     = 1
 TIER_CORRELATED = 2
 TIER_BACKGROUND = 3
 
+# 보고서·GUI 에 보이는 이름. 내부 이름(계보·상관·배경)은 코드에만 남긴다.
 TIER_LABELS: dict[int, str] = {
-    TIER_SAMPLE:     "샘플 계보",
-    TIER_CORRELATED: "상관 의심",
-    TIER_BACKGROUND: "환경 배경",
+    TIER_SAMPLE:     "샘플 관련",
+    TIER_CORRELATED: "관련 의심",
+    TIER_BACKGROUND: "평상시 활동",
+}
+
+# 표 배지처럼 좁은 자리에 쓰는 짧은 이름
+TIER_SHORT: dict[int, str] = {
+    TIER_SAMPLE:     "샘플",
+    TIER_CORRELATED: "의심",
+    TIER_BACKGROUND: "평상시",
 }
 
 TIER_DESCRIPTIONS: dict[int, str] = {
-    TIER_SAMPLE:     "샘플 프로세스와 그 자손이 직접 발생시킨 행위",
-    TIER_CORRELATED: "샘플 계보 밖이지만 환경 배경으로 설명되지 않는 행위 — 주입·측면 이동 가능성",
-    TIER_BACKGROUND: "베이스라인 또는 알려진 OS 배경 활동(Windows Update·Defender·텔레메트리)",
+    TIER_SAMPLE:     "샘플과 샘플이 실행한 자식 프로세스가 직접 일으킨 행위",
+    TIER_CORRELATED: "샘플 프로세스는 아니지만 평상시 활동으로도 설명되지 않는 행위 — 코드 주입·다른 프로세스 악용 가능성",
+    TIER_BACKGROUND: "샘플이 없어도 평소에 일어나는 Windows 기본 활동(Windows Update·Defender·진단 데이터 전송 등)",
 }
 
 
@@ -129,6 +137,12 @@ OS_BACKGROUND_PATH_FRAGMENTS: tuple[str, ...] = (
     r"\msedgeedge_bits_", r"\component_crx_cache" "\\", r"\widevinecdm" "\\",
     # OS 상태 파일
     r"\windows\servicestate" "\\", r"\$logfile", r"\$mft",
+    # Microsoft Edge 자동 업데이트 — Edge·EdgeUpdate·EdgeCore·EdgeWebView 설치 폴더와
+    # %TEMP% 에 받는 설치 파일({GUID}-MicrosoftEdge_X64_*.exe). 분석 중 업데이트가 돌면
+    # 설치 파일 수백 개와 서비스 재등록이 샘플 행위처럼 섞인다.
+    r"\program files (x86)\microsoft\edge", r"\program files\microsoft\edge",
+    r"}-microsoftedge_x64_", r"}-microsoftedge_x86_", r"}-microsoftedge_arm64_",
+    r"}-microsoftedgeupdatesetup",
 )
 
 # 분석 도구가 남기는 흔적
@@ -355,11 +369,11 @@ def tier_process(proc, ctx: RelevanceContext) -> int:
             return TIER_BACKGROUND
         return TIER_CORRELATED
 
-    # Tier 3 — 베이스라인 / 알려진 OS 배경
-    if ctx.baseline is not None:
-        if ctx.baseline.has_exe(exe) or ctx.baseline.has_process(name):
-            return TIER_BACKGROUND
-    elif name in OS_BACKGROUND_PROCS or _is_os_background_path(exe):
+    # Tier 3 — 베이스라인 / 알려진 OS 배경. 둘은 함께 본다: 베이스라인은 수집 시점의
+    # 스냅샷이라 그 뒤에 설치·갱신된 OS 구성요소(예: 새 Edge 버전 설치기)를 모른다.
+    if ctx.baseline is not None and (ctx.baseline.has_exe(exe) or ctx.baseline.has_process(name)):
+        return TIER_BACKGROUND
+    if name in OS_BACKGROUND_PROCS or _is_os_background_path(exe):
         return TIER_BACKGROUND
 
     # Tier 2 — 배경으로 설명되지 않음. 주입 탐지 PID 도 여기(오탐 비중이 높아
@@ -377,10 +391,9 @@ def tier_file(path: str, ctx: RelevanceContext) -> int:
         return TIER_SAMPLE
     if _is_analysis_artifact(path):
         return TIER_BACKGROUND
-    if ctx.baseline is not None:
-        if ctx.baseline.has_file(path):
-            return TIER_BACKGROUND
-    elif _is_os_background_path(path):
+    if ctx.baseline is not None and ctx.baseline.has_file(path):
+        return TIER_BACKGROUND
+    if _is_os_background_path(path):
         return TIER_BACKGROUND
     return TIER_CORRELATED
 
@@ -481,9 +494,20 @@ def _process_name_tier(pname: str, ctx: "RelevanceContext") -> int:
         return TIER_CORRELATED
     if ctx.baseline is not None and ctx.baseline.has_process(pname):
         return TIER_BACKGROUND
-    if ctx.baseline is None and pname in OS_BACKGROUND_PROCS:
+    if pname in OS_BACKGROUND_PROCS:
+        return TIER_BACKGROUND
+    # setup.exe 처럼 흔한 이름은 이름만으로 판정할 수 없다. 이번 실행에서 그 이름을 가진
+    # 프로세스가 모두 OS 배경 경로(Edge 설치 폴더 등)에서 실행됐을 때만 배경으로 본다.
+    exes = _exes_for_name(pname, ctx)
+    if exes and all(_is_os_background_path(e) for e in exes):
         return TIER_BACKGROUND
     return TIER_CORRELATED
+
+
+def _exes_for_name(pname: str, ctx: "RelevanceContext") -> set:
+    """이번 실행에서 이 이름으로 관찰된 실행 파일 경로들."""
+    return {exe for pid, exe in ctx.pid_exes.items()
+            if exe and ctx.pid_names.get(pid, "") == pname}
 
 
 def _evidence_item_tier(ev, ctx: "RelevanceContext") -> Optional[int]:
@@ -744,14 +768,14 @@ def classify_injections(result, ctx: RelevanceContext) -> list:
             # 왔다. 그 이름으로 explorer.exe 할로잉 같은 진짜 신호를 덮으면 안 된다.
             why = "PE 교체/주입 동반 — 확인 필요"
             if baseline_fp:
-                why += " (베이스라인에도 같은 이름의 주입 탐지가 있었음)"
+                why += " (평상시 기준에도 같은 이름의 주입 탐지가 있었음)"
             conf = "MEDIUM"
         elif baseline_fp:
-            conf, why = "LOW", "베이스라인에서도 동일 탐지 (환경 상시 오탐)"
+            conf, why = "LOW", "평상시 기준에서도 똑같이 탐지됨 (상시 오탐)"
         elif jit_prone and shc > 0:
-            conf, why = "LOW", ".NET JIT·ASLR 재배치 오탐 가능성 높음 (쉘코드만 탐지)"
+            conf, why = "LOW", ".NET JIT·ASLR 재배치 오탐 가능성 높음 (셸코드만 탐지)"
         elif shc > 0:
-            conf, why = "MEDIUM", "쉘코드만 탐지 — 확인 필요"
+            conf, why = "MEDIUM", "셸코드만 탐지 — 확인 필요"
         else:
             conf, why = "LOW", "약한 신호"
 

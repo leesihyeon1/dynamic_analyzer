@@ -1,12 +1,11 @@
-"""행위 그래프 — 샘플 계보 프로세스별 관측 행위를 자체 포함 SVG 로 표시한다.
+"""행위 그래프의 관측 집계 — 샘플 프로세스별로 무엇을 했는지 모은다.
 
-한 프로세스가 한 줄(lane)이다.  [부모] → [프로세스] → 동작 → 대상
-줄은 프로세스 트리 순서(샘플부터 깊이 우선)로 쌓이고, 자식 줄은 들여써서
-위아래로 읽으면 실행 체인이, 옆으로 읽으면 그 프로세스가 한 일이 보인다.
-대상 색은 판정 근거의 세기다 — 빨강: 악성 근거, 노랑: 의심 근거.
-각 줄 아래 "근거"를 펼치면 ProcMon·PCAP 원문이 나온다.
+exporters/behavior_graph.py 가 이 집계(_collect)로 실행 흐름과 행위를 한 그래프에 그린다.
+대상의 판정 근거 세기: 2 악성 근거 · 1 의심 근거 · 0 일반 행위.
+PCAP 세션은 ProcMon 소켓 이벤트와 4-튜플이 정확히 한 프로세스로 맞을 때만 그 프로세스에 붙이고,
+그 밖에는 '프로세스 미확인'(None)으로 둔다 — 포트 번호만 보고 SMTP·FTP 로 단정하지 않는다.
 """
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from html import escape
 from pathlib import PureWindowsPath
 
@@ -30,49 +29,7 @@ _EXE_EXT = (".exe", ".dll", ".sys", ".scr", ".com", ".bat", ".cmd", ".ps1", ".vb
 _LOLBINS = frozenset({"rundll32.exe", "regsvr32.exe", "mshta.exe", "powershell.exe", "pwsh.exe",
                       "cmd.exe", "wscript.exe", "cscript.exe", "certutil.exe", "bitsadmin.exe",
                       "schtasks.exe", "wmic.exe", "msiexec.exe", "installutil.exe", "regasm.exe"})
-_INDENT = 22   # 자식 줄 들여쓰기(px)
-
-_CSS = """<style>
-.cap-graph{margin:0 0 26px}
-.cap-legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:.76rem;color:var(--muted,#a7b9c9);
-  padding:0 0 10px;border-bottom:1px solid #344256}
-.cap-legend span:before{content:'';display:inline-block;width:10px;height:10px;background:var(--c);margin-right:6px;vertical-align:-1px}
-.cap-lane{border-bottom:1px solid #344256;padding:10px 0 8px;overflow:auto;scroll-margin-top:16px}
-.cap-lane.cap-child{border-left:1px solid #4a5f7d}
-.cap-lane svg{display:block;min-width:600px;width:100%;max-width:1020px;color:#75cebf}
-.cap-lane svg text{font:14px 'Segoe UI','Malgun Gothic',sans-serif;fill:#e3ecf6}
-.cap-lane svg .caption{font-size:12px;fill:#a7b9c9}
-.cap-lane svg .cap-link{cursor:pointer}
-.cap-lane svg .cap-link:hover text{text-decoration:underline}
-.cap-lane summary{cursor:pointer;color:#a7b9c9;font-size:.82rem;padding:4px 0}
-.cap-lane h4{font-size:.8rem;margin:8px 0 2px;color:#b7c9ed}
-.cap-lane ul{margin:0;padding-left:18px}
-.cap-lane li{overflow-wrap:anywhere;font-family:'Cascadia Code',Consolas,monospace;font-size:.76rem}
-.cap-lane small{color:#a7b9c9}
-.cap-lane code{display:block;margin:2px 0 4px;overflow-wrap:anywhere}
-.cap-mark{display:inline-block;width:8px;height:8px;margin-right:6px;background:var(--c)}
-.cap-flash{outline:1px solid var(--accent,#45d6bf)}
-</style>
-<script>
-function capGoLane(pid){
-  var el=document.getElementById('cap-'+pid); if(!el) return;
-  el.scrollIntoView({block:'center',behavior:'auto'}); el.classList.add('cap-flash');
-  setTimeout(function(){el.classList.remove('cap-flash');},1600);
-}
-</script>"""
-
-
-def _icon(kind, x, y):
-    return (f"<g transform='translate({x} {y})' color='{_ICON_COLOR[kind]}'>"
-            "<circle cx='12' cy='12' r='18' fill='currentColor' fill-opacity='.11'/>"
-            f"<path d='{_ICONS[kind]}' fill='none' stroke='currentColor' "
-            "stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></g>")
-
-
-def _short(text, n):
-    text = str(text)
-    return escape(text if len(text) <= n else text[:n-1] + "…")
-
+_Observed = namedtuple("_Observed", "groups procs names lineage loader_pids")
 
 def _is_external(ip):
     import ipaddress
@@ -84,35 +41,8 @@ def _is_external(ip):
                 or a.is_unspecified or a.is_reserved)
 
 
-def _lane_order(groups, procs, lineage, sample_pid):
-    """샘플부터 깊이 우선 — (pid, 깊이) 목록. 귀속 미확인(None) 줄은 맨 끝."""
-    kids = defaultdict(list)
-    for p in procs.values():
-        if p.pid in lineage:
-            kids[p.ppid].append(p.pid)
-    roots = sorted((pid for pid in lineage if getattr(procs.get(pid), "ppid", None) not in lineage),
-                   key=lambda pid: (pid != sample_pid, pid))
-    order, seen = [], set()
-
-    def walk(pid, depth):
-        if pid in seen:
-            return
-        seen.add(pid)
-        if pid in groups:
-            order.append((pid, depth))
-            depth += 1        # 그려지지 않는 중간 프로세스는 들여쓰기를 늘리지 않는다
-        for child in sorted(kids.get(pid, ())):
-            walk(child, depth)
-
-    for r in roots:
-        walk(r, 0)
-    order += [(pid, 0) for pid in groups if pid is not None and pid not in seen]
-    if None in groups:
-        order.append((None, 0))
-    return order
-
-
-def capability_preview_html(result, fallback_pids=None, *, include_evidence=True):
+def _collect(result, fallback_pids=None):
+    """샘플 계보 프로세스별 관측 행위를 집계한다 — 줄(lane) 보기와 통합 그래프가 공유한다."""
     procs = {p.pid: p for p in result.process_diff.get("new_processes", [])}
     lineage = set(result.lineage_pids) or set(fallback_pids or ())
     if result.sample_pid:
@@ -243,6 +173,15 @@ def capability_preview_html(result, fallback_pids=None, *, include_evidence=True
             packet(m, "SMTP DATA" if m.has_data else "SMTP", f"{m.dst_ip}:{m.dst_port}",
                    " · ".join(x for x in commands if x), level=2 if m.has_data else 1)
 
+    # 화면 캡처·키 입력 기록 (analysis.malware_traits) — 같은 파일의 '파일 쓰기'보다
+    # 센 근거로 올려, 그래프에서 일반 드롭이 아니라 그 행위로 보이게 한다
+    for beh in ((getattr(result, "malware_traits", None) or {}).get("behaviors") or []):
+        for item in beh.get("items", []):
+            if item.get("pid") in lineage:
+                names.setdefault(item["pid"], item.get("process", ""))
+                add(item["pid"], beh["label"], "file", item["path"],
+                    f"{beh['technique_id']} {beh['name']}", level=2)
+
     # 어느 프로세스에도 귀속하지 못한 응답 없는 DNS — C2 후보이므로 숨기지 않는다
     try:
         from exporters.report_visuals import _unanswered_dns
@@ -253,81 +192,4 @@ def capability_preview_html(result, fallback_pids=None, *, include_evidence=True
     except Exception:
         pass
 
-    if not groups:
-        return "<p>도식화할 관측 행위가 없습니다.</p>"
-
-    legend = ("<div class='cap-legend'>"
-              f"<span style='--c:{_LEVEL_COLOR[2]}'>악성 근거 (드롭 실행 파일·자동실행 등록·민감 경로 읽기·주입)</span>"
-              f"<span style='--c:{_LEVEL_COLOR[1]}'>의심 근거 (외부 통신·LOLBin 실행·관심 레지스트리)</span>"
-              f"<span style='--c:{_LEVEL_COLOR[0]}'>관측</span>"
-              "<span style='--c:#4a5f7d'>들여쓴 줄 = 위 줄 프로세스의 자식</span></div>")
-    parts = [_CSS, "<div class='cap-graph'>", legend]
-    sample_pid = getattr(result, "sample_pid", None)
-    for pid, depth in _lane_order(groups, procs, lineage, sample_pid):
-        actions_for_actor = groups[pid]
-        proc = procs.get(pid)
-        actor = names.get(pid) or ("패킷 캡처" if pid is None else "이름 미확인")
-        caption = "프로세스 귀속 미확인" if pid is None else f"PID {pid}"
-        if pid is not None and pid == sample_pid:
-            caption += " · 샘플"
-        if pid in loader_pids:
-            caption += " · 로더"
-        parent = procs.get(getattr(proc, "ppid", None))
-        origin = parent.name if parent else ("PCAP" if pid is None else "실행 기록")
-        parent_pid = f"PID {parent.pid}" if parent else ""
-        # 동작 줄: 근거가 센 것부터, 같은 수준이면 관측 순서대로
-        rows = sorted(actions_for_actor.items(),
-                      key=lambda kv: -max(rec[2] for rec in kv[1].values()))
-        height = max(80, len(rows) * 53)
-        mid = height / 2
-        if parent and parent.pid in groups:
-            origin_g = (f"<g class='cap-link' onclick='capGoLane({int(parent.pid)})' role='link' "
-                        f"aria-label='{escape(parent.name)} 줄로 이동'>")
-        else:
-            origin_g = "<g>"
-        if pid is not None and include_evidence:
-            actor_g = (f"<g class='cap-link' onclick='rvGoProc && rvGoProc({int(pid)})' role='link' "
-                       f"aria-label='{escape(actor)} 프로세스 트리로 이동'>")
-        else:
-            actor_g = "<g>"
-        svg = [f"<svg viewBox='-8 -6 986 {height + 12}' role='img' aria-label='{escape(actor)} 관측 관계'>",
-               origin_g, _icon("net" if pid is None else "proc", 5, mid-23),
-               f"<text x='5' y='{mid+18}'>{_short(origin,20)}</text><text class='caption' x='5' y='{mid+35}'>{parent_pid}</text></g>",
-               f"<path d='M142 {mid}h33l-5 -4m5 4-5 4' fill='none' stroke='#7694a2'/>",
-               actor_g, _icon("net" if pid is None else "proc", 190, mid-27),
-               f"<text x='190' y='{mid+13}'>{_short(actor,23)}</text><text class='caption' x='190' y='{mid+31}'>{escape(caption)}</text></g>"]
-        details = []
-        for index, ((action, icon), targets) in enumerate(rows):
-            y = (index + .5) * height / len(rows)
-            # 대표 대상: 근거가 가장 센 것, 같으면 관측이 많은 것
-            (target, _), (_, _, level) = max(targets.items(), key=lambda kv: (kv[1][2], kv[1][1]))
-            label = PureWindowsPath(target).name if icon != "net" else target
-            suffix = f" 외 {len(targets)-1}개" if len(targets) > 1 else ""
-            color = _LEVEL_COLOR[level]
-            weight = " font-weight='700'" if level else ""
-            svg.extend([f"<path d='M375 {mid} C404 {mid} 405 {y} 435 {y}h8l-5 -4m5 4-5 4' fill='none' stroke='#548d90'/>",
-                        _icon(icon, 455, y-12), f"<text x='492' y='{y+5}'>{escape(action)}</text>",
-                        f"<path d='M621 {y}h27l-5 -4m5 4-5 4' fill='none' stroke='#548d90'/>",
-                        f"<text x='662' y='{y+5}' style='fill:{color}'{weight}><title>{escape(target)}"
-                        f"{' — ' + _LEVEL_NAME[level] if level else ''}</title>{_short(label or target, 28)}{suffix}</text>"])
-            if not include_evidence:
-                continue
-            items = "".join(
-                f"<li>{f'<span class=cap-mark style=--c:{_LEVEL_COLOR[lv]}></span>' if lv else ''}"
-                f"{escape(path)} <small>· {count}건 · {escape(info)}</small></li>"
-                for (path, _), (info, count, lv) in sorted(targets.items(), key=lambda kv: -kv[1][2]))
-            details.append(f"<h4>{escape(action)}</h4><ul>{items}</ul>")
-        command = getattr(proc, "cmdline", []) or []
-        cmd = command if isinstance(command, str) else " ".join(command)
-        indent = min(depth, 6) * _INDENT
-        style = f" style='margin-left:{indent}px;padding-left:12px'" if indent else ""
-        cls = "cap-lane cap-child" if indent else "cap-lane"
-        lane_id = f" id='cap-{pid}'" if pid is not None else " id='cap-unattributed'"
-        parts.append(f"<section class='{cls}'{lane_id}{style}>" + "".join(svg) + "</svg>")
-        if include_evidence:
-            parts.append("<details><summary>" + escape(actor) + " · " + escape(caption)
-                         + " 근거</summary>" + (f"<code>{escape(cmd)}</code>" if cmd else "")
-                         + "".join(details) + "</details>")
-        parts.append("</section>")
-    parts.append("</div>")
-    return "".join(parts)
+    return _Observed(groups, procs, names, lineage, loader_pids)

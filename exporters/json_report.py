@@ -214,18 +214,19 @@ def save_json_report(result, output_path: str) -> None:
         "sample_pid": result.sample_pid,
         "all_pids":  sorted(result.all_pids),
 
-        # 관련도 등급 — 1=샘플 계보 2=상관 의심 3=환경 배경 (0=미판정)
+        # 관련성 구분 — 1=샘플 관련 2=관련 의심 3=평상시 활동 (0=미판정)
         "relevance": {
             "counts":   getattr(result, "relevance_counts", {}) or {},
             "baseline": getattr(result, "baseline_info", {}) or {},
             "tiers": {
-                "1": "샘플 계보", "2": "상관 의심", "3": "환경 배경",
+                "1": "샘플 관련", "2": "관련 의심", "3": "평상시 활동",
             },
         },
         "lineage_pids":  sorted(getattr(result, "lineage_pids", None) or []),
         "injected_pids": sorted(getattr(result, "injected_pids", None) or []),
         "evidence":           getattr(result, "evidence", None) or {},
         "sideload_findings":  getattr(result, "sideload_findings", None) or [],
+        "malware_traits":     getattr(result, "malware_traits", None) or {},
         "injection_findings": getattr(result, "injection_findings", None) or [],
         "packer_findings":    getattr(result, "packer_findings", None) or [],
         "masquerade_findings": getattr(result, "masquerade_findings", None) or [],

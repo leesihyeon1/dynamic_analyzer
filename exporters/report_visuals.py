@@ -5,8 +5,8 @@ report_visuals.py — 리포트 개요 화면의 판정 요약 · 위험 지표 
 
   * Hybrid Analysis — 판정(악성/의심) + 점수 링 + "악성 / 의심 / 정보성 지표" 목록.
     리포트를 열자마자 "그래서 악성인가, 근거가 뭔가"에 답한다.
-  * Joe Sandbox     — 행위 그래프(exporters/capability_graph.py). 프로세스 체인과 각 프로세스가 남긴
-    파일·레지스트리·네트워크 흔적을 한 장의 그림으로 보여준다.
+  * Joe Sandbox     — 행위 그래프(exporters/behavior_graph.py). 판정 카드에서 이어지는 프로세스 실행
+    흐름에 각 프로세스가 남긴 파일·레지스트리·네트워크 흔적을 붙여 한 장의 그림으로 보여준다.
   * ANY.RUN         — 프로세스 트리 행마다 활동 배지와 펼침 상세.
     (트리 본체는 html_report._process_tree_html, 여기서는 상세 패널과 스타일만 제공)
 
@@ -126,6 +126,7 @@ h3{border-bottom:1px solid var(--line);padding-bottom:6px;color:var(--text);font
 .ptree .pt-detail div{font-family:'Cascadia Code',Consolas,monospace;font-size:.74rem;color:#c8d6ea;overflow-wrap:anywhere;line-height:1.55}
 .ptree .pt-flash>.pt-row{outline:1px solid var(--accent);background:#132238}
 details.plain>summary{cursor:pointer;color:var(--muted);font-size:.85rem;padding:10px 0;border-top:1px solid var(--line)}
+.va .va-tag.va-family{color:#ff9b9b;border-color:#ff6b6b;font-weight:700}
 </style>
 <script>
 function rvGoProc(pid){
@@ -169,7 +170,7 @@ _TACTIC_KO = {
 }
 # 계보에서 관측되면 그 자체로 악성 판단 근거가 되는 기법 (접두 일치)
 _HIGH_SEV = ("T1055", "T1547", "T1543", "T1053", "T1574", "T1555", "T1539", "T1562",
-             "T1486", "T1490", "T1003", "T1056", "T1041", "T1048")
+             "T1486", "T1490", "T1003", "T1056", "T1113", "T1041", "T1048")
 # 이번 실행의 텔레메트리가 아니라 다른 곳(타 샌드박스·정적 분석·AI 추론)이 보고한 기법 출처
 _EXTERNAL_SOURCES = {"virustotal", "capa", "ai"}
 _TID_RE = __import__("re").compile(r"T\d{4}(?:\.\d{3})?")
@@ -249,16 +250,22 @@ def build_indicators(result) -> list:
 
     lineage = set(getattr(result, "lineage_pids", None) or ())
 
+    # ── 악성코드 패밀리 (실행 중 남긴 흔적 — analysis.malware_traits) ──
+    for fam in ((getattr(result, "malware_traits", None) or {}).get("families") or []):
+        add("mal" if fam.get("confidence") == "HIGH" else "sus", "악성코드 패밀리",
+            f"{fam['name']} 특징 확인 — 흔적 {fam.get('matched', '?')}/{fam.get('total', '?')}개 일치",
+            " · ".join(fam.get("evidence", [])[:3]))
+
     # ── 주입 탐지 (신뢰도 판정 결과) ──
     low = 0
     for f in (getattr(result, "injection_findings", None) or []):
         conf = f.get("confidence", "")
         line = f"{f.get('name', '?')} (PID {f.get('pid', '?')})"
         if conf == "HIGH":
-            add("mal", "프로세스 주입", f"샘플 계보 프로세스에서 코드 주입 탐지 — {line}", f.get("reason", ""), "T1055")
+            add("mal", "프로세스 주입", f"샘플 프로세스에서 코드 주입 탐지 — {line}", f.get("reason", ""), "T1055")
             covered.add("T1055")
         elif conf == "MEDIUM":
-            add("sus", "프로세스 주입", f"계보 밖 프로세스에서 PE 교체/주입 탐지 — {line}", f.get("reason", ""), "T1055")
+            add("sus", "프로세스 주입", f"샘플이 아닌 프로세스에서 PE 교체·주입 탐지 — {line}", f.get("reason", ""), "T1055")
             covered.add("T1055")
         else:
             low += 1
@@ -311,20 +318,20 @@ def build_indicators(result) -> list:
     d1 = [f for f in drops if tiers.get(f, 2) == 1 and _is_drop(f)]
     d2 = [f for f in drops if tiers.get(f, 2) == 2 and _is_drop(f)]
     if d1:
-        add("mal", "파일 드롭", f"샘플 계보가 실행 가능 파일 {len(d1)}건 드롭",
+        add("mal", "파일 드롭", f"샘플 프로세스가 실행 파일 {len(d1)}개 생성",
             ", ".join(_short(f, 70) for f in d1[:5]) + (" …" if len(d1) > 5 else ""))
     if d2:
         add("sus", "파일 드롭",
-            f"분석 중 실행 가능 파일 {len(d2)}건 생성 (샘플 계보와의 연결 미확정)" if lineage
-            else f"분석 중 실행 가능 파일 {len(d2)}건 생성 (프로세스 계보 미확정)",
+            f"분석 중 실행 파일 {len(d2)}개 생성 (샘플과의 연결 미확인)" if lineage
+            else f"분석 중 실행 파일 {len(d2)}개 생성 (어느 프로세스가 만들었는지 미확인)",
             ", ".join(_short(f, 70) for f in d2[:5]) + (" …" if len(d2) > 5 else ""))
 
     # ── 네트워크 ──
     pcap = getattr(result, "pcap_result", None)
     for s in (getattr(pcap, "smtp_sessions", None) or [])[:3]:
-        add("mal", "유출", "SMTP 세션 관측 — 메일로 데이터 유출 가능", f"{s.dst_ip}:{s.dst_port}", "T1048")
+        add("mal", "유출", "SMTP 메일 전송 확인 — 메일로 데이터 유출 가능", f"{s.dst_ip}:{s.dst_port}", "T1048")
     for s in (getattr(pcap, "ftp_sessions", None) or [])[:3]:
-        add("mal", "유출", "FTP 세션 관측 — 파일 업로드 가능", f"{s.dst_ip}:{s.dst_port}", "T1048")
+        add("mal", "유출", "FTP 전송 확인 — 파일 업로드 가능", f"{s.dst_ip}:{s.dst_port}", "T1048")
     ip2dom = getattr(pcap, "ip_to_domain", {}) or {}
     lin_conns = []
     for c in (getattr(pcap, "connections", None) or []):
@@ -336,7 +343,7 @@ def build_indicators(result) -> list:
         if lbl not in lin_conns:
             lin_conns.append(lbl)
     if lin_conns:
-        add("sus", "C2 통신", f"샘플 계보 프로세스의 외부 통신 {len(lin_conns)}건", ", ".join(lin_conns[:6]))
+        add("sus", "C2 통신", f"샘플 프로세스의 외부 통신 {len(lin_conns)}건", ", ".join(lin_conns[:6]))
     un = _unanswered_dns(result)
     if un:
         add("sus", "C2 통신", f"응답 없는 DNS 질의 {len(un)}건 — C2/유출 서버 후보 (접속 실패)", ", ".join(un[:6]))
@@ -373,8 +380,8 @@ def build_indicators(result) -> list:
         ev = next((x for x in (getattr(t, "evidence", None) or []) if x), "")
         add(lvl, _TACTIC_KO.get(tactic, tactic), name, str(ev)[:200], tid)
     for tactic, names in ext_by_tactic.items():
-        add("info", "AI·정적·타 샌드박스 (미관측)",
-            f"{_TACTIC_KO.get(tactic, tactic)} — AI 추론·정적 분석·타 샌드박스가 보고한 기법 {len(names)}건",
+        add("info", "외부 분석 결과",
+            f"{_TACTIC_KO.get(tactic, tactic)} — 이번 실행에서는 확인되지 않고 AI·정적 분석·다른 샌드박스가 보고한 기법 {len(names)}건",
             ", ".join(names[:6]) + (" …" if len(names) > 6 else ""))
 
     # ── 실행 진단 ──
@@ -382,7 +389,7 @@ def build_indicators(result) -> list:
     _VTXT = {"CONFIRMED": "실행과 네트워크 활동이 확인됨", "PARTIAL": "실행됐으나 C2 응답 미확인",
              "EVADED": "분석 환경 탐지 후 조기 종료 의심", "FAILED": "샘플 실행 실패 의심"}
     if v in _VTXT:
-        add("sus" if v == "EVADED" else "info", "실행 진단", _VTXT[v], f"execution_verdict = {v}")
+        add("sus" if v == "EVADED" else "info", "실행 진단", _VTXT[v])
     return out
 
 
@@ -394,10 +401,10 @@ def score_indicators(inds: list) -> tuple:
     score = (40 + 15 * (mal - 1) if mal else 0) + min(30, 6 * sus) + min(5, info)
     score = max(0, min(100, score))
     if mal >= 2 or score >= 70:
-        return score, "mal", "악성 · MALICIOUS", C_MAL
+        return score, "mal", "악성", C_MAL
     if mal == 1 or score >= 30:
-        return score, "sus", "의심 · SUSPICIOUS", C_SUS
-    return score, "ok", "특이 위협 미확인", C_OK
+        return score, "sus", "의심", C_SUS
+    return score, "ok", "위협 미확인", C_OK
 
 
 def _stat(label: str, big: str, unit: str, segments: list) -> str:
@@ -496,11 +503,11 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", ver
     _BG = "#5b6f8c"
     rings = [
         _stat("위협 점수", str(score), "/ 100", [(score, "", vcolor), (100 - score, "", C_MUTE)]),
-        _stat("위험 지표", str(len(inds)), "건",
+        _stat("탐지 근거", str(len(inds)), "건",
               [(len(mal), "악성", C_MAL), (len(sus), "의심", C_SUS), (len(info), "정보", C_INFO)]),
-        _stat("신규 프로세스", str(p1 + p2 + p3), "개", [(p1, "계보", C_MAL), (p2, "의심", C_SUS), (p3, "배경", _BG)]),
+        _stat("새 프로세스", str(p1 + p2 + p3), "개", [(p1, "샘플", C_MAL), (p2, "의심", C_SUS), (p3, "평상시", _BG)]),
         _stat("ATT&CK 기법", str(t1 + t2 + t3 + tx), "건",
-              [(t1, "계보", C_MAL), (t2, "의심", C_SUS), (t3, "배경", _BG), (tx, "외부", C_INFO)]),
+              [(t1, "샘플", C_MAL), (t2, "의심", C_SUS), (t3, "평상시", _BG), (tx, "외부 분석", C_INFO)]),
     ]
 
     ext = os.path.splitext(sample_name)[1].lower().lstrip(".")
@@ -508,6 +515,9 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", ver
         [ext.upper()] if ext else []) + (["스크립트"] if ext in ("js", "jse", "vbs", "vbe", "wsf", "hta", "ps1")
                                          else ["문서"] if ext in ("doc", "docx", "docm", "xls", "xlsx", "xlsm", "rtf", "pdf")
                                          else ["실행 파일"] if ext in ("exe", "dll", "scr") else []))
+    fams = [f["name"] for f in ((getattr(result, "malware_traits", None) or {}).get("families") or [])
+            if f.get("confidence") == "HIGH"]
+    tags += "".join(f"<span class='va-tag va-family'>{_e(f)}</span>" for f in fams)
     sample_pid = getattr(result, "sample_pid", None)
     host = ""
     for p in ((getattr(result, "process_diff", None) or {}).get("new_processes", []) or []):
@@ -522,9 +532,9 @@ def verdict_overview_html(result, sample_name: str, sample_sha256: str = "", ver
         + (f"<div class='va-hash'>SHA-256 {_e(sample_sha256)}</div>" if sample_sha256 else "<div class='va-hash'></div>")
         + f"<div class='va-stats'>{''.join(rings)}</div>"
         "<div class='va-ind'>"
-        + _indicator_block("악성 지표", C_MAL, mal, len(mal) <= 3)
-        + _indicator_block("의심 지표", C_SUS, sus, len(sus) <= 3)
-        + _indicator_block("정보성 지표", C_INFO, info, False)
+        + _indicator_block("악성 근거", C_MAL, mal, len(mal) <= 3)
+        + _indicator_block("의심 근거", C_SUS, sus, len(sus) <= 3)
+        + _indicator_block("참고 정보", C_INFO, info, False)
         + "</div></section>"
     )
 

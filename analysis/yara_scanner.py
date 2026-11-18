@@ -128,8 +128,14 @@ def _scan_single(compiled, path: Path, timeout: int = 60) -> list[YaraMatch]:
     try:
         raw = compiled.match(str(path), timeout=timeout)
     except Exception as exc:
-        logger.warning("YARA: scan error on %s — %s", path.name, exc)
-        return []
+        # libyara 는 공유 모드가 좁아, 실행 중인 프로세스가 연 파일(설치된 remcos.exe 등)을
+        # 열지 못한다. Python 으로 읽어 메모리에서 다시 검사한다.
+        try:
+            with open(path, "rb") as f:
+                raw = compiled.match(data=f.read(), timeout=timeout)
+        except Exception:
+            logger.warning("YARA: scan error on %s — %s", path.name, exc)
+            return []
 
     results: list[YaraMatch] = []
     for m in raw:

@@ -12,6 +12,7 @@ vm_setup.py — 패킷 캡처 품질 향상을 위한 VM 자동 세팅
 - Firefox DoH 비활성화       → 동일
 - LLMNR 비활성화             → .in-addr.arpa PTR 노이즈 제거
 - NetBIOS-NS 비활성화        → UDP 137 브로드캐스트 노이즈 제거
+- Edge 자동 업데이트 중지    → 분석 중 설치 파일 수백 개·서비스 재등록이 샘플 행위로 섞이는 것 방지
 """
 from __future__ import annotations
 
@@ -61,6 +62,11 @@ def _policies() -> List[_Policy]:
                 "EnableMulticast",  REG_DWORD, 0,         "LLMNR"),
         _Policy(HKLM, r"SYSTEM\CurrentControlSet\Services\NetBT\Parameters",
                 "NodeType",         REG_DWORD, 2,         "NetBIOS-NS"),
+        # ── Edge 자동 업데이트 (공식 EdgeUpdate 정책) ─────────────────
+        _Policy(HKLM, r"SOFTWARE\Policies\Microsoft\EdgeUpdate",
+                "UpdateDefault",    REG_DWORD, 0,         "Edge 자동 업데이트"),
+        _Policy(HKLM, r"SOFTWARE\Policies\Microsoft\EdgeUpdate",
+                "AutoUpdateCheckPeriodMinutes", REG_DWORD, 0, "Edge 업데이트 확인"),
     ]
 
 

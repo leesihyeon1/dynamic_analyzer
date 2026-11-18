@@ -78,6 +78,8 @@ BENIGN_PORTS: frozenset[int] = frozenset({80, 443, 53, 123, 67, 68})
 DGA_ENTROPY_THRESHOLD = 3.5
 
 # DNS 터널링 의심 기준: 단일 베이스 도메인에 대한 최소 쿼리 수
+# 같은 기반 도메인 아래 '서로 다른' 하위 이름 수. 같은 이름을 반복 조회하는 것은
+# C2 재접속·비콘이지 터널링이 아니다 (Remcos 가 C2 를 수십 번 다시 조회해 걸렸다).
 DNS_TUNNEL_QUERY_THRESHOLD = 20
 
 # DNS 터널링 의심 기준: 서브도메인 최소 길이
@@ -195,6 +197,8 @@ def _is_excluded_dns_name(name: str) -> bool:
     return (
         n.endswith(".in-addr.arpa")
         or n.endswith(".ip6.arpa")
+        or n.endswith(".local")                    # mDNS — 인터넷 DNS 가 아니다
+        or "._tcp." in n or "._udp." in n          # DNS-SD 서비스 레코드
         or _is_analysis_service_domain(n)
     )
 
@@ -250,7 +254,8 @@ class DNSQuery:
     qtype:        str
     response_ips: list[str] = field(default_factory=list)  # A/AAAA 응답 IP
     entropy:      float = 0.0    # 서브도메인 Shannon 엔트로피
-    suspicious:   bool  = False  # DGA 의심 or 터널링 의심
+    suspicious:   bool  = False  # 아래 사유 중 하나라도 있음
+    reasons:      list[str] = field(default_factory=list)  # dga · long · tunnel
     is_ddns:      bool  = False  # DDNS 서비스 도메인 여부
     no_response:  bool  = False  # DNS 응답 없음 (C2 오프라인 등)
 
@@ -379,6 +384,7 @@ class PcapResult:
     ftp_sessions:         list[FtpSession]         = field(default_factory=list)
     attempted_connections:list[AttemptedConnection]= field(default_factory=list)
     suspicious_domains:   list[str]               = field(default_factory=list)
+    dga_domains:          list[str]               = field(default_factory=list)  # 무작위성(엔트로피)만
     dns_tunnel_suspects:  list[str]               = field(default_factory=list)
     summary:              PcapSummary             = field(default_factory=PcapSummary)
     # 역참조용
@@ -654,10 +660,34 @@ def _subdomain_entropy(fqdn: str) -> float:
     return _shannon_entropy(parts[0])
 
 
+# 2단계 공개 접미사 — 이것을 기반 도메인으로 보면 무관한 도메인이 한 덩어리가 된다
+_SECOND_LEVEL_SUFFIXES: frozenset[str] = frozenset({
+    "co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "pe.kr",
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+    "co.jp", "ne.jp", "or.jp", "com.cn", "net.cn", "org.cn", "com.br", "com.tw",
+    "com.hk", "co.in", "in.net", "com.ru", "co.za", "com.tr", "com.mx", "com.sg", "com.vn",
+})
+
+
 def _base_domain(fqdn: str) -> str:
-    """FQDN → eTLD+1 근사 (단순 상위 2레이블)"""
-    parts = fqdn.rstrip(".").split(".")
+    """FQDN → eTLD+1 근사. 흔한 2단계 공개 접미사(co.kr·in.net 등)는 한 레이블 더 붙인다."""
+    parts = fqdn.lower().rstrip(".").split(".")
+    if len(parts) >= 3 and ".".join(parts[-2:]) in _SECOND_LEVEL_SUFFIXES:
+        return ".".join(parts[-3:])
     return ".".join(parts[-2:]) if len(parts) >= 2 else fqdn
+
+
+def _dns_reasons(name: str, entropy: float, base_names: dict) -> list:
+    """의심 사유 — dga(무작위성) · long(긴 하위 이름) · tunnel(하위 이름 다수)."""
+    out = []
+    if entropy >= DGA_ENTROPY_THRESHOLD:
+        out.append("dga")
+    if len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN:
+        out.append("long")
+    base = _base_domain(name)
+    if _is_dns_tunnel_base(base, len(base_names.get(base, ()))):
+        out.append("tunnel")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1147,7 +1177,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
     http_list:    list[HTTPRequest]               = []
     tls_list:     list[TLSInfo]                   = []
     beacon_ts:    dict[tuple, list[float]]        = defaultdict(list)
-    dns_base_cnt: dict[str, int]                  = defaultdict(int)
+    dns_base_cnt: dict[str, set]                  = defaultdict(set)   # base_domain→고유 이름
     raw_ips:      set[str]                        = set()
     raw_domains:  set[str]                        = set()
     total_bytes_out = 0
@@ -1234,7 +1264,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
             # 터널링 임계치를 넘겨 PTR 전체를 오탐하는 것을 막을 수 있다.
             if dns_name and not is_response and not _is_excluded_dns_name(dns_name):
                 raw_domains.add(dns_name)
-                dns_base_cnt[_base_domain(dns_name)] += 1
+                dns_base_cnt[_base_domain(dns_name)].add(dns_name.lower().rstrip("."))
                 if dns_name not in dns_seen:
                     qt_raw = _f(9)
                     qtype  = _QTYPE_MAP.get(_parse_int(qt_raw) or 0, qt_raw or "A")
@@ -1380,16 +1410,15 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
 
     suspicious_domains: list[str] = []
     for name, q in dns_seen.items():
-        if (q.entropy >= DGA_ENTROPY_THRESHOLD
-                or len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN
-                or _is_dns_tunnel_base(_base_domain(name),
-                                       dns_base_cnt.get(_base_domain(name), 0))):
+        q.reasons = _dns_reasons(name, q.entropy, dns_base_cnt)
+        if q.reasons:
             q.suspicious = True
             suspicious_domains.append(name)
+    dga_domains = [n for n, q in dns_seen.items() if "dga" in q.reasons]
 
     dns_tunnel_suspects = [
-        d for d, cnt in dns_base_cnt.items()
-        if _is_dns_tunnel_base(d, cnt)
+        d for d, names in dns_base_cnt.items()
+        if _is_dns_tunnel_base(d, len(names))
     ]
 
     summary = PcapSummary(
@@ -1416,6 +1445,7 @@ def _parse_pcap_with_tshark(pcap_path: Path, tshark_path: str) -> PcapResult:
         beacon_candidates=_detect_beacons(beacon_ts),
         attempted_connections=tshark_attempted,
         suspicious_domains=sorted(set(suspicious_domains)),
+        dga_domains=sorted(set(dga_domains)),
         dns_tunnel_suspects=sorted(set(dns_tunnel_suspects)),
         summary=summary,
         raw_ips=raw_ips,
@@ -1460,7 +1490,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     http_list:    list[HTTPRequest]               = []
     tls_list:     list[TLSInfo]                   = []
     beacon_ts:    dict[tuple, list[float]]        = defaultdict(list)  # (ip,port)→[ts]
-    dns_base_cnt: dict[str, int]                  = defaultdict(int)   # base_domain→query count
+    dns_base_cnt: dict[str, set]                  = defaultdict(set)   # base_domain→고유 이름
     raw_ips:      set[str]                        = set()
     raw_domains:  set[str]                        = set()
     total_bytes_out  = 0
@@ -1561,7 +1591,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
                         _excluded = _is_excluded_dns_name(name)
                         if not _excluded:
                             raw_domains.add(name)
-                            dns_base_cnt[_base_domain(name)] += 1
+                            dns_base_cnt[_base_domain(name)].add(name.lower().rstrip("."))
 
                         if name not in dns_seen:
                             if _excluded:
@@ -1679,17 +1709,16 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
     # --- DGA / 의심 도메인 판정 ---
     suspicious_domains = []
     for name, q in dns_seen.items():
-        is_dga     = q.entropy >= DGA_ENTROPY_THRESHOLD
-        is_long    = len(name.split(".")[0]) >= DNS_TUNNEL_LABEL_LEN
-        is_tunnel  = _is_dns_tunnel_base(_base_domain(name), dns_base_cnt.get(_base_domain(name), 0))
-        if is_dga or is_long or is_tunnel:
+        q.reasons = _dns_reasons(name, q.entropy, dns_base_cnt)
+        if q.reasons:
             q.suspicious = True
             suspicious_domains.append(name)
+    dga_domains = [n for n, q in dns_seen.items() if "dga" in q.reasons]
 
-    # --- DNS 터널링 의심 베이스 도메인 ---
+    # --- DNS 터널링 의심 베이스 도메인 (고유 하위 이름 수 기준) ---
     dns_tunnel_suspects = [
-        domain for domain, cnt in dns_base_cnt.items()
-        if _is_dns_tunnel_base(domain, cnt)
+        domain for domain, names in dns_base_cnt.items()
+        if _is_dns_tunnel_base(domain, len(names))
     ]
 
     # --- 비콘 탐지 ---
@@ -1750,6 +1779,7 @@ def parse_pcap(pcap_path: Path, tshark_path: Optional[str] = None) -> PcapResult
         ftp_sessions=ftp_sessions,
         attempted_connections=attempted_connections,
         suspicious_domains=sorted(set(suspicious_domains)),
+        dga_domains=sorted(set(dga_domains)),
         dns_tunnel_suspects=sorted(set(dns_tunnel_suspects)),
         summary=summary,
         raw_ips=raw_ips,

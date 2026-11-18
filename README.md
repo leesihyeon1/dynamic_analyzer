@@ -128,7 +128,14 @@ python analyzer.py malware.exe --no-tshark
 
 # 분석 완료 후 HTML 리포트 자동 열기 비활성화
 python analyzer.py malware.exe --no-open
+
+# 샘플을 일반 사용자 권한(중간 무결성)으로 실행 — 분석기는 관리자로 돌지만 샘플은
+# 사용자가 더블클릭한 것처럼 띄워 UAC 우회 같은 권한 상승 행위를 관찰한다 (GUI: "일반 사용자 권한")
+python analyzer.py malware.exe --unelevated
 ```
+
+샘플은 실행 **전에** SHA-256 과 사본(`evidence\sample\<이름>.evd`)을 남긴다. 실행 직후 자신을
+옮기고 원본을 지우는 샘플(Remcos 등)도 CAPA · VirusTotal · YARA 는 이 사본으로 검사한다.
 
 ### 메모리 포렌식 (Volatility3)
 
@@ -172,12 +179,12 @@ python analyzer.py malware.exe --fakenet --fakenet-path C:\Tools\FakeNet\FakeNet
 
 ### AI 행위 분석 (기본 NVIDIA NIM)
 
-기존 `config.json`의 `ai.api_key`에 NVIDIA API 키를 입력하고 `ai.model`에 모델을 지정합니다. GUI의 **AI 설정**에서 저장해도 같은 항목이 갱신됩니다. 기본 모델은 `mistralai/mistral-large-4-1t-a52b`입니다. `config.json` 값을 우선 사용하며, 빈 값만 환경변수 `NVIDIA_API_KEY`와 `NVIDIA_MODEL`로 보완합니다. 기존 `ai.local.json`은 더 이상 읽지 않습니다. 키를 입력한 config.json을 공유하거나 커밋하지 마세요.
+기존 `config.json`의 `ai.api_key`에 NVIDIA API 키를 입력하고 `ai.model`에 모델을 지정합니다. GUI의 **AI 설정**에서 저장해도 같은 항목이 갱신됩니다. 기본 모델은 `qwen/qwen2.5-72b-instruct`입니다. 응답이 멈추면 Gemma·Qwen·Llama 순으로 자동 대체하며, 느린 초대형 모델(`mistralai/mistral-large-4-1t-a52b`)은 직접 지정할 때만 씁니다. `config.json` 값을 우선 사용하며, 빈 값만 환경변수 `NVIDIA_API_KEY`와 `NVIDIA_MODEL`로 보완합니다. 기존 `ai.local.json`은 더 이상 읽지 않습니다. 키를 입력한 config.json을 공유하거나 커밋하지 마세요.
 
 ```json
 "ai": {
   "api_key": "여기에 NVIDIA API 키 입력",
-  "model": "mistralai/mistral-large-4-1t-a52b"
+  "model": "qwen/qwen2.5-72b-instruct"
 }
 ```
 
@@ -188,7 +195,7 @@ AI가 켜진 분석은 프로세스·파일 경로·레지스트리·IP·도메�
 python analyzer.py malware.exe
 
 # NVIDIA 모델 지정
-python analyzer.py malware.exe --ai-model mistralai/mistral-large-4-1t-a52b
+python analyzer.py malware.exe --ai-model qwen/qwen2.5-72b-instruct
 
 # AI 비활성화
 python analyzer.py malware.exe --no-ai
@@ -483,7 +490,7 @@ dynamic_analyzer/
 ### v1.8 — AI 분석 · 메모리 포렌식 · TLS 복호화 · FakeNet-NG
 
 - **🤖 AI 행위 분석** (`core/ai_analyzer.py` 신규)
-  - NVIDIA NIM API 기반 한국어 자동 위협 분석 (기본 `mistralai/mistral-large-4-1t-a52b`)
+  - NVIDIA NIM API 기반 한국어 자동 위협 분석 (기본 `qwen/qwen2.5-72b-instruct`)
   - 분석 항목 4개: 악성코드 패밀리 추정 · 위협 수준 평가 · 행위 분석 · C2 통신 패턴
   - 프롬프트 구성: MITRE ATT&CK 전술별 그룹 + 프로세스·파일·레지스트리·네트워크 행위 데이터
   - 10,000자 프롬프트 한도, `temperature=0.2` (사실 기반 일관성), `num_ctx=8192`

@@ -76,11 +76,11 @@ body.menu-hidden .tabs{display:none}body.menu-hidden .container{margin-left:auto
 #tbl-process-all th:nth-child(2){width:78px}
 #tbl-process-all th:nth-child(3){width:205px}
 #tbl-process-all th:nth-child(4){width:90px}
-#tbl-process-all th:nth-child(7){width:120px}
+#tbl-process-all th:nth-child(6){width:120px}
 #tbl-process-all tr[id^='proc-record-']>td{vertical-align:top}
 #tbl-process-all tr[id^='proc-record-']>td:nth-child(2){white-space:nowrap}
-#tbl-process-all tr[id^='proc-record-']>td:nth-child(5),#tbl-process-all tr[id^='proc-record-']>td:nth-child(6){white-space:normal;overflow-wrap:anywhere!important;word-break:normal!important}
-#tbl-process-all tr[id^='proc-record-']>td:nth-child(7){white-space:normal!important}
+#tbl-process-all tr[id^='proc-record-']>td:nth-child(5){white-space:normal;overflow-wrap:anywhere!important;word-break:normal!important}
+#tbl-process-all tr[id^='proc-record-']>td:nth-child(6){white-space:normal!important}
 .process-record-scroll{max-height:36rem}
 .tab-panel pre{max-height:22rem;overflow:auto;white-space:pre!important}
 @media(max-width:1100px){.tabs{padding-top:8px;top:38px}.report-menu-toggle{top:4px}}
@@ -98,6 +98,8 @@ document.addEventListener('DOMContentLoaded', function(){
  document.body.prepend(toggle);show(false);
  window.addEventListener('load',function(){
  document.querySelectorAll('.tab-panel table[id]').forEach(table=>{
+ table.querySelectorAll('td').forEach(td=>{const t=td.textContent.trim();
+ if(t.length&&t.length<=16&&!/\s{2}/.test(t)&&!td.querySelector('br,div,p'))td.classList.add('nw');});
  if(table.parentElement.classList.contains('report-table-scroll'))return;
  const box=document.createElement('div');box.className='report-table-scroll';
  box.tabIndex=0;table.before(box);box.append(table);});});
@@ -105,20 +107,39 @@ document.addEventListener('DOMContentLoaded', function(){
 """
 REPORT_CSS += COMPACT_CSS
 
+# 글자 크기 기준 (16px 기준):
+#   본문·표 셀 14px · 고정폭(경로·명령줄) 13px · 표 머리글 13px
+#   보조 문구·배지·칩 최소 12px — 그보다 작으면 VM 화면에서 읽기 어렵다.
+# 개별 모듈의 인라인 style 이 더 작게 지정한 경우도 여기서 끌어올린다.
+TYPE_CSS = """
+th{font-size:.8125rem;white-space:nowrap}
+td{font-size:.875rem}
+td.mono,td code,.report-table-scroll td.mono{font-size:.8125rem}
+.report-table-scroll td.mono,.report-table-scroll td code{white-space:normal;overflow-wrap:anywhere!important;word-break:normal!important}
+.report-table-scroll td.nw,.report-table-scroll td.nw *{white-space:nowrap!important;overflow-wrap:normal!important}
+.tab-panel [style*='font-size:.7'],.tab-panel [style*='font-size:.6'],.tab-panel [style*='font-size:0.7'],.tab-panel [style*='font-size:0.6'],
+.tab-panel [style*='font-size: .7'],.tab-panel [style*='font-size: .6']{font-size:.8rem!important}
+.act-badge,.attk-chip,.badge,.ev-tag{font-size:.75rem!important;line-height:1.5}
+.act-badge{padding:1px 7px!important}
+.va-ev,.va-stat-label,.ev-sub,.beh-sub,.bg-note,.hunt-qchip,.hunt-qlabel,.pg-info{font-size:.8rem!important}
+.ev-copy,.proc-exp-btn{font-size:.8rem!important}
+.ev-path,.ev-hash,.ev-tbl .mono,.ev-tbl code{font-family:'Cascadia Code','Consolas','D2Coding',monospace!important;font-size:.8125rem!important}
+.srch-wrap{margin:10px 0 8px}.srch-input{padding:7px 12px;font-size:.85rem}
+"""
+REPORT_CSS += TYPE_CSS
 
-def report_header(*, sample_name, sample_path, generated, timeout, duration, techniques,
-                  events, connections, ips, indicator=""):
-    """사용자 데이터는 이스케이프하고 생성기가 만든 도구 배지만 HTML로 삽입한다."""
+
+def report_header(*, sample_name, sample_path, generated, timeout, duration):
+    """사용자 데이터는 이스케이프한다.
+
+    판정·점수·개수는 바로 아래 판정 요약이 보여주므로 헤더에는 대상과 실행 정보만 둔다.
+    """
     e = lambda value: escape(str(value), quote=True)
-    metrics = [("ATT&CK 후보", techniques), ("ProcMon 이벤트", events),
-               ("네트워크 연결", connections), ("IOC IP 주소", ips)]
-    cards = "".join(f'<div class="metric"><div class="metric-label">{e(label)}</div><div class="metric-value">{int(count):,}</div></div>' for label, count in metrics)
     minutes, seconds = divmod(int(max(0, duration)), 60)
     return f'''<header class="report-header">
 <div class="report-topline"><span class="eyebrow">DYNAMIC / ANALYSIS REPORT</span><div class="report-actions">
 <button type="button" aria-pressed="false" onclick="const large=document.documentElement.classList.toggle('large-text');this.setAttribute('aria-pressed',String(large));this.textContent=large?'기본 글자':'글자 크게'">글자 크게</button>
 <button type="button" onclick="window.print()">현재 화면 인쇄</button></div></div>
 <h1>{e(sample_name)}</h1><p class="report-path">{e(sample_path)}</p>
-<div class="report-meta"><span>생성<strong>{e(generated)}</strong></span><span>모니터링<strong>{e(timeout)}초</strong></span><span>전체 소요<strong>{minutes}분 {seconds}초</strong></span><span>규칙 기반 지표<strong>{e(indicator)}</strong></span></div>
-<div class="metric-grid">{cards}</div>
+<div class="report-meta"><span>분석 시각<strong>{e(generated)}</strong></span><span>관찰 시간<strong>{e(timeout)}초</strong></span><span>전체 소요<strong>{minutes}분 {seconds}초</strong></span></div>
 </header>'''

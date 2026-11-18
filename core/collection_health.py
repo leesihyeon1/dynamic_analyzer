@@ -80,12 +80,12 @@ def collection_status(result) -> list[dict]:
     dns = getattr(result, "dns_attributed", None) or []
     attributed = sum(1 for q in dns if getattr(q, "attributed", False))
     if "dns_etw" not in tools:
-        add("DNS 귀속", "off", "사용 안 함")
+        add("DNS 요청 프로세스", "off", "사용 안 함")
     elif tools.get("dns_etw"):
-        add("DNS 귀속", "ok" if attributed or not dns else "partial",
-            f"질의 {len(dns)}건 중 프로세스 귀속 {attributed}건" if dns else "DNS-Client ETW 수집 · 질의 없음")
+        add("DNS 요청 프로세스", "ok" if attributed or not dns else "partial",
+            f"질의 {len(dns)}건 중 프로세스 확인 {attributed}건" if dns else "DNS-Client ETW 수집 · 질의 없음")
     else:
-        add("DNS 귀속", "partial", "DNS-Client ETW 시작 실패 — ProcMon UDP 이벤트로만 귀속")
+        add("DNS 요청 프로세스", "partial", "DNS-Client ETW 시작 실패 — ProcMon UDP 이벤트로만 확인")
 
     # ── 레지스트리 스냅샷 ──
     diff = getattr(result, "registry_diff", None) or {}

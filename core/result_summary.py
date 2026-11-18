@@ -99,7 +99,7 @@ class ResultSummary:
     errors: list[str] = field(default_factory=list)
     techniques: list[tuple] = field(default_factory=list)   # (ID, 이름, 전술, 출처, 근거, 등급)
     processes: list[ProcRow] = field(default_factory=list)
-    connections: list[tuple] = field(default_factory=list)  # (귀속, 프로세스, PID, 원격, 도메인, 이벤트, 색)
+    connections: list[tuple] = field(default_factory=list)  # (관계, 프로세스, PID, 원격, 도메인, 이벤트, 색)
     dns: list[tuple] = field(default_factory=list)          # (도메인, 응답, 프로세스, 상태, 색)
     dropped: list[tuple] = field(default_factory=list)      # (경로, 크기, SHA-256, 등급)
     registry: list[tuple] = field(default_factory=list)     # (변경, 키, 값, 데이터, 색)
@@ -190,14 +190,14 @@ def _collection_fallback(data: dict, by_name: dict, warnings: list) -> list:
 
 def _attribution(pid: str, lineage: set, related: set, target: set) -> tuple:
     if pid in lineage:
-        return "샘플 계보", "mal"
+        return "샘플", "mal"
     if pid in related:
-        return "상관 의심", "sus"
+        return "의심", "sus"
     if pid in target:
         return "추적 대상", "sus"
     if pid in ("", "0", "None"):
-        return "귀속 미확인", "faint"
-    return "배경", "faint"
+        return "프로세스 미확인", "faint"
+    return "평상시", "faint"
 
 
 def load_result(folder: Path) -> ResultSummary:
@@ -392,10 +392,10 @@ def load_result(folder: Path) -> ResultSummary:
         remote_ip = str(conn.get("remote_ip", ""))
         rows.append((label, str(conn.get("process", "")), pid, f"{remote_ip}:{conn.get('remote_port', '')}",
                      ip_domains.get(remote_ip, ""), str(conn.get("event_count", "")), level))
-    order = {"샘플 계보": 0, "상관 의심": 1, "추적 대상": 2, "귀속 미확인": 3, "배경": 4}
+    order = {"샘플": 0, "의심": 1, "추적 대상": 2, "프로세스 미확인": 3, "평상시": 4}
     result.connections = sorted(rows, key=lambda r: (order.get(r[0], 9), r[1]))
-    if result.connections and not any(r[0] in ("샘플 계보", "추적 대상") for r in result.connections):
-        result.warnings.append("프로세스에 연결된 네트워크 기록 중 샘플 계보와 일치하는 항목이 없습니다. 관찰 IP를 샘플의 통신으로 단정하지 마세요.")
+    if result.connections and not any(r[0] in ("샘플", "추적 대상") for r in result.connections):
+        result.warnings.append("프로세스에 연결된 네트워크 기록 중 샘플 프로세스와 일치하는 항목이 없습니다. 관찰 IP를 샘플의 통신으로 단정하지 마세요.")
     seen = set()
     for q in data.get("dns_attributed") or []:
         if not isinstance(q, dict) or not q.get("name"):
@@ -415,7 +415,7 @@ def load_result(folder: Path) -> ResultSummary:
                 seen.add(q.get("name"))
                 answers = ", ".join((q.get("response_ips") or [])[:3])
                 result.dns.append((str(q["name"]), answers or "응답 없음", "미확인",
-                                   "응답 없음" if q.get("no_response") else "관측", "faint"))
+                                   "응답 없음" if q.get("no_response") else "확인됨", "faint"))
     result.dns.sort(key=lambda r: (order.get(r[3], 5), r[0]))
 
     # ── 파일 · 레지스트리 ──

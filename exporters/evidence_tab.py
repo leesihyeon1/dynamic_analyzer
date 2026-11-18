@@ -20,7 +20,7 @@ from pathlib import Path
 
 _e = html.escape
 
-_TIER_BADGE = {1: ("계보", "#ff7b72"), 2: ("의심", "#e3b341"), 3: ("배경", "#6e7681")}
+_TIER_BADGE = {1: ("샘플", "#ff7b72"), 2: ("의심", "#e3b341"), 3: ("평상시", "#6e7681")}
 
 # 결과 폴더의 원본 수집물 — (판별 함수, 종류, 여는 도구/용도)
 _ARTIFACT_KINDS = (
@@ -29,7 +29,7 @@ _ARTIFACT_KINDS = (
     (lambda n, p: n.endswith((".pcap", ".pcapng")), "패킷 캡처",       "Wireshark 로 열기 — 아래 필터 식 사용"),
     (lambda n, p: n == "tls_keylog.txt",         "TLS 세션 키",       "Wireshark › Preferences › TLS › (Pre)-Master-Secret log"),
     (lambda n, p: n == "memory.raw",             "메모리 덤프",       "Volatility3 -f memory.raw windows.malfind 등"),
-    (lambda n, p: n.endswith("_dynamic_report.json"), "JSON 리포트",   "등급과 무관하게 전체 데이터 포함"),
+    (lambda n, p: n.endswith("_dynamic_report.json"), "JSON 리포트",   "표시 범위와 관계없이 전체 데이터 포함"),
     (lambda n, p: n.endswith("_dynamic_report.html"), "HTML 리포트",   "이 문서"),
     (lambda n, p: n.endswith(".log"),            "실행 로그",         "분석 파이프라인 콘솔 로그"),
     (lambda n, p: "regshot" in n or n.startswith("registry"), "레지스트리 스냅샷", "전/후 비교 원본"),
@@ -144,7 +144,7 @@ def _dropped_section(result, out_dir: Path) -> str:
         "<h3 class='ev-h3'>드롭 파일 — 보존 사본과 해시</h3>"
         "<p class='ev-sub'>보존 사본은 <code>evidence/dropped/</code> 에 <code>.evd</code> 확장자로 저장됩니다 "
         "(실수 실행 방지). 정적 분석 시 확장자를 원래대로 되돌려 사용하세요.</p>"
-        "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련도</th><th>원본 경로</th>"
+        "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련성</th><th>원본 경로</th>"
         "<th>크기 / 상태</th><th>보존 사본</th><th>복사</th></tr></thead><tbody>"
         + "".join(rows) + "</tbody></table></div>"
     )
@@ -232,7 +232,7 @@ def _dump_section(result, out_dir: Path) -> str:
         "PE-bear·Ghidra·dnSpy 로 열어보세요. <code>.shc</code> 는 쉘코드 조각입니다.</p>"
         "<p class='ev-sub' style='color:#f0b429'>⚠ 실제 악성 코드입니다. 링크는 <code>.bin</code> 을 덧붙여 "
         "내려받도록 되어 있으니 실행하지 말고 분석 VM 안에서만 다루세요.</p>"
-        "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련도</th><th>프로세스</th>"
+        "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련성</th><th>프로세스</th>"
         "<th>덤프 파일</th><th>위치</th></tr></thead><tbody>"
         + "".join(r[2] for r in rows) + "</tbody></table></div>"
     )
@@ -289,7 +289,7 @@ def _network_section(result, out_dir: Path) -> str:
     return (
         "<h3 class='ev-h3'>네트워크 — Wireshark 에서 직접 확인</h3>"
         f"<p class='ev-sub'>캡처 파일: {pcap_cell} — Wireshark 로 연 뒤 아래 표시 필터를 붙여 넣으세요.</p>"
-        "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련도</th><th>유형</th>"
+        "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>관련성</th><th>유형</th>"
         "<th>대상</th><th>Wireshark 표시 필터</th></tr></thead><tbody>"
         + "".join(r[1] for r in rows[:40]) + "</tbody></table></div>" + more
     )
@@ -316,7 +316,7 @@ def _process_section(result, out_dir: Path) -> str:
         )
     hint = (f"ProcMon 원본: {_link(pml.name, pml.name)} {_copy_btn(str(pml))} — " if pml.is_file() else "")
     return (
-        "<h3 class='ev-h3'>샘플 계보 프로세스 — ProcMon 에서 직접 확인</h3>"
+        "<h3 class='ev-h3'>샘플 프로세스 — ProcMon 에서 직접 확인</h3>"
         f"<p class='ev-sub'>{hint}Procmon › Filter(Ctrl+L) › <code>PID is &lt;값&gt; Include</code> 로 "
         "해당 프로세스의 파일·레지스트리·네트워크 이벤트 전체를 볼 수 있습니다.</p>"
         "<div class='table-wrap'><table class='ev-tbl'><thead><tr><th>프로세스</th><th>경로 / 명령줄</th>"

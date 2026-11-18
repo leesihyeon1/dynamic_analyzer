@@ -258,6 +258,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-ph",       action="store_true", help="Process Hacker GUI 실행 안 함")
     g.add_argument("--no-export",   action="store_true", help="파일 저장 없이 콘솔 출력만")
     g.add_argument("--no-open",     action="store_true", help="분석 완료 후 HTML 리포트 자동 열기 비활성화")
+    g.add_argument("--unelevated",  action="store_true",
+                   help="샘플을 일반 사용자 권한(중간 무결성)으로 실행 — 분석기는 관리자로 돌지만 "
+                        "샘플은 사용자가 더블클릭한 것처럼 띄워 UAC 우회 같은 권한 상승 행위를 관찰")
 
     # PCAP 입력
     pg = p.add_argument_group("PCAP 분석")
@@ -455,6 +458,7 @@ def main() -> None:
         external_pcap = external_pcap,
         use_keylog    = not getattr(args, "no_keylog", False),
         use_fakenet   = getattr(args, "fakenet", False),
+        run_unelevated = getattr(args, "unelevated", False),
         fakenet_path  = getattr(args, "fakenet_path", None),
         use_memdump       = getattr(args, "memdump", False) or bool(getattr(args, "dump", None)),
         winpmem_path      = getattr(args, "winpmem_path", None),
